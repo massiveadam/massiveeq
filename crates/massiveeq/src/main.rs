@@ -265,11 +265,11 @@ fn build_ui(app: &adw::Application) {
             .is_some_and(|device| !device.bypassed),
     );
     device_bypass.set_tooltip_text(Some(
-        "Level-matched filter A/B. Off removes the filters but retains the active profile's perceived gain correction.",
+        "Turn filters on or off. Off retains the active profile's perceived gain correction for fair listening comparisons.",
     ));
     let bypass_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bypass_row.set_halign(gtk::Align::Center);
-    bypass_row.append(&gtk::Label::new(Some("FILTER A/B")));
+    bypass_row.append(&gtk::Label::new(Some("FILTERS")));
     bypass_row.append(&device_bypass);
     device_actions.append(&bypass_row);
     let comparison_popover = gtk::Popover::new();
@@ -2384,7 +2384,7 @@ fn update_device_controls(
     } else if let Some(comparison) = comparison {
         let active_name = comparison_candidate_name(model, &comparison.active_profile_id);
         state.set_text(&if device.bypassed {
-            format!("A/B · filters off · level matched to {active_name}")
+            format!("Filters off · level matched to {active_name}")
         } else if comparison.active_profile_id == COMPARISON_BYPASS_ID {
             format!("Comparing · {active_name}")
         } else {
@@ -2394,8 +2394,8 @@ fn update_device_controls(
         assign.set_sensitive(model.current_id.borrow().is_some());
     } else if device.bypassed {
         state.set_text(&match assigned_name {
-            Some(name) => format!("A/B · filters off · level matched to {name}"),
-            None => "Not applied · filter A/B unavailable".to_owned(),
+            Some(name) => format!("Filters off · level matched to {name}"),
+            None => "Not applied · filters unavailable".to_owned(),
         });
         assign.set_label(if selected_matches {
             "Unassign from output"

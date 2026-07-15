@@ -182,7 +182,7 @@ impl MassiveEqTray {
         submenu.push(MenuItem::Separator);
         submenu.push(
             CheckmarkItem {
-                label: "Filters active (level-matched A/B)".into(),
+                label: "Filters".into(),
                 checked: filters_active,
                 activate: Box::new(move |tray: &mut Self| {
                     tray.send(Action::SetDeviceBypass {

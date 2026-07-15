@@ -57,7 +57,7 @@ systemctl --user enable --now massiveeq.service massiveeq-tray.service
 ```
 
 The tray companion shows the active profile for each output, switches or
-unassigns profiles, controls level-matched output A/B and the master engine,
+unassigns profiles, controls the per-output Filters switch and master engine,
 and opens the full editor. It is a separate process, so stopping it never
 changes audio routing.
 
@@ -75,8 +75,8 @@ loudness does not bias the comparison. Banks are remembered independently for
 each output and do not replace its normal assigned profile.
 
 While the app is focused, `Alt+1` through `Alt+9` select candidates in bank
-order. `Ctrl+B` toggles the selected output's level-matched **Filter A/B**.
-Turning Filter A/B off removes the filters while retaining the active profile's
+order. `Ctrl+B` toggles the selected output's **Filters** switch. Turning
+Filters off removes the filters while retaining the active profile's
 clipping-safe perceived level and convolution timing. The header **Engine**
 switch is deliberately different: Engine Off is true 0 dB dry audio with no
 EQ, perceptual correction, safety attenuation, or user trim. Comparison
