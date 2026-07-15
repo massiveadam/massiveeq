@@ -449,7 +449,9 @@ fn build_ui(app: &adw::Application) {
     );
     narrow_filters.add_setter(&title, "visible", Some(&false.to_value()));
     narrow_filters.add_setter(&global_bypass_label, "visible", Some(&false.to_value()));
-    view_stack.add_titled(&filter_list, Some("filters"), "Parametric");
+    let parametric_stack = gtk::Stack::new();
+    parametric_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    parametric_stack.add_named(&filter_list, Some("visual"));
     view_stack.set_valign(gtk::Align::Start);
 
     let convolution_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -502,6 +504,16 @@ fn build_ui(app: &adw::Application) {
     let text_view = gtk::TextView::new();
     text_view.set_monospace(true);
     text_view.set_wrap_mode(gtk::WrapMode::None);
+    text_view.buffer().set_enable_undo(true);
+    let text_scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(420)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&text_view)
+        .build();
+    text_scroll.add_css_class("code-editor");
+    parametric_stack.add_named(&text_scroll, Some("text"));
+    view_stack.add_titled(&parametric_stack, Some("filters"), "Parametric");
     let switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     switcher.set_halign(gtk::Align::Center);
     switcher.add_css_class("mode-switcher");
@@ -534,6 +546,37 @@ fn build_ui(app: &adw::Application) {
     });
     switcher.append(&parametric_mode);
     switcher.append(&convolution_mode);
+    let editor_switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    editor_switcher.add_css_class("editor-switcher");
+    let visual_mode = gtk::ToggleButton::with_label("VISUAL");
+    visual_mode.set_active(true);
+    let text_mode = gtk::ToggleButton::with_label("TEXT");
+    text_mode.set_group(Some(&visual_mode));
+    visual_mode.connect_clicked({
+        let stack = parametric_stack.clone();
+        move |button| {
+            button.set_active(true);
+            stack.set_visible_child_name("visual");
+        }
+    });
+    text_mode.connect_clicked({
+        let stack = parametric_stack.clone();
+        move |button| {
+            button.set_active(true);
+            stack.set_visible_child_name("text");
+        }
+    });
+    parametric_stack.connect_visible_child_name_notify({
+        let visual_mode = visual_mode.clone();
+        let text_mode = text_mode.clone();
+        move |stack| {
+            let text = stack.visible_child_name().as_deref() == Some("text");
+            visual_mode.set_active(!text);
+            text_mode.set_active(text);
+        }
+    });
+    editor_switcher.append(&visual_mode);
+    editor_switcher.append(&text_mode);
     let reset_filters_button = gtk::Button::with_label("RESET FILTERS");
     reset_filters_button.add_css_class("reset-filters");
     reset_filters_button.set_tooltip_text(Some(
@@ -541,8 +584,14 @@ fn build_ui(app: &adw::Application) {
     ));
     let filter_toolbar = gtk::CenterBox::new();
     filter_toolbar.set_hexpand(true);
+    filter_toolbar.set_start_widget(Some(&editor_switcher));
     filter_toolbar.set_center_widget(Some(&switcher));
     filter_toolbar.set_end_widget(Some(&reset_filters_button));
+    narrow_filters.add_setter(
+        &filter_toolbar,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
     window.add_breakpoint(narrow_filters);
     window.add_breakpoint(narrow_route);
     let add_filter_button = gtk::Button::with_label("＋  ADD PARAMETRIC BAND");
@@ -562,12 +611,28 @@ fn build_ui(app: &adw::Application) {
     view_stack.connect_visible_child_name_notify({
         let add_filter = add_filter_button.clone();
         let reset_filters = reset_filters_button.clone();
+        let editor_switcher = editor_switcher.clone();
+        let parametric_stack = parametric_stack.clone();
         move |stack| {
             let parametric = stack.visible_child_name().as_deref() == Some("filters");
-            add_filter.set_visible(parametric);
+            let visual = parametric_stack.visible_child_name().as_deref() == Some("visual");
+            editor_switcher.set_visible(parametric);
+            add_filter.set_visible(parametric && visual);
             reset_filters.set_visible(true);
-            reset_filters.set_sensitive(parametric);
-            reset_filters.set_opacity(if parametric { 1.0 } else { 0.0 });
+            reset_filters.set_sensitive(parametric && visual);
+            reset_filters.set_opacity(if parametric && visual { 1.0 } else { 0.0 });
+        }
+    });
+    parametric_stack.connect_visible_child_name_notify({
+        let view_stack = view_stack.clone();
+        let add_filter = add_filter_button.clone();
+        let reset_filters = reset_filters_button.clone();
+        move |stack| {
+            let parametric = view_stack.visible_child_name().as_deref() == Some("filters");
+            let visual = stack.visible_child_name().as_deref() == Some("visual");
+            add_filter.set_visible(parametric && visual);
+            reset_filters.set_sensitive(parametric && visual);
+            reset_filters.set_opacity(if parametric && visual { 1.0 } else { 0.0 });
         }
     });
     content.append(&filter_toolbar);
@@ -680,6 +745,7 @@ fn build_ui(app: &adw::Application) {
         &device_bypass,
         &comparison_ui,
     );
+    install_editor_shortcut(&window, &view_stack, &parametric_stack);
     window.present();
 }
 
@@ -940,6 +1006,9 @@ fn wire_actions(
     buffer.connect_changed({
         let model = model.clone();
         let buffer = buffer.clone();
+        let text_view = text_view.clone();
+        let filter_list = filter_list.clone();
+        let convolution_ui = convolution_ui.clone();
         let name = name_entry.clone();
         let status = status.clone();
         let graph = graph.clone();
@@ -956,6 +1025,9 @@ fn wire_actions(
             }
             let model = model.clone();
             let buffer = buffer.clone();
+            let text_view = text_view.clone();
+            let filter_list = filter_list.clone();
+            let convolution_ui = convolution_ui.clone();
             let name = name.clone();
             let status = status.clone();
             let graph = graph.clone();
@@ -968,7 +1040,13 @@ fn wire_actions(
                     let text = buffer
                         .text(&buffer.start_iter(), &buffer.end_iter(), false)
                         .to_string();
-                    save_current(
+                    let draft = parse_text(name.text(), &text);
+                    if draft.is_activatable() {
+                        text_view.remove_css_class("invalid-draft");
+                    } else {
+                        text_view.add_css_class("invalid-draft");
+                    }
+                    let saved = save_current(
                         &model,
                         &name.text(),
                         &text,
@@ -976,6 +1054,10 @@ fn wire_actions(
                         &graph,
                         &analysis_label,
                     );
+                    if saved {
+                        rebuild_filter_list(&filter_list, &draft, &model, &buffer, &graph);
+                        update_convolution_ui(&convolution_ui, &draft);
+                    }
                 },
             ));
         }
@@ -2144,6 +2226,33 @@ fn install_comparison_shortcuts(
     window.add_controller(controller);
 }
 
+fn install_editor_shortcut(
+    window: &adw::ApplicationWindow,
+    mode_stack: &adw::ViewStack,
+    editor_stack: &gtk::Stack,
+) {
+    let controller = gtk::EventControllerKey::new();
+    controller.connect_key_pressed({
+        let mode_stack = mode_stack.clone();
+        let editor_stack = editor_stack.clone();
+        move |_, key, _, modifiers| {
+            let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
+            if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) || character != Some('e') {
+                return gtk::glib::Propagation::Proceed;
+            }
+            mode_stack.set_visible_child_name("filters");
+            let next = if editor_stack.visible_child_name().as_deref() == Some("text") {
+                "visual"
+            } else {
+                "text"
+            };
+            editor_stack.set_visible_child_name(next);
+            gtk::glib::Propagation::Stop
+        }
+    });
+    window.add_controller(controller);
+}
+
 fn update_device_controls(
     model: &Rc<Model>,
     drop: &gtk::DropDown,
@@ -2373,6 +2482,34 @@ fn install_css() {
 
         .comparison-candidate:checked {
             background-color: rgba(230, 75, 47, 0.10);
+        }
+
+        .editor-switcher button {
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            border-bottom: 2px solid transparent;
+            color: #8f9394;
+            font-family: monospace;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 8px 12px;
+        }
+
+        .editor-switcher button:checked {
+            background: transparent;
+            border-bottom-color: #e64b2f;
+            color: #f1f1ec;
+        }
+
+        .code-editor {
+            background-color: #151718;
+            border: 1px solid #292c2d;
+            border-radius: 22px;
+        }
+
+        textview.invalid-draft {
+            color: #ff9b88;
         }
 
         .profile-name {
@@ -2632,9 +2769,9 @@ fn save_current(
     status: &gtk::Label,
     graph: &gtk::DrawingArea,
     analysis_label: &gtk::Label,
-) {
+) -> bool {
     let Some(id) = model.current_id.borrow().clone() else {
-        return;
+        return false;
     };
     let parsed = parse_text(name, text);
     if !parsed.is_activatable() {
@@ -2645,7 +2782,7 @@ fn save_current(
                 .map(|d| format!("Line {}: {}", d.line, d.message))
                 .unwrap_or_else(|| "Invalid profile".into()),
         );
-        return;
+        return false;
     }
     match model.client.put(&id, name, text, model.manual_trim.get()) {
         Ok(profile) => {
@@ -2664,8 +2801,12 @@ fn save_current(
                 *model.analysis.borrow_mut() = Some(analysis);
                 graph.queue_draw();
             }
+            true
         }
-        Err(error) => status.set_text(&error.to_string()),
+        Err(error) => {
+            status.set_text(&error.to_string());
+            false
+        }
     }
 }
 

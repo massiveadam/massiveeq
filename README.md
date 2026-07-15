@@ -37,6 +37,7 @@ should therefore be treated as a public beta, not a production-stable release.
 - Eight-millisecond click-safe chain changes without removing the audio endpoint
 - Rate-aware compilation, high-quality IR resampling, and reported latency
 - Wayland-native GTK4 interface and systemd user service
+- Synchronized visual and Equalizer APO text editors with live validation
 - Optional StatusNotifier tray controls for Noctalia, Waybar, KDE Plasma, and other compatible bars
 
 ## Build
@@ -77,6 +78,11 @@ order. `Ctrl+B` toggles the selected output's level-matched bypass. Comparison
 candidates switch through the live 8 ms crossfade without replacing the
 PipeWire endpoint. Profiles with incompatible convolution latency cannot be
 placed in the same bank.
+
+The Parametric page can switch between **Visual** filter cards and the canonical
+Equalizer APO-style **Text** profile. Both edit the same draft and autosave
+after 300 ms. Invalid text remains visible for correction while the last valid
+audio chain continues playing. `Ctrl+E` toggles the two editor views.
 
 ## Text compatibility
 
