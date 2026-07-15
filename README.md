@@ -68,11 +68,20 @@ multichannel devices are never intercepted.
 ## Comparing profiles
 
 Open **Compare** in the Signal Route strip, choose between two and nine
-candidates, and select **Save + Start**. `Off` can be included as a dry
-candidate. MassiveEQ measures the complete response of every candidate and
-attenuates them to the quietest clipping-safe perceived level in that bank, so
-loudness does not bias the comparison. Banks are remembered independently for
+candidates, and select **Start Comparison**. The panel then becomes a set of
+listening buttons; selecting one immediately switches to that candidate. `Off`
+can be included as a dry candidate. Banks are remembered independently for
 each output and do not replace its normal assigned profile.
+
+Level matching predicts the expected [ITU-R BS.1770-5](https://www.itu.int/rec/R-REC-BS.1770-5-202311-I/en)
+K-weighted mean-square energy of stationary pink noise after the complete
+left/right transfer response. Every candidate is then attenuation-only matched
+to the quietest clipping-safe result in the bank. This gives a deterministic,
+content-independent comparison without gain pumping; the manual trim remains
+available for listener-specific correction. Exact perceived equality cannot be
+guaranteed without the listener's playback SPL and headphone transfer, which
+more detailed stationary-loudness models such as
+[ISO 532-2](https://www.iso.org/standard/63078.html) require.
 
 While the app is focused, `Alt+1` through `Alt+9` select candidates in bank
 order. `Ctrl+B` toggles the selected output's **Filters** switch. Turning

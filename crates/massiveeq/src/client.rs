@@ -62,11 +62,6 @@ impl Client {
             .call("SelectComparisonProfile", &(device_key, profile_id))
             .context("comparison switch failed")
     }
-    pub fn set_comparison_enabled(&self, device_key: &str, enabled: bool) -> Result<()> {
-        self.proxy()?
-            .call("SetComparisonEnabled", &(device_key, enabled))
-            .context("comparison mode change failed")
-    }
     pub fn delete_comparison(&self, device_key: &str) -> Result<()> {
         self.proxy()?
             .call("DeleteComparison", &(device_key))

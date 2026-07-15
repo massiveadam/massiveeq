@@ -31,7 +31,6 @@ struct Model {
     loading: Cell<bool>,
     syncing_device: Cell<bool>,
     syncing_engine: Cell<bool>,
-    syncing_comparison: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -47,18 +46,19 @@ struct ConvolutionUi {
     syncing: Rc<Cell<bool>>,
 }
 
-#[derive(Clone)]
 struct ComparisonUi {
     menu: gtk::MenuButton,
+    stack: gtk::Stack,
     candidates: gtk::Box,
     checks: Rc<RefCell<Vec<(String, gtk::ToggleButton)>>>,
-    active_strings: gtk::StringList,
-    active_ids: Rc<RefCell<Vec<String>>>,
-    active_drop: gtk::DropDown,
-    enabled: gtk::Switch,
+    listening: gtk::Box,
     save: gtk::Button,
+    edit: gtk::Button,
     delete: gtk::Button,
     status: gtk::Label,
+    device_state: gtk::Label,
+    assign: gtk::Button,
+    bypass: gtk::Switch,
 }
 
 fn main() {
@@ -125,7 +125,6 @@ fn build_ui(app: &adw::Application) {
         loading: Cell::new(false),
         syncing_device: Cell::new(false),
         syncing_engine: Cell::new(false),
-        syncing_comparison: Cell::new(false),
     });
 
     let window = adw::ApplicationWindow::builder()
@@ -317,78 +316,83 @@ fn build_ui(app: &adw::Application) {
     comparison_box.set_margin_bottom(14);
     comparison_box.set_margin_start(14);
     comparison_box.set_margin_end(14);
-    comparison_box.set_size_request(360, 420);
+    comparison_box.set_size_request(310, 390);
     let comparison_title = gtk::Label::new(Some("PROFILE COMPARISON"));
     comparison_title.set_xalign(0.0);
     comparison_title.add_css_class("panel-title");
     comparison_box.append(&comparison_title);
-    let comparison_help = gtk::Label::new(Some(
-        "Select 2–9 candidates. Each full-width row is a stable multi-select; every saved choice is matched to the quietest safe level.",
-    ));
-    comparison_help.set_wrap(true);
+
+    let comparison_stack = gtk::Stack::new();
+    comparison_stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
+    comparison_stack.set_transition_duration(160);
+    comparison_stack.set_vexpand(true);
+
+    let comparison_setup = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let comparison_help = gtk::Label::new(Some("Choose 2–9 profiles to compare."));
     comparison_help.set_xalign(0.0);
     comparison_help.add_css_class("level-code");
-    comparison_box.append(&comparison_help);
+    comparison_setup.append(&comparison_help);
     let comparison_candidates = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let comparison_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&comparison_candidates)
         .build();
-    comparison_box.append(&comparison_scroll);
-    let comparison_status = gtk::Label::new(Some("No comparison bank"));
-    comparison_status.set_xalign(0.0);
-    comparison_status.add_css_class("level-code");
-    comparison_box.append(&comparison_status);
-    let comparison_active_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let comparison_active_label = gtk::Label::new(Some("LISTEN TO"));
-    comparison_active_label.add_css_class("section-label");
-    comparison_active_row.append(&comparison_active_label);
-    let comparison_active_strings = gtk::StringList::new(&[]);
-    let comparison_active_drop = gtk::DropDown::new(
-        Some(comparison_active_strings.clone()),
-        gtk::Expression::NONE,
-    );
-    comparison_active_drop.set_hexpand(true);
-    comparison_active_drop.set_factory(Some(&ellipsized_string_factory(28)));
-    comparison_active_drop.set_list_factory(Some(&ellipsized_string_factory(42)));
-    comparison_active_row.append(&comparison_active_drop);
-    let comparison_enabled = gtk::Switch::new();
-    comparison_enabled.set_valign(gtk::Align::Center);
-    comparison_enabled.set_tooltip_text(Some("Enable this output's comparison bank"));
-    comparison_enabled
-        .update_property(&[gtk::accessible::Property::Label("Comparison bank active")]);
-    let comparison_enabled_label = gtk::Label::new(Some("BANK ACTIVE"));
-    comparison_enabled_label.add_css_class("section-label");
-    comparison_active_row.append(&comparison_enabled_label);
-    comparison_active_row.append(&comparison_enabled);
-    comparison_box.append(&comparison_active_row);
+    comparison_setup.append(&comparison_scroll);
+    let comparison_save = gtk::Button::with_label("START COMPARISON");
+    comparison_save.add_css_class("suggested-action");
+    comparison_setup.append(&comparison_save);
+    comparison_stack.add_named(&comparison_setup, Some("setup"));
+
+    let comparison_listen = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let listening_help = gtk::Label::new(Some("Tap a profile to hear it immediately."));
+    listening_help.set_xalign(0.0);
+    listening_help.add_css_class("level-code");
+    comparison_listen.append(&listening_help);
+    let comparison_listening_buttons = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    let comparison_listening_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&comparison_listening_buttons)
+        .build();
+    comparison_listen.append(&comparison_listening_scroll);
     let comparison_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     comparison_actions.set_homogeneous(true);
-    let comparison_save = gtk::Button::with_label("SAVE + START");
-    comparison_save.add_css_class("suggested-action");
-    let comparison_delete = gtk::Button::with_label("REMOVE BANK");
-    comparison_actions.append(&comparison_save);
+    let comparison_edit = gtk::Button::with_label("EDIT SET");
+    let comparison_delete = gtk::Button::with_label("END COMPARE");
+    comparison_actions.append(&comparison_edit);
     comparison_actions.append(&comparison_delete);
-    comparison_box.append(&comparison_actions);
+    comparison_listen.append(&comparison_actions);
+    comparison_stack.add_named(&comparison_listen, Some("listen"));
+    comparison_box.append(&comparison_stack);
+
+    let comparison_status = gtk::Label::new(Some("No comparison bank"));
+    comparison_status.set_xalign(0.0);
+    comparison_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    comparison_status.add_css_class("level-code");
+    comparison_box.append(&comparison_status);
     comparison_popover.set_child(Some(&comparison_box));
     let comparison_menu = gtk::MenuButton::new();
     comparison_menu.set_label("COMPARE");
     comparison_menu.set_popover(Some(&comparison_popover));
     comparison_menu.add_css_class("comparison-menu");
-    comparison_menu.set_tooltip_text(Some("Compare level-matched profiles on this output"));
-    let comparison_ui = ComparisonUi {
+    comparison_menu.set_tooltip_text(Some(
+        "Compare profiles at a shared BS.1770 K-weighted pink-noise level",
+    ));
+    let comparison_ui = Rc::new(ComparisonUi {
         menu: comparison_menu,
+        stack: comparison_stack,
         candidates: comparison_candidates,
         checks: Rc::new(RefCell::new(Vec::new())),
-        active_strings: comparison_active_strings,
-        active_ids: Rc::new(RefCell::new(Vec::new())),
-        active_drop: comparison_active_drop,
-        enabled: comparison_enabled,
+        listening: comparison_listening_buttons,
         save: comparison_save,
+        edit: comparison_edit,
         delete: comparison_delete,
         status: comparison_status,
-    };
+        device_state: device_state.clone(),
+        assign: assign_button.clone(),
+        bypass: device_bypass.clone(),
+    });
     device_actions.append(&comparison_ui.menu);
     device_actions.append(&assign_button);
     controls_card.append(&device_actions);
@@ -868,7 +872,7 @@ fn wire_actions(
     assign: &gtk::Button,
     device_bypass: &gtk::Switch,
     global_bypass: &gtk::Switch,
-    comparison_ui: &ComparisonUi,
+    comparison_ui: &Rc<ComparisonUi>,
     trim: &gtk::SpinButton,
 ) {
     let buffer = text_view.buffer();
@@ -1445,6 +1449,13 @@ fn wire_actions(
             }
         }
     });
+    comparison_ui.edit.connect_clicked({
+        let ui = comparison_ui.clone();
+        move |_| {
+            ui.stack.set_visible_child_name("setup");
+            ui.status.set_text("Choose the profiles in this comparison");
+        }
+    });
     comparison_ui.save.connect_clicked({
         let model = model.clone();
         let drop = device_drop.clone();
@@ -1479,82 +1490,6 @@ fn wire_actions(
                         .insert(device.key.as_storage_key(), comparison);
                     if let Ok(devices) = model.client.devices() {
                         *model.devices.borrow_mut() = devices;
-                    }
-                    refresh_comparison_ui(&model, &drop, &ui);
-                    update_device_controls(&model, &drop, &state, &assign, &bypass);
-                }
-                Err(error) => ui.status.set_text(&error.to_string()),
-            }
-        }
-    });
-    comparison_ui.active_drop.connect_selected_notify({
-        let model = model.clone();
-        let drop = device_drop.clone();
-        let ui = comparison_ui.clone();
-        let state = device_state.clone();
-        let assign = assign.clone();
-        let bypass = device_bypass.clone();
-        move |active_drop| {
-            if model.syncing_comparison.get() {
-                return;
-            }
-            let Some(device) = model
-                .devices
-                .borrow()
-                .get(drop.selected() as usize)
-                .cloned()
-            else {
-                return;
-            };
-            let Some(profile_id) = ui
-                .active_ids
-                .borrow()
-                .get(active_drop.selected() as usize)
-                .cloned()
-            else {
-                return;
-            };
-            match model
-                .client
-                .select_comparison_profile(&device.key.as_storage_key(), &profile_id)
-            {
-                Ok(()) => {
-                    if let Ok(comparisons) = model.client.comparisons() {
-                        *model.comparisons.borrow_mut() = comparisons;
-                    }
-                    refresh_comparison_ui(&model, &drop, &ui);
-                    update_device_controls(&model, &drop, &state, &assign, &bypass);
-                }
-                Err(error) => ui.status.set_text(&error.to_string()),
-            }
-        }
-    });
-    comparison_ui.enabled.connect_active_notify({
-        let model = model.clone();
-        let drop = device_drop.clone();
-        let ui = comparison_ui.clone();
-        let state = device_state.clone();
-        let assign = assign.clone();
-        let bypass = device_bypass.clone();
-        move |enabled| {
-            if model.syncing_comparison.get() {
-                return;
-            }
-            let Some(device) = model
-                .devices
-                .borrow()
-                .get(drop.selected() as usize)
-                .cloned()
-            else {
-                return;
-            };
-            match model
-                .client
-                .set_comparison_enabled(&device.key.as_storage_key(), enabled.is_active())
-            {
-                Ok(()) => {
-                    if let Ok(comparisons) = model.client.comparisons() {
-                        *model.comparisons.borrow_mut() = comparisons;
                     }
                     refresh_comparison_ui(&model, &drop, &ui);
                     update_device_controls(&model, &drop, &state, &assign, &bypass);
@@ -2233,9 +2168,12 @@ fn comparison_candidate_name(model: &Model, profile_id: &str) -> String {
         .unwrap_or_else(|| "Missing profile".into())
 }
 
-fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &ComparisonUi) {
+fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Rc<ComparisonUi>) {
     while let Some(child) = ui.candidates.first_child() {
         ui.candidates.remove(&child);
+    }
+    while let Some(child) = ui.listening.first_child() {
+        ui.listening.remove(&child);
     }
     ui.checks.borrow_mut().clear();
     let Some(device) = model
@@ -2246,6 +2184,7 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Compariso
     else {
         ui.menu.set_sensitive(false);
         ui.menu.set_label("COMPARE");
+        ui.stack.set_visible_child_name("setup");
         ui.status.set_text("No output selected");
         return;
     };
@@ -2331,32 +2270,89 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Compariso
         });
     }
 
-    let active_ids = comparison
+    let selected_ids = comparison
         .as_ref()
         .map(|comparison| comparison.profile_ids.clone())
         .unwrap_or_default();
     ui.save
-        .set_sensitive((2..=MAX_COMPARISON_PROFILES).contains(&active_ids.len()));
-    let active_names = active_ids
-        .iter()
-        .map(|profile_id| comparison_candidate_name(model, profile_id))
-        .collect::<Vec<_>>();
-    let active_name_refs = active_names.iter().map(String::as_str).collect::<Vec<_>>();
-    model.syncing_comparison.set(true);
-    ui.active_strings
-        .splice(0, ui.active_strings.n_items(), &active_name_refs);
-    *ui.active_ids.borrow_mut() = active_ids.clone();
+        .set_sensitive((2..=MAX_COMPARISON_PROFILES).contains(&selected_ids.len()));
     if let Some(comparison) = &comparison {
-        ui.save.set_label("UPDATE + START");
-        let selected = active_ids
-            .iter()
-            .position(|id| id == &comparison.active_profile_id)
-            .unwrap_or_default();
-        ui.active_drop.set_selected(selected as u32);
-        ui.enabled.set_active(comparison.enabled);
-        ui.enabled.set_sensitive(true);
-        ui.active_drop.set_sensitive(true);
+        ui.save.set_label("UPDATE COMPARISON");
         ui.delete.set_sensitive(true);
+        ui.stack.set_visible_child_name("listen");
+
+        for (index, profile_id) in comparison.profile_ids.iter().enumerate() {
+            let name = comparison_candidate_name(model, profile_id);
+            let button = gtk::Button::new();
+            button.set_hexpand(true);
+            button.add_css_class("comparison-listen");
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let label = gtk::Label::new(Some(&name));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let state_text = if comparison.enabled && profile_id == &comparison.active_profile_id {
+                "PLAYING".to_owned()
+            } else {
+                format!("ALT+{}", index + 1)
+            };
+            let state = gtk::Label::new(Some(&state_text));
+            state.add_css_class("comparison-mark");
+            row.append(&label);
+            row.append(&state);
+            button.set_child(Some(&row));
+            if comparison.enabled && profile_id == &comparison.active_profile_id {
+                button.add_css_class("active");
+            }
+            button.update_property(&[
+                gtk::accessible::Property::Label(&format!("Listen to {name}")),
+                gtk::accessible::Property::Description(
+                    if comparison.enabled && profile_id == &comparison.active_profile_id {
+                        "This is the profile currently playing."
+                    } else {
+                        "Switch immediately to this level-matched profile."
+                    },
+                ),
+            ]);
+            button.connect_clicked({
+                let model = model.clone();
+                let drop = drop.clone();
+                let ui = Rc::downgrade(ui);
+                let key = key.clone();
+                let profile_id = profile_id.clone();
+                move |_| match model.client.select_comparison_profile(&key, &profile_id) {
+                    Ok(()) => {
+                        if let Ok(comparisons) = model.client.comparisons() {
+                            *model.comparisons.borrow_mut() = comparisons;
+                        }
+                        if let Ok(devices) = model.client.devices() {
+                            *model.devices.borrow_mut() = devices;
+                        }
+                        let model = model.clone();
+                        let drop = drop.clone();
+                        if let Some(ui) = ui.upgrade() {
+                            gtk::glib::idle_add_local_once(move || {
+                                refresh_comparison_ui(&model, &drop, &ui);
+                                update_device_controls(
+                                    &model,
+                                    &drop,
+                                    &ui.device_state,
+                                    &ui.assign,
+                                    &ui.bypass,
+                                );
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(ui) = ui.upgrade() {
+                            ui.status.set_text(&error.to_string());
+                        }
+                    }
+                }
+            });
+            ui.listening.append(&button);
+        }
+
         let active_name = comparison_candidate_name(model, &comparison.active_profile_id);
         if comparison.enabled {
             let active_position = comparison
@@ -2369,33 +2365,27 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Compariso
                 "COMPARE · {active_position}/{}",
                 comparison.profile_ids.len()
             ));
-            ui.menu
-                .set_tooltip_text(Some(&format!("Level-matched comparison · {active_name}")));
-            ui.status.set_text(&format!(
-                "{} candidates · active · shared safe level",
-                comparison.profile_ids.len()
-            ));
+            ui.menu.set_tooltip_text(Some(&format!(
+                "BS.1770 K-weighted comparison · {active_name}"
+            )));
+            ui.status
+                .set_text(&format!("LEVEL MATCHED · {active_name}"));
         } else {
             ui.menu.set_label("COMPARE · PAUSED");
             ui.menu
                 .set_tooltip_text(Some("This output's comparison bank is paused"));
-            ui.status.set_text(&format!(
-                "{} candidates · paused",
-                comparison.profile_ids.len()
-            ));
+            ui.status.set_text("PAUSED · choose a profile to resume");
         }
     } else {
-        ui.save.set_label("SAVE + START");
-        ui.enabled.set_active(false);
-        ui.enabled.set_sensitive(false);
-        ui.active_drop.set_sensitive(false);
+        ui.save.set_label("START COMPARISON");
         ui.delete.set_sensitive(false);
+        ui.stack.set_visible_child_name("setup");
         ui.menu.set_label("COMPARE");
-        ui.menu
-            .set_tooltip_text(Some("Compare level-matched profiles on this output"));
+        ui.menu.set_tooltip_text(Some(
+            "Compare profiles at a shared BS.1770 K-weighted pink-noise level",
+        ));
         ui.status.set_text("Choose at least two candidates");
     }
-    model.syncing_comparison.set(false);
 }
 
 fn install_comparison_shortcuts(
@@ -2403,7 +2393,7 @@ fn install_comparison_shortcuts(
     model: &Rc<Model>,
     device_drop: &gtk::DropDown,
     device_bypass: &gtk::Switch,
-    comparison_ui: &ComparisonUi,
+    comparison_ui: &Rc<ComparisonUi>,
 ) {
     let controller = gtk::EventControllerKey::new();
     controller.connect_key_pressed({
@@ -2731,6 +2721,25 @@ fn install_css() {
             background-color: rgba(230, 75, 47, 0.10);
             border-color: rgba(230, 75, 47, 0.72);
             color: #f2f1ec;
+        }
+
+        .comparison-listen {
+            background-color: #1b1d1e;
+            border: 1px solid #2d3031;
+            border-radius: 10px;
+            padding: 8px 10px;
+            font-family: monospace;
+            box-shadow: none;
+        }
+
+        .comparison-listen.active {
+            background-color: #e64b2f;
+            border-color: #ef5a3e;
+            color: #fff8f4;
+        }
+
+        .comparison-listen.active .comparison-mark {
+            color: #fff8f4;
         }
 
         .comparison-mark {

@@ -265,26 +265,60 @@ fn graphic_gain_db(eq: &GraphicEq, frequency: f64) -> f64 {
 }
 
 fn k_weight_power(frequency: f64, sample_rate: f64) -> f64 {
-    let hp = Filter {
-        enabled: true,
-        kind: FilterKind::HighPass,
-        frequency: 38.0,
-        gain_db: 0.0,
-        q: 0.5,
-        channels: crate::model::ChannelSelection::All,
-    };
-    let shelf = Filter {
-        enabled: true,
-        kind: FilterKind::HighShelf,
-        frequency: 1681.974,
-        gain_db: 4.0,
-        q: std::f64::consts::FRAC_1_SQRT_2,
-        channels: crate::model::ChannelSelection::All,
-    };
+    let (shelf_b, shelf_a, rlb_b, rlb_a) = bs1770_k_weighting_coefficients(sample_rate);
     db_to_power(
-        filter_gain_db(&hp, frequency, sample_rate)
-            + filter_gain_db(&shelf, frequency, sample_rate),
+        coefficient_gain_db(shelf_b, shelf_a, frequency, sample_rate)
+            + coefficient_gain_db(rlb_b, rlb_a, frequency, sample_rate),
     )
+}
+
+fn bs1770_k_weighting_coefficients(sample_rate: f64) -> ([f64; 3], [f64; 3], [f64; 3], [f64; 3]) {
+    const SHELF_F0: f64 = 1_681.974_450_955_533;
+    const SHELF_GAIN_DB: f64 = 3.999_843_853_973_347;
+    const SHELF_Q: f64 = 0.707_175_236_955_419_6;
+    const SHELF_VB_EXPONENT: f64 = 0.499_666_774_154_541_6;
+    const RLB_F0: f64 = 38.135_470_876_024_44;
+    const RLB_Q: f64 = 0.500_327_037_323_877_3;
+
+    let k = (PI * SHELF_F0 / sample_rate).tan();
+    let vh = 10.0_f64.powf(SHELF_GAIN_DB / 20.0);
+    let vb = vh.powf(SHELF_VB_EXPONENT);
+    let a0 = 1.0 + k / SHELF_Q + k * k;
+    let shelf_b = [
+        (vh + vb * k / SHELF_Q + k * k) / a0,
+        2.0 * (k * k - vh) / a0,
+        (vh - vb * k / SHELF_Q + k * k) / a0,
+    ];
+    let shelf_a = [
+        1.0,
+        2.0 * (k * k - 1.0) / a0,
+        (1.0 - k / SHELF_Q + k * k) / a0,
+    ];
+
+    let k = (PI * RLB_F0 / sample_rate).tan();
+    let a0 = 1.0 + k / RLB_Q + k * k;
+    let rlb_b = [1.0, -2.0, 1.0];
+    let rlb_a = [
+        1.0,
+        2.0 * (k * k - 1.0) / a0,
+        (1.0 - k / RLB_Q + k * k) / a0,
+    ];
+    (shelf_b, shelf_a, rlb_b, rlb_a)
+}
+
+fn coefficient_gain_db(b: [f64; 3], a: [f64; 3], frequency: f64, sample_rate: f64) -> f64 {
+    let omega = 2.0 * PI * frequency / sample_rate;
+    let z1 = Complex::new(omega.cos(), -omega.sin());
+    let z2 = z1.mul(z1);
+    let numerator = Complex::new(
+        b[0] + b[1] * z1.re + b[2] * z2.re,
+        b[1] * z1.im + b[2] * z2.im,
+    );
+    let denominator = Complex::new(
+        a[0] + a[1] * z1.re + a[2] * z2.re,
+        a[1] * z1.im + a[2] * z2.im,
+    );
+    10.0 * numerator.div(denominator).abs2().max(1e-30).log10()
 }
 
 fn db_to_power(db: f64) -> f64 {
