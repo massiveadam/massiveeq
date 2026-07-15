@@ -1,5 +1,8 @@
 use crate::{AppState, refresh_locked};
-use massiveeq_core::{ChannelAnalysis, ChannelSelection, ProfileAnalysis};
+use massiveeq_core::{
+    COMPARISON_BYPASS_ID, ChannelAnalysis, ChannelSelection, ComparisonSet,
+    MAX_COMPARISON_PROFILES, ProfileAnalysis,
+};
 use massiveeq_dsp::{CompileOptions, compile_profile};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -135,6 +138,137 @@ impl Service {
         serde_json::to_string(&state.devices).map_err(failed)
     }
 
+    async fn list_comparisons(&self) -> fdo::Result<String> {
+        let state = self.state.lock().await;
+        serde_json::to_string(&state.library.comparison_sets).map_err(failed)
+    }
+
+    async fn configure_comparison(
+        &self,
+        device_key: &str,
+        profile_ids_json: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<String> {
+        let requested: Vec<String> = serde_json::from_str(profile_ids_json).map_err(failed)?;
+        let mut profile_ids = Vec::with_capacity(requested.len());
+        for profile_id in requested {
+            if !profile_ids.contains(&profile_id) {
+                profile_ids.push(profile_id);
+            }
+        }
+        if !(2..=MAX_COMPARISON_PROFILES).contains(&profile_ids.len()) {
+            return Err(fdo::Error::Failed(format!(
+                "choose between 2 and {MAX_COMPARISON_PROFILES} unique comparison candidates"
+            )));
+        }
+
+        let mut state = self.state.lock().await;
+        if let Some(missing) = profile_ids.iter().find(|profile_id| {
+            profile_id.as_str() != COMPARISON_BYPASS_ID
+                && !state.library.profiles.contains_key(*profile_id)
+        }) {
+            return Err(fdo::Error::Failed(format!(
+                "profile {missing} does not exist"
+            )));
+        }
+        let active_profile_id = state
+            .library
+            .comparison_sets
+            .get(device_key)
+            .map(|comparison| comparison.active_profile_id.clone())
+            .filter(|active| profile_ids.contains(active))
+            .unwrap_or_else(|| profile_ids[0].clone());
+        let comparison = ComparisonSet {
+            profile_ids,
+            active_profile_id,
+            enabled: true,
+        };
+        let device = state
+            .devices
+            .iter()
+            .find(|device| device.key.as_storage_key() == device_key)
+            .cloned()
+            .ok_or_else(|| fdo::Error::Failed("output is not known to MassiveEQ".into()))?;
+        crate::filter_host::validate_comparison_set(
+            &state.storage,
+            &state.library,
+            &device,
+            crate::device::graph_settings().await,
+            &comparison,
+        )
+        .map_err(failed)?;
+        state
+            .library
+            .comparison_sets
+            .insert(device_key.to_owned(), comparison.clone());
+        state.library.bypassed_devices.remove(device_key);
+        state.storage.save_library(&state.library).map_err(failed)?;
+        refresh_locked(&mut state, false).await.map_err(failed)?;
+        let result = serde_json::to_string(&comparison).map_err(failed)?;
+        Self::changed(&emitter, "comparison")
+            .await
+            .map_err(failed)?;
+        Ok(result)
+    }
+
+    async fn select_comparison_profile(
+        &self,
+        device_key: &str,
+        profile_id: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<()> {
+        let mut state = self.state.lock().await;
+        let comparison = state
+            .library
+            .comparison_sets
+            .get_mut(device_key)
+            .ok_or_else(|| fdo::Error::Failed("this output has no comparison bank".into()))?;
+        if !comparison.profile_ids.iter().any(|id| id == profile_id) {
+            return Err(fdo::Error::Failed(
+                "the requested profile is not in this comparison bank".into(),
+            ));
+        }
+        comparison.active_profile_id = profile_id.to_owned();
+        comparison.enabled = true;
+        state.library.bypassed_devices.remove(device_key);
+        state.storage.save_library(&state.library).map_err(failed)?;
+        refresh_locked(&mut state, false).await.map_err(failed)?;
+        Self::changed(&emitter, "comparison").await.map_err(failed)
+    }
+
+    async fn set_comparison_enabled(
+        &self,
+        device_key: &str,
+        enabled: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<()> {
+        let mut state = self.state.lock().await;
+        let comparison = state
+            .library
+            .comparison_sets
+            .get_mut(device_key)
+            .ok_or_else(|| fdo::Error::Failed("this output has no comparison bank".into()))?;
+        comparison.enabled = enabled;
+        if enabled {
+            state.library.bypassed_devices.remove(device_key);
+        }
+        state.storage.save_library(&state.library).map_err(failed)?;
+        refresh_locked(&mut state, false).await.map_err(failed)?;
+        Self::changed(&emitter, "comparison").await.map_err(failed)
+    }
+
+    async fn delete_comparison(
+        &self,
+        device_key: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<()> {
+        let mut state = self.state.lock().await;
+        state.library.comparison_sets.remove(device_key);
+        state.storage.save_library(&state.library).map_err(failed)?;
+        refresh_locked(&mut state, false).await.map_err(failed)?;
+        Self::changed(&emitter, "comparison").await.map_err(failed)
+    }
+
     async fn assign_profile(
         &self,
         device_key: &str,
@@ -210,7 +344,7 @@ impl Service {
 
     async fn status(&self) -> fdo::Result<String> {
         let state = self.state.lock().await;
-        Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass, "engine": state.host.status_json() }).to_string())
+        Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass, "comparisons": state.library.comparison_sets, "engine": state.host.status_json() }).to_string())
     }
 
     #[zbus(signal)]

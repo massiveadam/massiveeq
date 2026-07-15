@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use massiveeq_core::{DeviceInfo, ProfileAnalysis, ProfileInfo};
+use massiveeq_core::{ComparisonSet, DeviceInfo, ProfileAnalysis, ProfileInfo};
+use std::collections::HashMap;
 use zbus::blocking::{Connection, Proxy};
 
 pub struct Client {
@@ -43,6 +44,33 @@ impl Client {
     }
     pub fn devices(&self) -> Result<Vec<DeviceInfo>> {
         self.call_json("ListDevices", &())
+    }
+    pub fn comparisons(&self) -> Result<HashMap<String, ComparisonSet>> {
+        self.call_json("ListComparisons", &())
+    }
+    pub fn configure_comparison(
+        &self,
+        device_key: &str,
+        profile_ids: &[String],
+    ) -> Result<ComparisonSet> {
+        let json =
+            serde_json::to_string(profile_ids).context("could not encode comparison bank")?;
+        self.call_json("ConfigureComparison", &(device_key, json))
+    }
+    pub fn select_comparison_profile(&self, device_key: &str, profile_id: &str) -> Result<()> {
+        self.proxy()?
+            .call("SelectComparisonProfile", &(device_key, profile_id))
+            .context("comparison switch failed")
+    }
+    pub fn set_comparison_enabled(&self, device_key: &str, enabled: bool) -> Result<()> {
+        self.proxy()?
+            .call("SetComparisonEnabled", &(device_key, enabled))
+            .context("comparison mode change failed")
+    }
+    pub fn delete_comparison(&self, device_key: &str) -> Result<()> {
+        self.proxy()?
+            .call("DeleteComparison", &(device_key))
+            .context("comparison bank removal failed")
     }
     pub fn create(&self, name: &str) -> Result<ProfileInfo> {
         self.call_json("CreateProfile", &(name))

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ksni::{Status, ToolTip, TrayMethods};
-use massiveeq_core::{DeviceInfo, ProfileInfo};
+use massiveeq_core::{COMPARISON_BYPASS_ID, ComparisonSet, DeviceInfo, ProfileInfo};
+use std::collections::HashMap;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use zbus::{Connection, Proxy};
 
@@ -20,6 +21,10 @@ enum Action {
         key: String,
         profile: Option<String>,
     },
+    SelectComparison {
+        key: String,
+        profile: String,
+    },
     Refresh,
     Quit,
 }
@@ -30,6 +35,7 @@ struct Snapshot {
     global_bypass: bool,
     profiles: Vec<ProfileInfo>,
     devices: Vec<DeviceInfo>,
+    comparisons: HashMap<String, ComparisonSet>,
     error: Option<String>,
 }
 
@@ -48,12 +54,17 @@ impl MassiveEqTray {
             "Unavailable"
         } else if self.snapshot.global_bypass {
             "Bypassed"
-        } else if self
-            .snapshot
-            .devices
-            .iter()
-            .any(|device| device.connected && device.assigned_profile.is_some() && !device.bypassed)
-        {
+        } else if self.snapshot.devices.iter().any(|device| {
+            let key = device.key.as_storage_key();
+            device.connected
+                && !device.bypassed
+                && (device.assigned_profile.is_some()
+                    || self
+                        .snapshot
+                        .comparisons
+                        .get(&key)
+                        .is_some_and(|comparison| comparison.enabled))
+        }) {
             "Active"
         } else {
             "Idle"
@@ -100,6 +111,89 @@ impl MassiveEqTray {
         let assignment_ids = profile_ids;
         let bypass_key = key;
         let bypassed = device.bypassed;
+        let mut submenu = vec![
+            RadioGroup {
+                selected,
+                options,
+                select: Box::new(move |tray: &mut Self, index| {
+                    if let Some(profile) = assignment_ids.get(index).cloned() {
+                        tray.send(Action::Assign {
+                            key: assignment_key.clone(),
+                            profile,
+                        });
+                    }
+                }),
+            }
+            .into(),
+        ];
+        if let Some(comparison) = self
+            .snapshot
+            .comparisons
+            .get(&device.key.as_storage_key())
+            .filter(|comparison| comparison.enabled)
+        {
+            let comparison_ids = comparison.profile_ids.clone();
+            let comparison_selected = comparison_ids
+                .iter()
+                .position(|id| id == &comparison.active_profile_id)
+                .unwrap_or_default();
+            let comparison_options = comparison_ids
+                .iter()
+                .map(|id| RadioItem {
+                    label: if id == COMPARISON_BYPASS_ID {
+                        "Off · level matched".into()
+                    } else {
+                        self.snapshot
+                            .profiles
+                            .iter()
+                            .find(|profile| &profile.id == id)
+                            .map(|profile| profile.name.clone())
+                            .unwrap_or_else(|| "Missing profile".into())
+                    },
+                    ..Default::default()
+                })
+                .collect();
+            let comparison_key = device.key.as_storage_key();
+            submenu.push(MenuItem::Separator);
+            submenu.push(
+                SubMenu {
+                    label: "Level-matched comparison".into(),
+                    icon_name: "media-playlist-shuffle-symbolic".into(),
+                    submenu: vec![
+                        RadioGroup {
+                            selected: comparison_selected,
+                            options: comparison_options,
+                            select: Box::new(move |tray: &mut Self, index| {
+                                if let Some(profile) = comparison_ids.get(index) {
+                                    tray.send(Action::SelectComparison {
+                                        key: comparison_key.clone(),
+                                        profile: profile.clone(),
+                                    });
+                                }
+                            }),
+                        }
+                        .into(),
+                    ],
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        submenu.push(MenuItem::Separator);
+        submenu.push(
+            CheckmarkItem {
+                label: "Bypass this output".into(),
+                checked: bypassed,
+                activate: Box::new(move |tray: &mut Self| {
+                    tray.send(Action::SetDeviceBypass {
+                        key: bypass_key.clone(),
+                        bypassed: !bypassed,
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
         SubMenu {
             label: if device.connected {
                 device.description.clone()
@@ -107,34 +201,7 @@ impl MassiveEqTray {
                 format!("{} (disconnected)", device.description)
             },
             icon_name: "audio-headphones-symbolic".into(),
-            submenu: vec![
-                RadioGroup {
-                    selected,
-                    options,
-                    select: Box::new(move |tray: &mut Self, index| {
-                        if let Some(profile) = assignment_ids.get(index).cloned() {
-                            tray.send(Action::Assign {
-                                key: assignment_key.clone(),
-                                profile,
-                            });
-                        }
-                    }),
-                }
-                .into(),
-                MenuItem::Separator,
-                CheckmarkItem {
-                    label: "Bypass this output".into(),
-                    checked: bypassed,
-                    activate: Box::new(move |tray: &mut Self| {
-                        tray.send(Action::SetDeviceBypass {
-                            key: bypass_key.clone(),
-                            bypassed: !bypassed,
-                        });
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            ],
+            submenu,
             ..Default::default()
         }
         .into()
@@ -186,11 +253,33 @@ impl ksni::Tray for MassiveEqTray {
                 .iter()
                 .filter(|device| device.connected)
                 .map(|device| {
-                    let profile = device
-                        .assigned_profile
-                        .as_ref()
-                        .and_then(|id| self.snapshot.profiles.iter().find(|p| &p.id == id))
-                        .map_or("Unassigned", |profile| profile.name.as_str());
+                    let key = device.key.as_storage_key();
+                    let profile = self
+                        .snapshot
+                        .comparisons
+                        .get(&key)
+                        .filter(|comparison| comparison.enabled)
+                        .map(|comparison| {
+                            if comparison.active_profile_id == COMPARISON_BYPASS_ID {
+                                "Comparing: Off".to_owned()
+                            } else {
+                                let name = self
+                                    .snapshot
+                                    .profiles
+                                    .iter()
+                                    .find(|profile| profile.id == comparison.active_profile_id)
+                                    .map_or("Missing profile", |profile| profile.name.as_str());
+                                format!("Comparing: {name}")
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            device
+                                .assigned_profile
+                                .as_ref()
+                                .and_then(|id| self.snapshot.profiles.iter().find(|p| &p.id == id))
+                                .map_or("Unassigned", |profile| profile.name.as_str())
+                                .to_owned()
+                        });
                     format!("{} — {profile}", device.description)
                 })
                 .collect::<Vec<_>>();
@@ -331,6 +420,8 @@ impl Client {
     async fn snapshot(&self) -> Result<Snapshot> {
         let profiles: Vec<ProfileInfo> = self.call_json("ListProfiles", &()).await?;
         let devices: Vec<DeviceInfo> = self.call_json("ListDevices", &()).await?;
+        let comparisons: HashMap<String, ComparisonSet> =
+            self.call_json("ListComparisons", &()).await?;
         let status: serde_json::Value = self.call_json("Status", &()).await?;
         Ok(Snapshot {
             online: true,
@@ -340,6 +431,7 @@ impl Client {
                 .unwrap_or(false),
             profiles,
             devices,
+            comparisons,
             error: None,
         })
     }
@@ -366,6 +458,14 @@ impl Client {
             .call("SetGlobalBypass", &(bypassed))
             .await
             .context("could not update global bypass")
+    }
+
+    async fn select_comparison(&self, key: &str, profile: &str) -> Result<()> {
+        self.proxy()
+            .await?
+            .call("SelectComparisonProfile", &(key, profile))
+            .await
+            .context("could not switch comparison profile")
     }
 
     async fn call_json<
@@ -456,6 +556,13 @@ async fn main() -> Result<()> {
             Action::Assign { key, profile } => {
                 if let Some(client) = client.as_ref() {
                     client.assign(&key, profile.as_deref()).await
+                } else {
+                    Err(anyhow::anyhow!("MassiveEQ audio service is unavailable"))
+                }
+            }
+            Action::SelectComparison { key, profile } => {
+                if let Some(client) = client.as_ref() {
+                    client.select_comparison(&key, &profile).await
                 } else {
                     Err(anyhow::anyhow!("MassiveEQ audio service is unavailable"))
                 }

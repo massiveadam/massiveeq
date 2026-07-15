@@ -5,11 +5,13 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 use massiveeq_core::{
-    ChannelSelection, DeviceInfo, Filter, FilterKind, ProfileAnalysis, ProfileDocument,
-    ProfileInfo, analyze_profile_preview, parse_text, serialize_profile,
+    COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
+    ProfileAnalysis, ProfileDocument, ProfileInfo, analyze_profile_preview, parse_text,
+    serialize_profile,
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
 };
 
@@ -19,6 +21,7 @@ struct Model {
     client: Client,
     profiles: RefCell<Vec<ProfileInfo>>,
     devices: RefCell<Vec<DeviceInfo>>,
+    comparisons: RefCell<HashMap<String, ComparisonSet>>,
     current_id: RefCell<Option<String>>,
     document: Rc<RefCell<Option<ProfileDocument>>>,
     analysis: Rc<RefCell<Option<ProfileAnalysis>>>,
@@ -27,6 +30,7 @@ struct Model {
     sample_rate: Cell<f64>,
     loading: Cell<bool>,
     syncing_device: Cell<bool>,
+    syncing_comparison: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -40,6 +44,20 @@ struct ConvolutionUi {
     add_filter: gtk::Button,
     reset_filters: gtk::Button,
     syncing: Rc<Cell<bool>>,
+}
+
+#[derive(Clone)]
+struct ComparisonUi {
+    menu: gtk::MenuButton,
+    candidates: gtk::Box,
+    checks: Rc<RefCell<Vec<(String, gtk::CheckButton)>>>,
+    active_strings: gtk::StringList,
+    active_ids: Rc<RefCell<Vec<String>>>,
+    active_drop: gtk::DropDown,
+    enabled: gtk::Switch,
+    save: gtk::Button,
+    delete: gtk::Button,
+    status: gtk::Label,
 }
 
 fn main() {
@@ -68,6 +86,7 @@ fn build_ui(app: &adw::Application) {
     let model = Rc::new(Model {
         profiles: RefCell::new(client.profiles().unwrap_or_default()),
         devices: RefCell::new(client.devices().unwrap_or_default()),
+        comparisons: RefCell::new(client.comparisons().unwrap_or_default()),
         client,
         current_id: RefCell::new(None),
         document: Rc::new(RefCell::new(None)),
@@ -77,6 +96,7 @@ fn build_ui(app: &adw::Application) {
         sample_rate: Cell::new(active_sample_rate),
         loading: Cell::new(false),
         syncing_device: Cell::new(false),
+        syncing_comparison: Cell::new(false),
     });
 
     let window = adw::ApplicationWindow::builder()
@@ -245,6 +265,80 @@ fn build_ui(app: &adw::Application) {
     bypass_row.append(&gtk::Label::new(Some("Bypass output")));
     bypass_row.append(&device_bypass);
     device_actions.append(&bypass_row);
+    let comparison_popover = gtk::Popover::new();
+    let comparison_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    comparison_box.set_margin_top(14);
+    comparison_box.set_margin_bottom(14);
+    comparison_box.set_margin_start(14);
+    comparison_box.set_margin_end(14);
+    comparison_box.set_size_request(360, 420);
+    let comparison_title = gtk::Label::new(Some("PROFILE COMPARISON"));
+    comparison_title.set_xalign(0.0);
+    comparison_title.add_css_class("panel-title");
+    comparison_box.append(&comparison_title);
+    let comparison_help = gtk::Label::new(Some(
+        "Choose 2–9 candidates. Every choice is matched to the quietest safe level.",
+    ));
+    comparison_help.set_wrap(true);
+    comparison_help.set_xalign(0.0);
+    comparison_help.add_css_class("level-code");
+    comparison_box.append(&comparison_help);
+    let comparison_candidates = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let comparison_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&comparison_candidates)
+        .build();
+    comparison_box.append(&comparison_scroll);
+    let comparison_status = gtk::Label::new(Some("No comparison bank"));
+    comparison_status.set_xalign(0.0);
+    comparison_status.add_css_class("level-code");
+    comparison_box.append(&comparison_status);
+    let comparison_active_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let comparison_active_label = gtk::Label::new(Some("LISTEN TO"));
+    comparison_active_label.add_css_class("section-label");
+    comparison_active_row.append(&comparison_active_label);
+    let comparison_active_strings = gtk::StringList::new(&[]);
+    let comparison_active_drop = gtk::DropDown::new(
+        Some(comparison_active_strings.clone()),
+        gtk::Expression::NONE,
+    );
+    comparison_active_drop.set_hexpand(true);
+    comparison_active_drop.set_factory(Some(&ellipsized_string_factory(28)));
+    comparison_active_drop.set_list_factory(Some(&ellipsized_string_factory(42)));
+    comparison_active_row.append(&comparison_active_drop);
+    let comparison_enabled = gtk::Switch::new();
+    comparison_enabled.set_valign(gtk::Align::Center);
+    comparison_enabled.set_tooltip_text(Some("Enable this output's comparison bank"));
+    comparison_active_row.append(&comparison_enabled);
+    comparison_box.append(&comparison_active_row);
+    let comparison_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    comparison_actions.set_homogeneous(true);
+    let comparison_save = gtk::Button::with_label("SAVE + START");
+    comparison_save.add_css_class("suggested-action");
+    let comparison_delete = gtk::Button::with_label("REMOVE BANK");
+    comparison_actions.append(&comparison_save);
+    comparison_actions.append(&comparison_delete);
+    comparison_box.append(&comparison_actions);
+    comparison_popover.set_child(Some(&comparison_box));
+    let comparison_menu = gtk::MenuButton::new();
+    comparison_menu.set_label("COMPARE");
+    comparison_menu.set_popover(Some(&comparison_popover));
+    comparison_menu.add_css_class("comparison-menu");
+    comparison_menu.set_tooltip_text(Some("Compare level-matched profiles on this output"));
+    let comparison_ui = ComparisonUi {
+        menu: comparison_menu,
+        candidates: comparison_candidates,
+        checks: Rc::new(RefCell::new(Vec::new())),
+        active_strings: comparison_active_strings,
+        active_ids: Rc::new(RefCell::new(Vec::new())),
+        active_drop: comparison_active_drop,
+        enabled: comparison_enabled,
+        save: comparison_save,
+        delete: comparison_delete,
+        status: comparison_status,
+    };
+    device_actions.append(&comparison_ui.menu);
     device_actions.append(&assign_button);
     controls_card.append(&device_actions);
     dashboard.append(&controls_card);
@@ -318,12 +412,17 @@ fn build_ui(app: &adw::Application) {
         "min-children-per-line",
         Some(&1_u32.to_value()),
     );
-    narrow_filters.add_setter(
+    let narrow_route = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        1040.0,
+        adw::LengthUnit::Px,
+    ));
+    narrow_route.add_setter(
         &controls_card,
         "orientation",
         Some(&gtk::Orientation::Vertical.to_value()),
     );
-    narrow_filters.add_setter(
+    narrow_route.add_setter(
         &route_rule,
         "orientation",
         Some(&gtk::Orientation::Horizontal.to_value()),
@@ -445,6 +544,7 @@ fn build_ui(app: &adw::Application) {
     filter_toolbar.set_center_widget(Some(&switcher));
     filter_toolbar.set_end_widget(Some(&reset_filters_button));
     window.add_breakpoint(narrow_filters);
+    window.add_breakpoint(narrow_route);
     let add_filter_button = gtk::Button::with_label("＋  ADD PARAMETRIC BAND");
     add_filter_button.add_css_class("band-add");
     add_filter_button.set_hexpand(true);
@@ -520,6 +620,7 @@ fn build_ui(app: &adw::Application) {
         &assign_button,
         &device_bypass,
         &global_bypass,
+        &comparison_ui,
         &trim,
     );
     gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), {
@@ -529,6 +630,7 @@ fn build_ui(app: &adw::Application) {
         let state = device_state.clone();
         let assign = assign_button.clone();
         let bypass = device_bypass.clone();
+        let comparison_ui = comparison_ui.clone();
         move || {
             if let Ok(devices) = model.client.devices() {
                 let selected_key = model
@@ -552,6 +654,10 @@ fn build_ui(app: &adw::Application) {
                     drop.set_selected(index as u32);
                 }
                 update_device_controls(&model, &drop, &state, &assign, &bypass);
+                if let Ok(comparisons) = model.client.comparisons() {
+                    *model.comparisons.borrow_mut() = comparisons;
+                }
+                refresh_comparison_ui(&model, &drop, &comparison_ui);
             }
             gtk::glib::ControlFlow::Continue
         }
@@ -565,6 +671,14 @@ fn build_ui(app: &adw::Application) {
         &device_state,
         &assign_button,
         &device_bypass,
+    );
+    refresh_comparison_ui(&model, &device_drop, &comparison_ui);
+    install_comparison_shortcuts(
+        &window,
+        &model,
+        &device_drop,
+        &device_bypass,
+        &comparison_ui,
     );
     window.present();
 }
@@ -596,6 +710,7 @@ fn wire_actions(
     assign: &gtk::Button,
     device_bypass: &gtk::Switch,
     global_bypass: &gtk::Switch,
+    comparison_ui: &ComparisonUi,
     trim: &gtk::SpinButton,
 ) {
     let buffer = text_view.buffer();
@@ -1076,8 +1191,170 @@ fn wire_actions(
         let state = device_state.clone();
         let assign = assign.clone();
         let bypass = device_bypass.clone();
+        let comparison_ui = comparison_ui.clone();
         move |drop| {
             update_device_controls(&model, drop, &state, &assign, &bypass);
+            refresh_comparison_ui(&model, drop, &comparison_ui);
+        }
+    });
+    comparison_ui.menu.connect_active_notify({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let ui = comparison_ui.clone();
+        move |menu| {
+            if menu.is_active() {
+                if let Ok(comparisons) = model.client.comparisons() {
+                    *model.comparisons.borrow_mut() = comparisons;
+                }
+                refresh_comparison_ui(&model, &drop, &ui);
+            }
+        }
+    });
+    comparison_ui.save.connect_clicked({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let ui = comparison_ui.clone();
+        let state = device_state.clone();
+        let assign = assign.clone();
+        let bypass = device_bypass.clone();
+        move |_| {
+            let Some(device) = model
+                .devices
+                .borrow()
+                .get(drop.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            let selected = ui
+                .checks
+                .borrow()
+                .iter()
+                .filter(|(_, check)| check.is_active())
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            match model
+                .client
+                .configure_comparison(&device.key.as_storage_key(), &selected)
+            {
+                Ok(comparison) => {
+                    model
+                        .comparisons
+                        .borrow_mut()
+                        .insert(device.key.as_storage_key(), comparison);
+                    if let Ok(devices) = model.client.devices() {
+                        *model.devices.borrow_mut() = devices;
+                    }
+                    refresh_comparison_ui(&model, &drop, &ui);
+                    update_device_controls(&model, &drop, &state, &assign, &bypass);
+                }
+                Err(error) => ui.status.set_text(&error.to_string()),
+            }
+        }
+    });
+    comparison_ui.active_drop.connect_selected_notify({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let ui = comparison_ui.clone();
+        let state = device_state.clone();
+        let assign = assign.clone();
+        let bypass = device_bypass.clone();
+        move |active_drop| {
+            if model.syncing_comparison.get() {
+                return;
+            }
+            let Some(device) = model
+                .devices
+                .borrow()
+                .get(drop.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            let Some(profile_id) = ui
+                .active_ids
+                .borrow()
+                .get(active_drop.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            match model
+                .client
+                .select_comparison_profile(&device.key.as_storage_key(), &profile_id)
+            {
+                Ok(()) => {
+                    if let Ok(comparisons) = model.client.comparisons() {
+                        *model.comparisons.borrow_mut() = comparisons;
+                    }
+                    refresh_comparison_ui(&model, &drop, &ui);
+                    update_device_controls(&model, &drop, &state, &assign, &bypass);
+                }
+                Err(error) => ui.status.set_text(&error.to_string()),
+            }
+        }
+    });
+    comparison_ui.enabled.connect_active_notify({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let ui = comparison_ui.clone();
+        let state = device_state.clone();
+        let assign = assign.clone();
+        let bypass = device_bypass.clone();
+        move |enabled| {
+            if model.syncing_comparison.get() {
+                return;
+            }
+            let Some(device) = model
+                .devices
+                .borrow()
+                .get(drop.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            match model
+                .client
+                .set_comparison_enabled(&device.key.as_storage_key(), enabled.is_active())
+            {
+                Ok(()) => {
+                    if let Ok(comparisons) = model.client.comparisons() {
+                        *model.comparisons.borrow_mut() = comparisons;
+                    }
+                    refresh_comparison_ui(&model, &drop, &ui);
+                    update_device_controls(&model, &drop, &state, &assign, &bypass);
+                }
+                Err(error) => ui.status.set_text(&error.to_string()),
+            }
+        }
+    });
+    comparison_ui.delete.connect_clicked({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let ui = comparison_ui.clone();
+        let state = device_state.clone();
+        let assign = assign.clone();
+        let bypass = device_bypass.clone();
+        move |_| {
+            let Some(device) = model
+                .devices
+                .borrow()
+                .get(drop.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            match model.client.delete_comparison(&device.key.as_storage_key()) {
+                Ok(()) => {
+                    model
+                        .comparisons
+                        .borrow_mut()
+                        .remove(&device.key.as_storage_key());
+                    refresh_comparison_ui(&model, &drop, &ui);
+                    update_device_controls(&model, &drop, &state, &assign, &bypass);
+                }
+                Err(error) => ui.status.set_text(&error.to_string()),
+            }
         }
     });
     device_bypass.connect_active_notify({
@@ -1685,6 +1962,188 @@ fn format_band_frequency(frequency: f64) -> String {
     }
 }
 
+fn comparison_candidate_name(model: &Model, profile_id: &str) -> String {
+    if profile_id == COMPARISON_BYPASS_ID {
+        return "OFF · LEVEL MATCHED".into();
+    }
+    model
+        .profiles
+        .borrow()
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .map(|profile| profile.name.clone())
+        .unwrap_or_else(|| "Missing profile".into())
+}
+
+fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &ComparisonUi) {
+    while let Some(child) = ui.candidates.first_child() {
+        ui.candidates.remove(&child);
+    }
+    ui.checks.borrow_mut().clear();
+    let Some(device) = model
+        .devices
+        .borrow()
+        .get(drop.selected() as usize)
+        .cloned()
+    else {
+        ui.menu.set_sensitive(false);
+        ui.menu.set_label("COMPARE");
+        ui.status.set_text("No output selected");
+        return;
+    };
+    ui.menu.set_sensitive(matches!(device.channels, 1 | 2));
+    let key = device.key.as_storage_key();
+    let comparison = model.comparisons.borrow().get(&key).cloned();
+
+    let mut candidates = Vec::with_capacity(model.profiles.borrow().len() + 1);
+    candidates.push((
+        COMPARISON_BYPASS_ID.to_owned(),
+        "OFF · level matched".to_owned(),
+    ));
+    candidates.extend(
+        model
+            .profiles
+            .borrow()
+            .iter()
+            .map(|profile| (profile.id.clone(), profile.name.clone())),
+    );
+    for (profile_id, name) in candidates {
+        let check = gtk::CheckButton::with_label(&name);
+        check.set_active(
+            comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.profile_ids.contains(&profile_id)),
+        );
+        check.add_css_class("comparison-candidate");
+        ui.candidates.append(&check);
+        ui.checks.borrow_mut().push((profile_id, check));
+    }
+
+    let active_ids = comparison
+        .as_ref()
+        .map(|comparison| comparison.profile_ids.clone())
+        .unwrap_or_default();
+    let active_names = active_ids
+        .iter()
+        .map(|profile_id| comparison_candidate_name(model, profile_id))
+        .collect::<Vec<_>>();
+    let active_name_refs = active_names.iter().map(String::as_str).collect::<Vec<_>>();
+    model.syncing_comparison.set(true);
+    ui.active_strings
+        .splice(0, ui.active_strings.n_items(), &active_name_refs);
+    *ui.active_ids.borrow_mut() = active_ids.clone();
+    if let Some(comparison) = &comparison {
+        let selected = active_ids
+            .iter()
+            .position(|id| id == &comparison.active_profile_id)
+            .unwrap_or_default();
+        ui.active_drop.set_selected(selected as u32);
+        ui.enabled.set_active(comparison.enabled);
+        ui.enabled.set_sensitive(true);
+        ui.active_drop.set_sensitive(true);
+        ui.delete.set_sensitive(true);
+        let active_name = comparison_candidate_name(model, &comparison.active_profile_id);
+        if comparison.enabled {
+            let active_position = comparison
+                .profile_ids
+                .iter()
+                .position(|id| id == &comparison.active_profile_id)
+                .unwrap_or_default()
+                + 1;
+            ui.menu.set_label(&format!(
+                "COMPARE · {active_position}/{}",
+                comparison.profile_ids.len()
+            ));
+            ui.menu
+                .set_tooltip_text(Some(&format!("Level-matched comparison · {active_name}")));
+            ui.status.set_text(&format!(
+                "{} candidates · active · shared safe level",
+                comparison.profile_ids.len()
+            ));
+        } else {
+            ui.menu.set_label("COMPARE · PAUSED");
+            ui.menu
+                .set_tooltip_text(Some("This output's comparison bank is paused"));
+            ui.status.set_text(&format!(
+                "{} candidates · paused",
+                comparison.profile_ids.len()
+            ));
+        }
+    } else {
+        ui.enabled.set_active(false);
+        ui.enabled.set_sensitive(false);
+        ui.active_drop.set_sensitive(false);
+        ui.delete.set_sensitive(false);
+        ui.menu.set_label("COMPARE");
+        ui.menu
+            .set_tooltip_text(Some("Compare level-matched profiles on this output"));
+        ui.status.set_text("Choose at least two candidates");
+    }
+    model.syncing_comparison.set(false);
+}
+
+fn install_comparison_shortcuts(
+    window: &adw::ApplicationWindow,
+    model: &Rc<Model>,
+    device_drop: &gtk::DropDown,
+    device_bypass: &gtk::Switch,
+    comparison_ui: &ComparisonUi,
+) {
+    let controller = gtk::EventControllerKey::new();
+    controller.connect_key_pressed({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let bypass = device_bypass.clone();
+        let ui = comparison_ui.clone();
+        move |_, key, _, modifiers| {
+            let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
+            if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) && character == Some('b') {
+                bypass.set_active(!bypass.is_active());
+                return gtk::glib::Propagation::Stop;
+            }
+            if !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK) {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let Some(index) = character
+                .and_then(|value| value.to_digit(10))
+                .filter(|value| (1..=9).contains(value))
+                .map(|value| value as usize - 1)
+            else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let Some(device) = model
+                .devices
+                .borrow()
+                .get(drop.selected() as usize)
+                .cloned()
+            else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let key = device.key.as_storage_key();
+            let Some(comparison) = model.comparisons.borrow().get(&key).cloned() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            if !comparison.enabled {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let Some(profile_id) = comparison.profile_ids.get(index).cloned() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            match model.client.select_comparison_profile(&key, &profile_id) {
+                Ok(()) => {
+                    if let Some(comparison) = model.comparisons.borrow_mut().get_mut(&key) {
+                        comparison.active_profile_id = profile_id;
+                    }
+                    refresh_comparison_ui(&model, &drop, &ui);
+                }
+                Err(error) => ui.status.set_text(&error.to_string()),
+            }
+            gtk::glib::Propagation::Stop
+        }
+    });
+    window.add_controller(controller);
+}
+
 fn update_device_controls(
     model: &Rc<Model>,
     drop: &gtk::DropDown,
@@ -1726,6 +2185,12 @@ fn update_device_controls(
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     });
+    let comparison = model
+        .comparisons
+        .borrow()
+        .get(&device.key.as_storage_key())
+        .filter(|comparison| comparison.enabled)
+        .cloned();
 
     if let Some(error) = engine_error {
         state.set_text(&format!("Last valid audio retained · {error}"));
@@ -1735,6 +2200,15 @@ fn update_device_controls(
         state.set_text("Unsupported surround output · bypassed");
         assign.set_label("Unavailable");
         assign.set_sensitive(false);
+    } else if let Some(comparison) = comparison {
+        let active_name = comparison_candidate_name(model, &comparison.active_profile_id);
+        state.set_text(&if comparison.active_profile_id == COMPARISON_BYPASS_ID {
+            format!("Comparing · {active_name}")
+        } else {
+            format!("Comparing · {active_name} · level matched")
+        });
+        assign.set_label("Set selected as normal profile");
+        assign.set_sensitive(model.current_id.borrow().is_some());
     } else if device.bypassed {
         state.set_text(&match assigned_name {
             Some(name) => format!("Assigned to {name} · currently bypassed"),
@@ -1881,6 +2355,24 @@ fn install_css() {
             font-size: 9px;
             font-weight: 700;
             padding: 7px 12px;
+        }
+
+        .comparison-menu > button {
+            border-radius: 999px;
+            font-family: monospace;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 7px 12px;
+        }
+
+        .comparison-candidate {
+            border-radius: 10px;
+            padding: 6px 8px;
+            font-family: monospace;
+        }
+
+        .comparison-candidate:checked {
+            background-color: rgba(230, 75, 47, 0.10);
         }
 
         .profile-name {

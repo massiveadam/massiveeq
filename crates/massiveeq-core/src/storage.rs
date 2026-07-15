@@ -35,6 +35,17 @@ pub struct ProfileRecord {
     pub manual_trim_db: f64,
 }
 
+pub const COMPARISON_BYPASS_ID: &str = "__bypass__";
+pub const MAX_COMPARISON_PROFILES: usize = 9;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComparisonSet {
+    pub profile_ids: Vec<String>,
+    pub active_profile_id: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Library {
     pub schema_version: u32,
@@ -48,17 +59,20 @@ pub struct Library {
     pub remembered_devices: HashMap<String, RememberedDevice>,
     #[serde(default)]
     pub global_bypass: bool,
+    #[serde(default)]
+    pub comparison_sets: HashMap<String, ComparisonSet>,
 }
 
 impl Default for Library {
     fn default() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             profiles: BTreeMap::new(),
             assignments: HashMap::new(),
             bypassed_devices: HashSet::new(),
             remembered_devices: HashMap::new(),
             global_bypass: false,
+            comparison_sets: HashMap::new(),
         }
     }
 }
@@ -98,7 +112,7 @@ impl Storage {
             return Ok(Library::default());
         }
         let mut library: Library = serde_json::from_slice(&fs::read(&self.state_path)?)?;
-        library.schema_version = 2;
+        library.schema_version = 3;
         Ok(library)
     }
 
@@ -300,6 +314,14 @@ impl Storage {
             return Err(StorageError::MissingProfile(id.into()));
         }
         library.assignments.retain(|_, assigned| assigned != id);
+        library.comparison_sets.retain(|_, comparison| {
+            comparison.profile_ids.retain(|profile_id| profile_id != id);
+            if comparison.active_profile_id == id {
+                comparison.active_profile_id =
+                    comparison.profile_ids.first().cloned().unwrap_or_default();
+            }
+            comparison.profile_ids.len() >= 2
+        });
         let path = self.profile_dir(id);
         if path.exists() {
             fs::remove_dir_all(path)?;
@@ -512,8 +534,9 @@ mod tests {
         .unwrap();
         let storage = Storage::new(temp.path().join("data"), config).unwrap();
         let library = storage.load_library().unwrap();
-        assert_eq!(library.schema_version, 2);
+        assert_eq!(library.schema_version, 3);
         assert!(library.remembered_devices.is_empty());
+        assert!(library.comparison_sets.is_empty());
     }
 
     #[test]

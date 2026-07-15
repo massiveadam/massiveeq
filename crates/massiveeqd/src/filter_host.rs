@@ -1,7 +1,10 @@
 use crate::{device, native_filter::NativeFilter};
 use anyhow::{Context, Result};
-use massiveeq_core::{DeviceInfo, Library, Storage};
-use massiveeq_dsp::{CompileOptions, ProfileProcessor, compile_bypass, compile_profile};
+use massiveeq_core::{COMPARISON_BYPASS_ID, ComparisonSet, DeviceInfo, Library, Storage};
+use massiveeq_dsp::{
+    CompileOptions, CompiledProfile, ProfileProcessor, attenuate_for_comparison,
+    compile_bypass_with_gain, compile_profile, perceived_output_level_db,
+};
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use tokio::{
@@ -60,10 +63,7 @@ impl FilterHost {
             .filter(|device| {
                 device.connected
                     && matches!(device.channels, 1 | 2)
-                    && device
-                        .assigned_profile
-                        .as_ref()
-                        .is_some_and(|id| library.profiles.contains_key(id))
+                    && device_has_runtime_profile(library, &device.key.as_storage_key())
             })
             .map(|device| device.key.as_storage_key())
             .collect::<HashSet<_>>();
@@ -86,23 +86,15 @@ impl FilterHost {
             if !desired.contains(&key) {
                 continue;
             }
-            let profile_id = device.assigned_profile.as_ref().expect("desired profile");
-            let (profile, trim) = match storage.parsed_profile(library, profile_id) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.errors.insert(key, error.to_string());
-                    continue;
-                }
-            };
             let bypassed = device.bypassed || library.global_bypass;
-            let revision = profile_revision(
-                &profile,
-                trim,
-                bypassed,
-                settings.sample_rate,
-                settings.quantum,
-                device.channels,
-            );
+            let (compiled, revision) =
+                match compile_runtime_profile(storage, library, device, settings, bypassed) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.errors.insert(key, error.to_string());
+                        continue;
+                    }
+                };
             if !force_update
                 && self.filters.get(&key).is_some_and(|active| {
                     active.revision == revision
@@ -116,26 +108,6 @@ impl FilterHost {
                 continue;
             }
 
-            let compiled = if bypassed {
-                compile_bypass(settings.sample_rate, settings.quantum, device.channels)
-            } else {
-                let options = CompileOptions {
-                    sample_rate: settings.sample_rate,
-                    quantum: settings.quantum,
-                    output_channels: device.channels,
-                    manual_trim_db: trim,
-                    profile_dir: storage.profile_dir(profile_id),
-                };
-                match compile_profile(&profile, &options) {
-                    Ok(compiled) => compiled,
-                    Err(error) => {
-                        self.errors.insert(key, error.to_string());
-                        // Transactional activation: a bad candidate never
-                        // replaces the last chain that is already playing.
-                        continue;
-                    }
-                }
-            };
             let latency_frames = compiled.latency_frames;
             let processor = match ProfileProcessor::new(&compiled) {
                 Ok(processor) => Box::new(processor),
@@ -241,6 +213,197 @@ impl FilterHost {
     }
 }
 
+fn device_has_runtime_profile(library: &Library, device_key: &str) -> bool {
+    let comparison = library
+        .comparison_sets
+        .get(device_key)
+        .filter(|comparison| comparison.enabled);
+    if let Some(comparison) = comparison {
+        return comparison.profile_ids.len() >= 2
+            && comparison
+                .profile_ids
+                .iter()
+                .all(|id| id == COMPARISON_BYPASS_ID || library.profiles.contains_key(id))
+            && comparison
+                .profile_ids
+                .contains(&comparison.active_profile_id);
+    }
+    library
+        .assignments
+        .get(device_key)
+        .is_some_and(|id| library.profiles.contains_key(id))
+}
+
+fn compile_runtime_profile(
+    storage: &Storage,
+    library: &Library,
+    device: &DeviceInfo,
+    settings: device::GraphSettings,
+    bypassed: bool,
+) -> Result<(CompiledProfile, u64)> {
+    let key = device.key.as_storage_key();
+    if let Some(comparison) = library
+        .comparison_sets
+        .get(&key)
+        .filter(|comparison| comparison.enabled)
+    {
+        return compile_comparison_profile(
+            storage, library, device, settings, comparison, bypassed,
+        );
+    }
+
+    let profile_id = library
+        .assignments
+        .get(&key)
+        .context("output has no assigned profile")?;
+    let (profile, trim) = storage.parsed_profile(library, profile_id)?;
+    let options = CompileOptions {
+        sample_rate: settings.sample_rate,
+        quantum: settings.quantum,
+        output_channels: device.channels,
+        manual_trim_db: trim,
+        profile_dir: storage.profile_dir(profile_id),
+    };
+    let active = compile_profile(&profile, &options)?;
+    let compiled = if bypassed {
+        // Keep dry comparisons at the same perceived level as the active
+        // profile. The gain is never allowed to exceed the profile's own
+        // clipping-protected output level.
+        compile_bypass_with_gain(
+            settings.sample_rate,
+            settings.quantum,
+            device.channels,
+            perceived_output_level_db(&active).min(0.0),
+        )
+    } else {
+        active
+    };
+    let revision = profile_revision(
+        &profile,
+        trim,
+        bypassed,
+        settings.sample_rate,
+        settings.quantum,
+        device.channels,
+    );
+    Ok((compiled, revision))
+}
+
+fn compile_comparison_profile(
+    storage: &Storage,
+    library: &Library,
+    device: &DeviceInfo,
+    settings: device::GraphSettings,
+    comparison: &ComparisonSet,
+    bypassed: bool,
+) -> Result<(CompiledProfile, u64)> {
+    anyhow::ensure!(
+        comparison.profile_ids.len() >= 2,
+        "a comparison bank needs at least two candidates"
+    );
+    anyhow::ensure!(
+        comparison
+            .profile_ids
+            .contains(&comparison.active_profile_id),
+        "the active comparison candidate is not in the bank"
+    );
+
+    let mut candidates = Vec::with_capacity(comparison.profile_ids.len());
+    let mut signature = serde_json::to_string(comparison).unwrap_or_default();
+    for profile_id in &comparison.profile_ids {
+        if profile_id == COMPARISON_BYPASS_ID {
+            candidates.push((
+                profile_id.clone(),
+                compile_bypass_with_gain(
+                    settings.sample_rate,
+                    settings.quantum,
+                    device.channels,
+                    0.0,
+                ),
+                0.0,
+            ));
+            signature.push_str("|bypass");
+            continue;
+        }
+        let (profile, trim) = storage.parsed_profile(library, profile_id)?;
+        let compiled = compile_profile(
+            &profile,
+            &CompileOptions {
+                sample_rate: settings.sample_rate,
+                quantum: settings.quantum,
+                output_channels: device.channels,
+                manual_trim_db: trim,
+                profile_dir: storage.profile_dir(profile_id),
+            },
+        )?;
+        let perceived = perceived_output_level_db(&compiled);
+        signature.push('|');
+        signature.push_str(profile_id);
+        signature.push('|');
+        signature.push_str(&format!("{trim:.9}"));
+        signature.push('|');
+        signature.push_str(&serde_json::to_string(&profile).unwrap_or_default());
+        candidates.push((profile_id.clone(), compiled, perceived));
+    }
+
+    let latency = candidates
+        .first()
+        .map(|(_, compiled, _)| compiled.latency_frames)
+        .unwrap_or_default();
+    anyhow::ensure!(
+        candidates
+            .iter()
+            .all(|(_, compiled, _)| compiled.latency_frames == latency),
+        "comparison candidates have incompatible processing latency"
+    );
+    let target_level = candidates
+        .iter()
+        .map(|(_, _, perceived)| *perceived)
+        .fold(0.0_f64, f64::min)
+        .min(0.0);
+    let selected_id = if bypassed {
+        COMPARISON_BYPASS_ID
+    } else {
+        comparison.active_profile_id.as_str()
+    };
+    let mut selected = if selected_id == COMPARISON_BYPASS_ID {
+        compile_bypass_with_gain(
+            settings.sample_rate,
+            settings.quantum,
+            device.channels,
+            target_level,
+        )
+    } else {
+        let (_, mut compiled, perceived) = candidates
+            .into_iter()
+            .find(|(id, _, _)| id == selected_id)
+            .context("active comparison profile is unavailable")?;
+        attenuate_for_comparison(&mut compiled, target_level - perceived)?;
+        compiled
+    };
+    // A dry candidate is only admitted when every bank member has zero
+    // latency. Preserve the common latency for processed candidates; an
+    // explicit engine bypass still reports its true zero processing latency.
+    if selected_id != COMPARISON_BYPASS_ID {
+        selected.latency_frames = latency;
+    }
+    signature.push_str(&format!(
+        "|active={selected_id}|bypassed={bypassed}|target={target_level:.9}|{}|{}|{}",
+        settings.sample_rate, settings.quantum, device.channels
+    ));
+    Ok((selected, stable_hash(&signature)))
+}
+
+pub(crate) fn validate_comparison_set(
+    storage: &Storage,
+    library: &Library,
+    device: &DeviceInfo,
+    settings: device::GraphSettings,
+    comparison: &ComparisonSet,
+) -> Result<()> {
+    compile_comparison_profile(storage, library, device, settings, comparison, false).map(|_| ())
+}
+
 fn profile_revision(
     profile: &massiveeq_core::ProfileDocument,
     trim: f64,
@@ -327,7 +490,7 @@ fn stable_hash(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use massiveeq_core::parse_text;
+    use massiveeq_core::{DeviceKey, parse_text};
 
     #[test]
     fn profile_revision_changes_for_audio_relevant_state() {
@@ -354,5 +517,80 @@ mod tests {
             node_id_from_status_line(line, "bluez_output.AA_BB.1"),
             Some(97)
         );
+    }
+
+    #[test]
+    fn three_way_comparison_uses_one_safe_perceived_level() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = Library::default();
+        let flat = storage.create_profile(&mut library, "Flat").unwrap();
+        let bass = storage.create_profile(&mut library, "Bass").unwrap();
+        storage
+            .put_profile(
+                &mut library,
+                &bass.id,
+                "Bass",
+                "Filter: ON LSC Fc 100 Hz Gain 6 dB Q 0.707",
+                0.0,
+            )
+            .unwrap();
+        let presence = storage.create_profile(&mut library, "Presence").unwrap();
+        storage
+            .put_profile(
+                &mut library,
+                &presence.id,
+                "Presence",
+                "Filter: ON PK Fc 3000 Hz Gain 4 dB Q 1.2",
+                0.0,
+            )
+            .unwrap();
+        let device = DeviceInfo {
+            key: DeviceKey {
+                backend: "test".into(),
+                stable_id: "airpods".into(),
+                route: "a2dp-sink".into(),
+            },
+            node_name: "test.airpods".into(),
+            description: "AirPods".into(),
+            channels: 2,
+            connected: true,
+            assigned_profile: None,
+            bypassed: false,
+        };
+        let ids = vec![
+            COMPARISON_BYPASS_ID.to_owned(),
+            flat.id,
+            bass.id,
+            presence.id,
+        ];
+        let mut levels = Vec::new();
+        for active in &ids {
+            let comparison = ComparisonSet {
+                profile_ids: ids.clone(),
+                active_profile_id: active.clone(),
+                enabled: true,
+            };
+            let (compiled, _) = compile_comparison_profile(
+                &storage,
+                &library,
+                &device,
+                device::GraphSettings {
+                    sample_rate: 48_000,
+                    quantum: 256,
+                },
+                &comparison,
+                false,
+            )
+            .unwrap();
+            assert_eq!(compiled.latency_frames, 0);
+            levels.push(perceived_output_level_db(&compiled));
+        }
+        assert!(
+            levels
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() < 1e-9)
+        );
+        assert!(levels[0] <= -1.0);
     }
 }

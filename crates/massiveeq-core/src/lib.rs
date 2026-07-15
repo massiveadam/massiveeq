@@ -9,4 +9,6 @@ pub mod storage;
 pub use analysis::{ChannelAnalysis, ProfileAnalysis, analyze_profile, analyze_profile_preview};
 pub use model::*;
 pub use parser::{ParseError, parse_file, parse_text, serialize_profile};
-pub use storage::{Library, Storage, StorageError};
+pub use storage::{
+    COMPARISON_BYPASS_ID, ComparisonSet, Library, MAX_COMPARISON_PROFILES, Storage, StorageError,
+};

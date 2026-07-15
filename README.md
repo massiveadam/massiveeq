@@ -31,6 +31,7 @@ should therefore be treated as a public beta, not a production-stable release.
 - Parametric EQ, per-ear filters, GraphicEQ, preamp, includes, and convolution
 - Automatic profile assignment using stable Bluetooth and ALSA identifiers
 - Unlimited saved profiles with per-output assignment or an explicit unassigned state
+- Per-output comparison banks for 2–9 profiles plus level-matched dry playback
 - Multiple simultaneous output devices, bypass, headroom, and level analysis
 - Native 32-bit floating-point DSP with allocation-free live processing
 - Eight-millisecond click-safe chain changes without removing the audio endpoint
@@ -61,6 +62,21 @@ editor. It is a separate process, so stopping it never changes audio routing.
 Profiles live in `~/.local/share/massiveeq/profiles/`; assignments and manual
 trims live in `~/.config/massiveeq/state.json`. Unassigned and unsupported
 multichannel devices are never intercepted.
+
+## Comparing profiles
+
+Open **Compare** in the Signal Route strip, choose between two and nine
+candidates, and select **Save + Start**. `Off` can be included as a dry
+candidate. MassiveEQ measures the complete response of every candidate and
+attenuates them to the quietest clipping-safe perceived level in that bank, so
+loudness does not bias the comparison. Banks are remembered independently for
+each output and do not replace its normal assigned profile.
+
+While the app is focused, `Alt+1` through `Alt+9` select candidates in bank
+order. `Ctrl+B` toggles the selected output's level-matched bypass. Comparison
+candidates switch through the live 8 ms crossfade without replacing the
+PipeWire endpoint. Profiles with incompatible convolution latency cannot be
+placed in the same bank.
 
 ## Text compatibility
 
