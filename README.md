@@ -4,6 +4,26 @@ MassiveEQ is a system-wide playback equalizer for Arch Linux audio sessions.
 It combines a GTK4/libadwaita profile editor with a user-level service that
 places PipeWire smart filters in front of assigned output devices.
 
+> [!WARNING]
+> **Beta software:** MassiveEQ is ready for testing, but its audio routing and
+> profile format may still change. Keep an easy way to select the original
+> hardware output while testing it.
+
+## Tested on
+
+The current beta has been validated on:
+
+- Arch Linux x86_64 with the niri Wayland compositor
+- PipeWire 1.6.8, WirePlumber 0.5.15, GTK 4.22.4, and libadwaita 1.9.2
+- Apple AirPods over Bluetooth A2DP and a built-in analog stereo output
+- PipeWire hotplug/reconnect, simultaneous outputs, service restart/fail-open,
+  live filter edits, bypass, and device assignment restoration
+- Automated DSP reference tests at 44.1, 48, 96, and 192 kHz
+
+It has **not yet been manually validated** on GNOME, KDE Plasma, surround
+outputs, professional multichannel interfaces, or ARM systems. Version 0.2.x
+should therefore be treated as a public beta, not a production-stable release.
+
 ## Current features
 
 - Squiglink, AutoEQ, and common Equalizer APO text profile import
