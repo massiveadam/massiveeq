@@ -1,0 +1,14 @@
+[package]
+name = "massiveeq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gtk4.workspace = true
+libadwaita.workspace = true
+massiveeq-core = { path = "../massiveeq-core" }
+serde.workspace = true
+serde_json.workspace = true
+zbus = { workspace = true, features = ["blocking"] }

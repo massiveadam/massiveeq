@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=MassiveEQ
+GenericName=Systemwide Equalizer
+Comment=Manage device-specific PipeWire equalizer profiles
+Exec=massiveeq
+Icon=org.massiveeq.MassiveEQ
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;
+Keywords=equalizer;audio;pipewire;headphones;convolution;
+StartupNotify=true

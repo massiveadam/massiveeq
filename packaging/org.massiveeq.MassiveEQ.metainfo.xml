@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.massiveeq.MassiveEQ</id>
+  <name>MassiveEQ</name>
+  <summary>Device-aware systemwide equalizer for PipeWire</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="org.massiveeq"><name>MassiveEQ contributors</name></developer>
+  <url type="homepage">https://github.com/massiveeq/massiveeq</url>
+  <description>
+    <p>MassiveEQ provides parametric, graphic, per-ear, and convolution equalization for Arch Linux playback devices.</p>
+  </description>
+  <launchable type="desktop-id">org.massiveeq.MassiveEQ.desktop</launchable>
+  <provides><binary>massiveeq</binary></provides>
+  <content_rating type="oars-1.1" />
+</component>
