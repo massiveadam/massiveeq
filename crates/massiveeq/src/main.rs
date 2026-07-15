@@ -440,15 +440,10 @@ fn build_ui(app: &adw::Application) {
     reset_filters_button.set_tooltip_text(Some(
         "Flatten every parametric band to 0 dB without changing its frequency or Q",
     ));
-    let filter_toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    switcher.set_hexpand(true);
-    filter_toolbar.append(&switcher);
-    filter_toolbar.append(&reset_filters_button);
-    narrow_filters.add_setter(
-        &filter_toolbar,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
+    let filter_toolbar = gtk::CenterBox::new();
+    filter_toolbar.set_hexpand(true);
+    filter_toolbar.set_center_widget(Some(&switcher));
+    filter_toolbar.set_end_widget(Some(&reset_filters_button));
     window.add_breakpoint(narrow_filters);
     let add_filter_button = gtk::Button::with_label("＋  ADD PARAMETRIC BAND");
     add_filter_button.add_css_class("band-add");
