@@ -14,6 +14,11 @@
   <provides><binary>massiveeq</binary></provides>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.3.0-beta.2" date="2026-07-15" type="development">
+      <description>
+        <p>Beta 2 adds click-to-create graph bands, precise keyboard editing, responsive filter switches, and additional editor safety checks.</p>
+      </description>
+    </release>
     <release version="0.3.0-beta.1" date="2026-07-15" type="development">
       <description>
         <p>Beta 1 adds native real-time DSP, device assignments, level-matched profile comparisons, synchronized visual and text editing, convolution, and optional StatusNotifier controls.</p>

@@ -957,7 +957,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "massiveeq"
-version = "0.3.0-beta.1"
+version = "0.3.0-beta.2"
 dependencies = [
  "anyhow",
  "gtk4",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "massiveeq-core"
-version = "0.3.0-beta.1"
+version = "0.3.0-beta.2"
 dependencies = [
  "dirs",
  "regex",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "massiveeq-dsp"
-version = "0.3.0-beta.1"
+version = "0.3.0-beta.2"
 dependencies = [
  "fft-convolver",
  "massiveeq-core",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "massiveeq-tray"
-version = "0.3.0-beta.1"
+version = "0.3.0-beta.2"
 dependencies = [
  "anyhow",
  "ksni",
@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "massiveeqd"
-version = "0.3.0-beta.1"
+version = "0.3.0-beta.2"
 dependencies = [
  "anyhow",
  "bytemuck",

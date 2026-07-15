@@ -6,8 +6,8 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use massiveeq_core::{
     COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
-    MAX_COMPARISON_PROFILES, ProfileAnalysis, ProfileDocument, ProfileInfo,
-    analyze_profile_preview, parse_text, serialize_profile,
+    MAX_COMPARISON_PROFILES, MAX_FILTERS_PER_CHANNEL, ProfileAnalysis, ProfileDocument,
+    ProfileInfo, analyze_profile_preview, parse_text, serialize_profile,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -30,7 +30,14 @@ struct Model {
     sample_rate: Cell<f64>,
     loading: Cell<bool>,
     syncing_device: Cell<bool>,
+    pending_device_bypass: RefCell<Option<PendingDeviceBypass>>,
     syncing_engine: Cell<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingDeviceBypass {
+    device_key: String,
+    bypassed: bool,
 }
 
 #[derive(Clone)]
@@ -124,6 +131,7 @@ fn build_ui(app: &adw::Application) {
         sample_rate: Cell::new(active_sample_rate),
         loading: Cell::new(false),
         syncing_device: Cell::new(false),
+        pending_device_bypass: RefCell::new(None),
         syncing_engine: Cell::new(false),
     });
 
@@ -409,7 +417,9 @@ fn build_ui(app: &adw::Application) {
     graph_header.append(&graph_title);
     let graph_hint = gtk::Label::new(Some(&engine_summary(&engine_status)));
     graph_hint.add_css_class("level-code");
-    graph_hint.set_tooltip_text(Some("Drag response points to edit parametric filters"));
+    graph_hint.set_tooltip_text(Some(
+        "Click empty graph space to add a band, drag points to edit, or use arrows on the selected point",
+    ));
     graph_header.append(&graph_hint);
     graph_card.append(&graph_header);
     let graph = graph::response_graph(
@@ -417,10 +427,17 @@ fn build_ui(app: &adw::Application) {
         model.document.clone(),
         model.selected_filter.clone(),
     );
+    graph.set_focusable(true);
+    graph.set_focus_on_click(true);
+    graph.set_accessible_role(gtk::AccessibleRole::Group);
+    graph.add_css_class("response-graph");
+    graph.set_tooltip_text(Some(
+        "Click an empty position to add a peak filter. Arrows edit gain and frequency; Shift+Up/Down edits Q; Shift+Left/Right moves frequency farther.",
+    ));
     graph.update_property(&[
         gtk::accessible::Property::Label("Frequency response graph"),
         gtk::accessible::Property::Description(
-            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Use the filter controls below for keyboard editing.",
+            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Click empty graph space to add a filter. Use arrow keys to edit the selected filter; hold Shift for Q or larger frequency steps.",
         ),
     ]);
     let analysis_label = gtk::Label::new(Some("AUTO PREAMP —"));
@@ -881,6 +898,7 @@ fn wire_actions(
         let buffer = buffer.clone();
         let list = filter_list.clone();
         let graph = graph.clone();
+        let status = status.clone();
         let convolution_ui = convolution_ui.clone();
         move |_| {
             let (text, snapshot) = {
@@ -888,6 +906,10 @@ fn wire_actions(
                 let Some(document) = document.as_mut() else {
                     return;
                 };
+                if !can_add_filter(document, ChannelSelection::All) {
+                    status.set_text("This profile already has 64 bands on one channel");
+                    return;
+                }
                 document.convolutions.clear();
                 document.graphic_eqs.clear();
                 document.filters.push(Filter {
@@ -1534,7 +1556,7 @@ fn wire_actions(
         let assign = assign.clone();
         let status = status.clone();
         move |switch| {
-            if model.syncing_device.get() {
+            if model.syncing_device.get() || model.pending_device_bypass.borrow().is_some() {
                 return;
             }
             let device = {
@@ -1542,18 +1564,43 @@ fn wire_actions(
                 devices.get(drop.selected() as usize).cloned()
             };
             if let Some(device) = device {
-                match model
-                    .client
-                    .set_device_bypass(&device.key.as_storage_key(), !switch.is_active())
-                {
-                    Ok(()) => {
-                        if let Ok(devices) = model.client.devices() {
-                            *model.devices.borrow_mut() = devices;
+                let device_key = device.key.as_storage_key();
+                let bypassed = !switch.is_active();
+                *model.pending_device_bypass.borrow_mut() = Some(PendingDeviceBypass {
+                    device_key: device_key.clone(),
+                    bypassed,
+                });
+                state.set_text(if bypassed {
+                    "Turning filters off…"
+                } else {
+                    "Turning filters on…"
+                });
+                switch.set_sensitive(false);
+
+                // Let GTK paint the thumb at its requested position before
+                // making the synchronous service call. The pending state also
+                // prevents the health poll from repainting the old value while
+                // this transition is being committed.
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(40), {
+                    let model = model.clone();
+                    let drop = drop.clone();
+                    let state = state.clone();
+                    let assign = assign.clone();
+                    let status = status.clone();
+                    let switch = switch.clone();
+                    move || {
+                        match model.client.set_device_bypass(&device_key, bypassed) {
+                            Ok(()) => {
+                                if let Ok(devices) = model.client.devices() {
+                                    *model.devices.borrow_mut() = devices;
+                                }
+                            }
+                            Err(error) => status.set_text(&error.to_string()),
                         }
+                        *model.pending_device_bypass.borrow_mut() = None;
+                        update_device_controls(&model, &drop, &state, &assign, &switch);
                     }
-                    Err(error) => status.set_text(&error.to_string()),
-                }
-                update_device_controls(&model, &drop, &state, &assign, switch);
+                });
             }
         }
     });
@@ -1604,7 +1651,10 @@ fn wire_actions(
         let model = model.clone();
         let state = drag_state.clone();
         let graph = graph.clone();
+        let status = status.clone();
+        let analysis_label = analysis_label.clone();
         move |_, x, y| {
+            graph.grab_focus();
             let Some(document) = model.document.borrow().as_ref().cloned() else {
                 return;
             };
@@ -1631,8 +1681,54 @@ fn wire_actions(
                     *state.borrow_mut() = Some((index, filter.frequency, filter.gain_db));
                     model.selected_filter.set(Some(index));
                     graph.queue_draw();
+                    return;
                 }
             }
+
+            let Some((frequency, gain_db)) = graph::values_at_position(x, y, width, height) else {
+                return;
+            };
+            let (index, preview) = {
+                let mut document = model.document.borrow_mut();
+                let Some(document) = document.as_mut() else {
+                    return;
+                };
+                if !document.convolutions.is_empty() {
+                    status.set_text(
+                        "Convolution is active · remove the impulse response before adding a band",
+                    );
+                    return;
+                }
+                if !can_add_filter(document, ChannelSelection::All) {
+                    status.set_text("This profile already has 64 bands on one channel");
+                    return;
+                }
+                document.graphic_eqs.clear();
+                document.filters.push(Filter {
+                    enabled: true,
+                    kind: FilterKind::Peaking,
+                    frequency,
+                    gain_db,
+                    q: 1.0,
+                    channels: ChannelSelection::All,
+                });
+                let index = document.filters.len() - 1;
+                let preview = analyze_profile_preview(
+                    document,
+                    model.sample_rate.get(),
+                    model.manual_trim.get(),
+                );
+                (index, preview)
+            };
+            *state.borrow_mut() = Some((index, frequency, gain_db));
+            model.selected_filter.set(Some(index));
+            set_analysis_label(&analysis_label, &preview);
+            *model.analysis.borrow_mut() = Some(preview);
+            status.set_text(&format!(
+                "Added peak filter at {}",
+                format_band_frequency(frequency)
+            ));
+            graph.queue_draw();
         }
     });
     gesture.connect_drag_update({
@@ -1684,6 +1780,50 @@ fn wire_actions(
         }
     });
     graph.add_controller(gesture);
+
+    let keyboard = gtk::EventControllerKey::new();
+    keyboard.connect_key_pressed({
+        let model = model.clone();
+        let buffer = buffer.clone();
+        let graph = graph.clone();
+        let status = status.clone();
+        move |_, key, _, modifiers| {
+            if modifiers
+                .intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK)
+            {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let direction = match key {
+                gtk::gdk::Key::Up => graph::NudgeDirection::Up,
+                gtk::gdk::Key::Down => graph::NudgeDirection::Down,
+                gtk::gdk::Key::Left => graph::NudgeDirection::Left,
+                gtk::gdk::Key::Right => graph::NudgeDirection::Right,
+                _ => return gtk::glib::Propagation::Proceed,
+            };
+            let Some(index) = model.selected_filter.get() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let shifted = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            update_filter(&model, &buffer, &graph, index, |filter| {
+                graph::nudge_filter(filter, direction, shifted);
+            });
+            if let Some(filter) = model
+                .document
+                .borrow()
+                .as_ref()
+                .and_then(|document| document.filters.get(index))
+            {
+                status.set_text(&format!(
+                    "{} · {:+.1} dB · Q {:.3}",
+                    format_band_frequency(filter.frequency),
+                    filter.gain_db,
+                    filter.q
+                ));
+            }
+            gtk::glib::Propagation::Stop
+        }
+    });
+    graph.add_controller(keyboard);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1907,6 +2047,7 @@ fn rebuild_filter_list(
             move |button| {
                 if button.is_active() {
                     model.selected_filter.set(Some(index));
+                    graph.grab_focus();
                     graph.queue_draw();
                 }
             }
@@ -1916,9 +2057,20 @@ fn rebuild_filter_list(
             let buffer = buffer.clone();
             let graph = graph.clone();
             move |switch| {
-                update_filter(&model, &buffer, &graph, index, |filter| {
-                    filter.enabled = switch.is_active()
-                })
+                let enabled = switch.is_active();
+                // Response analysis and text serialization can be noticeable
+                // for a large bank. Defer them until after GTK has painted the
+                // switch, just like the output-level Filters control.
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(40), {
+                    let model = model.clone();
+                    let buffer = buffer.clone();
+                    let graph = graph.clone();
+                    move || {
+                        update_filter(&model, &buffer, &graph, index, |filter| {
+                            filter.enabled = enabled
+                        });
+                    }
+                });
             }
         });
         kind_drop.connect_selected_notify({
@@ -2102,6 +2254,33 @@ fn update_filter(
     *model.analysis.borrow_mut() = Some(preview);
     graph.queue_draw();
     buffer.set_text(&text);
+}
+
+fn can_add_filter(document: &ProfileDocument, channels: ChannelSelection) -> bool {
+    let left_bands = document
+        .filters
+        .iter()
+        .filter(|filter| {
+            matches!(
+                filter.channels,
+                ChannelSelection::All | ChannelSelection::Left
+            )
+        })
+        .count();
+    let right_bands = document
+        .filters
+        .iter()
+        .filter(|filter| {
+            matches!(
+                filter.channels,
+                ChannelSelection::All | ChannelSelection::Right
+            )
+        })
+        .count();
+    (!matches!(channels, ChannelSelection::All | ChannelSelection::Left)
+        || left_bands < MAX_FILTERS_PER_CHANNEL)
+        && (!matches!(channels, ChannelSelection::All | ChannelSelection::Right)
+            || right_bands < MAX_FILTERS_PER_CHANNEL)
 }
 
 fn ellipsized_string_factory(max_chars: i32) -> gtk::SignalListItemFactory {
@@ -2499,8 +2678,15 @@ fn update_device_controls(
         return;
     };
 
+    let device_key = device.key.as_storage_key();
+    let pending_bypass = model.pending_device_bypass.borrow();
+    let pending_bypassed = pending_bypass
+        .as_ref()
+        .filter(|pending| pending.device_key == device_key);
+    let displayed_bypassed =
+        displayed_device_bypass(&device_key, device.bypassed, pending_bypass.as_ref());
     model.syncing_device.set(true);
-    let filters_active = !device.bypassed;
+    let filters_active = !displayed_bypassed;
     if bypass.is_active() != filters_active {
         bypass.set_active(filters_active);
     }
@@ -2541,7 +2727,7 @@ fn update_device_controls(
         assign.set_sensitive(false);
     } else if let Some(comparison) = comparison {
         let active_name = comparison_candidate_name(model, &comparison.active_profile_id);
-        state.set_text(&if device.bypassed {
+        state.set_text(&if displayed_bypassed {
             format!("Filters off · level matched to {active_name}")
         } else if comparison.active_profile_id == COMPARISON_BYPASS_ID {
             format!("Comparing · {active_name}")
@@ -2550,7 +2736,7 @@ fn update_device_controls(
         });
         assign.set_label("Set selected as normal profile");
         assign.set_sensitive(model.current_id.borrow().is_some());
-    } else if device.bypassed {
+    } else if displayed_bypassed {
         state.set_text(&match assigned_name {
             Some(name) => format!("Filters off · level matched to {name}"),
             None => "Not applied · filters unavailable".to_owned(),
@@ -2575,7 +2761,20 @@ fn update_device_controls(
         assign.set_sensitive(model.current_id.borrow().is_some());
     }
 
-    bypass.set_sensitive(has_ab_source && matches!(device.channels, 1 | 2));
+    bypass.set_sensitive(
+        pending_bypassed.is_none() && has_ab_source && matches!(device.channels, 1 | 2),
+    );
+}
+
+fn displayed_device_bypass(
+    device_key: &str,
+    service_bypassed: bool,
+    pending: Option<&PendingDeviceBypass>,
+) -> bool {
+    pending
+        .filter(|pending| pending.device_key == device_key)
+        .map(|pending| pending.bypassed)
+        .unwrap_or(service_bypassed)
 }
 
 fn engine_summary(status: &serde_json::Value) -> String {
@@ -3133,4 +3332,59 @@ fn show_startup_error(app: &adw::Application, message: &str) {
         .build();
     window.set_content(Some(&status));
     window.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ChannelSelection, Filter, FilterKind, PendingDeviceBypass, ProfileDocument, can_add_filter,
+        displayed_device_bypass,
+    };
+
+    #[test]
+    fn pending_filter_toggle_wins_over_stale_service_poll() {
+        let pending = PendingDeviceBypass {
+            device_key: "selected-output".into(),
+            bypassed: true,
+        };
+
+        assert!(displayed_device_bypass(
+            "selected-output",
+            false,
+            Some(&pending)
+        ));
+    }
+
+    #[test]
+    fn pending_filter_toggle_does_not_leak_to_another_output() {
+        let pending = PendingDeviceBypass {
+            device_key: "other-output".into(),
+            bypassed: true,
+        };
+
+        assert!(!displayed_device_bypass(
+            "selected-output",
+            false,
+            Some(&pending)
+        ));
+    }
+
+    #[test]
+    fn graph_add_respects_the_per_channel_band_limit() {
+        let mut document = ProfileDocument::empty("limit");
+        document.filters = (0..64)
+            .map(|_| Filter {
+                enabled: true,
+                kind: FilterKind::Peaking,
+                frequency: 1_000.0,
+                gain_db: 0.0,
+                q: 1.0,
+                channels: ChannelSelection::Left,
+            })
+            .collect();
+
+        assert!(!can_add_filter(&document, ChannelSelection::All));
+        assert!(!can_add_filter(&document, ChannelSelection::Left));
+        assert!(can_add_filter(&document, ChannelSelection::Right));
+    }
 }
