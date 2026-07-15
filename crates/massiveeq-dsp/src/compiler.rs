@@ -344,6 +344,34 @@ mod tests {
                 compile_profile(&profile, &CompileOptions::stereo(rate, 256, "/tmp")).unwrap();
             assert!((compiled.analysis.match_gain_db + 6.0).abs() < 0.01);
             assert!((compiled.analysis.final_peak_db + 1.0).abs() < 0.01);
+            assert!(compiled.analysis.channels.iter().all(|channel| {
+                channel
+                    .response
+                    .iter()
+                    .all(|point| point.gain_db.abs() < 0.01)
+            }));
+        }
+    }
+
+    #[test]
+    fn output_preamp_does_not_move_the_display_response() {
+        let profile = parse_text("test", "Filter: ON PK Fc 1000 Hz Gain 8 dB Q 1");
+        let normal =
+            compile_profile(&profile, &CompileOptions::stereo(48_000, 256, "/tmp")).unwrap();
+        let mut adjusted_options = CompileOptions::stereo(48_000, 256, "/tmp");
+        adjusted_options.manual_trim_db = -20.0;
+        let adjusted = compile_profile(&profile, &adjusted_options).unwrap();
+
+        assert_ne!(
+            normal.analysis.effective_gain_db,
+            adjusted.analysis.effective_gain_db
+        );
+        for (normal, adjusted) in normal.analysis.channels[0]
+            .response
+            .iter()
+            .zip(&adjusted.analysis.channels[0].response)
+        {
+            assert!((normal.gain_db - adjusted.gain_db).abs() < 1e-12);
         }
     }
 

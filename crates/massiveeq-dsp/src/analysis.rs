@@ -167,8 +167,12 @@ pub(crate) fn analyze_compiled(
                 .iter()
                 .map(|frequency| ResponsePoint {
                     frequency: *frequency,
+                    // Match Squiglink's editing model: graph only the EQ/IR
+                    // transfer. Source preamp, perceptual match, correction,
+                    // and safety attenuation belong to the separate preamp
+                    // readout and must not vertically translate the curve.
                     gain_db: linear_to_db(transfer(channel_index, *frequency).norm())
-                        + effective_gain_db,
+                        - source_preamps[channel_index],
                 })
                 .collect(),
         })

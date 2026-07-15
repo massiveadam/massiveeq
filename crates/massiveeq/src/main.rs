@@ -259,8 +259,7 @@ fn build_ui(app: &adw::Application) {
         model.document.clone(),
         model.selected_filter.clone(),
     );
-    graph_card.append(&graph);
-    let analysis_label = gtk::Label::new(Some("Select a profile"));
+    let analysis_label = gtk::Label::new(Some("AUTO PREAMP —"));
     analysis_label.set_xalign(0.0);
     analysis_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     analysis_label.add_css_class("level-code");
@@ -271,7 +270,10 @@ fn build_ui(app: &adw::Application) {
     let trim = gtk::SpinButton::with_range(-24.0, 24.0, 0.1);
     trim.set_digits(1);
     trim.set_width_chars(5);
-    let trim_label = gtk::Label::new(Some("TRIM"));
+    trim.set_tooltip_text(Some(
+        "Fine-tune the perceptually matched preamp; safety attenuation still prevents clipping",
+    ));
+    let trim_label = gtk::Label::new(Some("ADJUST"));
     trim_label.add_css_class("section-label");
     let trim_unit = gtk::Label::new(Some("dB"));
     trim_unit.add_css_class("level-code");
@@ -282,6 +284,7 @@ fn build_ui(app: &adw::Application) {
     trim_controls.append(&trim_unit);
     level_row.append(&trim_controls);
     graph_card.append(&level_row);
+    graph_card.append(&graph);
     dashboard.append(&graph_card);
     content.append(&dashboard);
 
@@ -1079,11 +1082,6 @@ fn wire_actions(
             let Some(document) = model.document.borrow().as_ref().cloned() else {
                 return;
             };
-            let effective_gain = model
-                .analysis
-                .borrow()
-                .as_ref()
-                .map_or(0.0, |analysis| analysis.effective_gain_db);
             let width = graph.width().max(1) as f64;
             let height = graph.height().max(1) as f64;
             let closest = document
@@ -1092,32 +1090,17 @@ fn wire_actions(
                 .enumerate()
                 .filter(|(_, filter)| filter.enabled)
                 .min_by(|(_, a), (_, b)| {
-                    let (ax, ay) = graph::filter_point_position(
-                        a.frequency,
-                        a.gain_db,
-                        effective_gain,
-                        width,
-                        height,
-                    );
-                    let (bx, by) = graph::filter_point_position(
-                        b.frequency,
-                        b.gain_db,
-                        effective_gain,
-                        width,
-                        height,
-                    );
+                    let (ax, ay) =
+                        graph::filter_point_position(a.frequency, a.gain_db, width, height);
+                    let (bx, by) =
+                        graph::filter_point_position(b.frequency, b.gain_db, width, height);
                     let da = ((ax - x).powi(2) + (ay - y).powi(2)).sqrt();
                     let db = ((bx - x).powi(2) + (by - y).powi(2)).sqrt();
                     da.total_cmp(&db)
                 });
             if let Some((index, filter)) = closest {
-                let (point_x, point_y) = graph::filter_point_position(
-                    filter.frequency,
-                    filter.gain_db,
-                    effective_gain,
-                    width,
-                    height,
-                );
+                let (point_x, point_y) =
+                    graph::filter_point_position(filter.frequency, filter.gain_db, width, height);
                 if ((point_x - x).powi(2) + (point_y - y).powi(2)).sqrt() <= 34.0 {
                     *state.borrow_mut() = Some((index, filter.frequency, filter.gain_db));
                     model.selected_filter.set(Some(index));
@@ -1130,6 +1113,7 @@ fn wire_actions(
         let model = model.clone();
         let state = drag_state.clone();
         let graph = graph.clone();
+        let analysis_label = analysis_label.clone();
         move |_, dx, dy| {
             let Some((index, start_frequency, start_gain)) = *state.borrow() else {
                 return;
@@ -1151,6 +1135,7 @@ fn wire_actions(
                 filter.gain_db = (start_gain - dy / height * 36.0).clamp(-24.0, 24.0);
                 analyze_profile_preview(document, model.sample_rate.get(), model.manual_trim.get())
             };
+            set_analysis_label(&analysis_label, &preview);
             *model.analysis.borrow_mut() = Some(preview);
             graph.queue_draw();
         }
@@ -1780,8 +1765,8 @@ fn install_css() {
         .graph-card { padding: 20px 18px 10px 18px; }
 
         .level-readout {
-            border-top: 1px solid #292c2d;
-            padding: 8px 2px 1px 2px;
+            border-bottom: 1px solid #292c2d;
+            padding: 4px 2px 9px 2px;
         }
 
         .level-code {
@@ -2075,13 +2060,19 @@ fn save_current(
 }
 
 fn set_analysis_label(label: &gtk::Label, analysis: &ProfileAnalysis) {
+    let left_preamp = analysis.left.preamp_db + analysis.effective_gain_db;
+    let right_preamp = analysis.right.preamp_db + analysis.effective_gain_db;
+    let preamp = if (left_preamp - right_preamp).abs() < 0.01 {
+        format!("AUTO PREAMP {left_preamp:+.2} dB")
+    } else {
+        format!("AUTO PREAMP  L {left_preamp:+.2} dB  /  R {right_preamp:+.2} dB")
+    };
     label.set_text(&format!(
-        "Match {:+.2} dB   •   Safety {:+.2} dB   •   Effective {:+.2} dB{}",
+        "{preamp}   •   MATCH {:+.2} dB   •   SAFETY {:+.2} dB{}",
         analysis.match_gain_db,
         analysis.safety_attenuation_db,
-        analysis.effective_gain_db,
         if analysis.headroom_limited {
-            "   •   Headroom limited"
+            "   •   HEADROOM LIMITED"
         } else {
             ""
         }

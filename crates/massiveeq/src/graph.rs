@@ -32,7 +32,7 @@ pub fn response_graph(
         );
         draw_background(context, width, height, foreground);
 
-        let effective_gain_db = if let Some(result) = analysis.borrow().as_ref() {
+        if let Some(result) = analysis.borrow().as_ref() {
             let stereo = responses_match(&result.left.response, &result.right.response);
             draw_combined(
                 context,
@@ -66,20 +66,10 @@ pub fn response_graph(
                 );
             }
             draw_channel_legend(context, width, stereo);
-            result.effective_gain_db
-        } else {
-            0.0
-        };
+        }
 
         if let Some(profile) = document.borrow().as_ref() {
-            draw_filter_points(
-                context,
-                profile,
-                selected_filter.get(),
-                effective_gain_db,
-                width,
-                height,
-            );
+            draw_filter_points(context, profile, selected_filter.get(), width, height);
         }
     });
     area
@@ -199,7 +189,6 @@ fn draw_filter_points(
     cr: &cairo::Context,
     profile: &ProfileDocument,
     selected: Option<usize>,
-    effective_gain_db: f64,
     width: f64,
     height: f64,
 ) {
@@ -207,13 +196,7 @@ fn draw_filter_points(
         if !filter.enabled {
             continue;
         }
-        let (x, y) = filter_point_position(
-            filter.frequency,
-            filter.gain_db,
-            effective_gain_db,
-            width,
-            height,
-        );
+        let (x, y) = filter_point_position(filter.frequency, filter.gain_db, width, height);
         let is_selected = selected == Some(index);
         if is_selected {
             cr.new_sub_path();
@@ -353,11 +336,10 @@ pub fn point_position(frequency: f64, gain: f64, width: f64, height: f64) -> (f6
 pub fn filter_point_position(
     frequency: f64,
     filter_gain: f64,
-    effective_gain: f64,
     width: f64,
     height: f64,
 ) -> (f64, f64) {
-    point_position(frequency, filter_gain + effective_gain, width, height)
+    point_position(frequency, filter_gain, width, height)
 }
 
 fn plot_size(width: f64, height: f64) -> (f64, f64) {
@@ -406,10 +388,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filter_handle_uses_the_curve_effective_gain() {
+    fn filter_handle_is_independent_of_output_preamp() {
         assert_eq!(
-            filter_point_position(1_000.0, 9.0, -10.0, 1_000.0, 500.0),
-            point_position(1_000.0, -1.0, 1_000.0, 500.0)
+            filter_point_position(1_000.0, 9.0, 1_000.0, 500.0),
+            point_position(1_000.0, 9.0, 1_000.0, 500.0)
         );
     }
 }

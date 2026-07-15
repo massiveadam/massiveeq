@@ -98,7 +98,7 @@ fn analyze_profile_with_bins(
         .zip(&frequencies)
         .map(|((l, r), f)| {
             let k = k_weight_power(*f, sample_rate);
-            k * (db_to_power(l.gain_db) + db_to_power(r.gain_db))
+            k * (db_to_power(l.gain_db + left.preamp_db) + db_to_power(r.gain_db + right.preamp_db))
         })
         .sum::<f64>();
     let match_gain_db = -10.0 * (profile_energy / bypass_energy).log10();
@@ -127,7 +127,11 @@ fn analyze_channel(
     let response = frequencies
         .iter()
         .map(|frequency| {
-            let mut gain = preamp_db;
+            // Keep the plotted response anchored to the EQ controls. Source
+            // preamp, perceptual matching, user correction, and safety gain
+            // are represented separately and must never move the graph while
+            // a filter is being dragged.
+            let mut gain = 0.0;
             for filter in profile.filters_for(channel).filter(|filter| filter.enabled) {
                 gain += filter_gain_db(filter, *frequency, sample_rate);
             }
@@ -146,7 +150,7 @@ fn analyze_channel(
         .collect::<Vec<_>>();
     let peak_db = response
         .iter()
-        .map(|point| point.gain_db)
+        .map(|point| point.gain_db + preamp_db)
         .fold(f64::NEG_INFINITY, f64::max);
     ChannelAnalysis {
         preamp_db,
@@ -305,5 +309,32 @@ mod tests {
         let analysis = analyze_profile(&profile, 48000.0, 0.0);
         assert!(analysis.headroom_limited);
         assert!(analysis.left.peak_db + analysis.effective_gain_db <= -0.999);
+    }
+
+    #[test]
+    fn display_response_ignores_preamp_and_output_matching() {
+        let profile = parse_text(
+            "test",
+            "Preamp: -8 dB\nFilter 1: ON PK Fc 1000 Hz Gain 6 dB Q 1",
+        );
+        let first = analyze_profile(&profile, 48_000.0, 0.0);
+        let adjusted = analyze_profile(&profile, 48_000.0, 4.0);
+        let center = first
+            .left
+            .response
+            .iter()
+            .min_by(|left, right| {
+                (left.frequency - 1_000.0)
+                    .abs()
+                    .total_cmp(&(right.frequency - 1_000.0).abs())
+            })
+            .unwrap();
+
+        assert!((center.gain_db - 6.0).abs() < 0.02);
+        assert_eq!(first.left.response.len(), adjusted.left.response.len());
+        for (first, adjusted) in first.left.response.iter().zip(&adjusted.left.response) {
+            assert!((first.gain_db - adjusted.gain_db).abs() < 1e-12);
+        }
+        assert!((first.left.peak_db - (center.gain_db - 8.0)).abs() < 0.02);
     }
 }
