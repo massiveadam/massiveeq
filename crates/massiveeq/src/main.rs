@@ -470,7 +470,9 @@ fn build_ui(app: &adw::Application) {
         move |stack| {
             let parametric = stack.visible_child_name().as_deref() == Some("filters");
             add_filter.set_visible(parametric);
-            reset_filters.set_visible(parametric);
+            reset_filters.set_visible(true);
+            reset_filters.set_sensitive(parametric);
+            reset_filters.set_opacity(if parametric { 1.0 } else { 0.0 });
         }
     });
     content.append(&filter_toolbar);
@@ -814,14 +816,14 @@ fn wire_actions(
             update_device_controls(&model, &device_drop, &device_state, &assign, &device_bypass);
         }
     };
-    profile_list.connect_row_selected({
-        let profile_popover = profile_popover.clone();
-        move |_, row| {
-            if let Some(row) = row {
-                reload(row.index() as usize);
-                profile_popover.popdown();
-            }
+    profile_list.connect_row_selected(move |_, row| {
+        if let Some(row) = row {
+            reload(row.index() as usize);
         }
+    });
+    profile_list.connect_row_activated({
+        let profile_popover = profile_popover.clone();
+        move |_, _| profile_popover.popdown()
     });
 
     let pending_save: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
@@ -1287,7 +1289,10 @@ fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
     }
     let parametric = profile.convolutions.is_empty();
     ui.add_filter.set_visible(parametric);
-    ui.reset_filters.set_visible(parametric);
+    ui.reset_filters.set_visible(true);
+    ui.reset_filters.set_sensitive(parametric);
+    ui.reset_filters
+        .set_opacity(if parametric { 1.0 } else { 0.0 });
     ui.syncing.set(false);
 }
 
