@@ -5,7 +5,7 @@ It combines a GTK4/libadwaita profile editor with a user-level service that
 places PipeWire smart filters in front of assigned output devices.
 
 > [!WARNING]
-> **Beta software:** MassiveEQ is ready for testing, but its audio routing and
+> **Beta 1 software:** MassiveEQ is ready for testing, but its audio routing and
 > profile format may still change. Keep an easy way to select the original
 > hardware output while testing it.
 
@@ -22,8 +22,11 @@ The current beta has been validated on:
 - Automated DSP reference tests at 44.1, 48, 96, and 192 kHz
 
 It has **not yet been manually validated** on GNOME, KDE Plasma, surround
-outputs, professional multichannel interfaces, or ARM systems. Version 0.2.x
-should therefore be treated as a public beta, not a production-stable release.
+outputs, professional multichannel interfaces, or ARM systems. Version
+0.3.0-beta.1 should therefore be treated as a public beta, not a
+production-stable release. Fully updated Arch Linux x86_64 is the supported
+packaging target; partial upgrades and Arch Linux ARM are outside this beta's
+support contract.
 
 ## Current features
 
