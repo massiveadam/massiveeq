@@ -9,6 +9,7 @@ depends=('pipewire>=1:1.4' 'wireplumber>=0.5' 'gtk4>=4.18' 'libadwaita>=1.8' 'li
 makedepends=('cargo' 'clang' 'git')
 provides=('massiveeq')
 conflicts=('massiveeq')
+install=massiveeq.install
 source=("$pkgname::git+https://github.com/massiveadam/massiveeq.git")
 sha256sums=('SKIP')
 
@@ -24,7 +25,7 @@ build() {
 
 check() {
   cd "$pkgname"
-  cargo test --workspace --locked
+  cargo test --workspace --release --locked
 }
 
 package() {
