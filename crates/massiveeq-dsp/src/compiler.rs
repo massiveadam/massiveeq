@@ -66,8 +66,6 @@ pub struct CompiledChannel {
     pub biquads: Vec<BiquadCoefficients>,
     pub peak_candidates: Vec<f64>,
     pub convolutions: Vec<ConvolutionKernel>,
-    /// Optional time-alignment used by a level-matched dry A/B path.
-    pub delay_frames: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +105,6 @@ pub fn compile_bypass_with_gain(
                 biquads: Vec::new(),
                 peak_candidates: Vec::new(),
                 convolutions: Vec::new(),
-                delay_frames: 0,
             })
             .collect(),
         analysis: CompiledAnalysis {
@@ -256,7 +253,6 @@ pub fn compile_profile(
             biquads,
             peak_candidates,
             convolutions,
-            delay_frames: 0,
         });
     }
 

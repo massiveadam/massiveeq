@@ -77,7 +77,7 @@ each output and do not replace its normal assigned profile.
 While the app is focused, `Alt+1` through `Alt+9` select candidates in bank
 order. `Ctrl+B` toggles the selected output's **Filters** switch. Turning
 Filters off removes the filters while retaining the active profile's
-clipping-safe perceived level and convolution timing. The header **Engine**
+clipping-safe perceived level and existing PipeWire endpoint. The header **Engine**
 switch is deliberately different: Engine Off is true 0 dB dry audio with no
 EQ, perceptual correction, safety attenuation, or user trim. Comparison
 candidates switch through the live 8 ms crossfade without replacing the

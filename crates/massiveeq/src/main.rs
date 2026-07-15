@@ -79,15 +79,42 @@ fn build_ui(app: &adw::Application) {
             return;
         }
     };
-    let engine_status = client.status().unwrap_or_default();
+    let profiles = match client.profiles() {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            show_startup_error(app, &format!("Could not load profiles: {error}"));
+            return;
+        }
+    };
+    let devices = match client.devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            show_startup_error(app, &format!("Could not load audio outputs: {error}"));
+            return;
+        }
+    };
+    let comparisons = match client.comparisons() {
+        Ok(comparisons) => comparisons,
+        Err(error) => {
+            show_startup_error(app, &format!("Could not load comparison banks: {error}"));
+            return;
+        }
+    };
+    let engine_status = match client.status() {
+        Ok(status) => status,
+        Err(error) => {
+            show_startup_error(app, &format!("Could not read audio engine status: {error}"));
+            return;
+        }
+    };
     let active_sample_rate = engine_status
         .pointer("/engine/active/0/sample_rate")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(48_000) as f64;
     let model = Rc::new(Model {
-        profiles: RefCell::new(client.profiles().unwrap_or_default()),
-        devices: RefCell::new(client.devices().unwrap_or_default()),
-        comparisons: RefCell::new(client.comparisons().unwrap_or_default()),
+        profiles: RefCell::new(profiles),
+        devices: RefCell::new(devices),
+        comparisons: RefCell::new(comparisons),
         client,
         current_id: RefCell::new(None),
         document: Rc::new(RefCell::new(None)),
@@ -179,6 +206,12 @@ fn build_ui(app: &adw::Application) {
     global_bypass.set_tooltip_text(Some(
         "Master DSP engine. Off is true dry audio at 0 dB with no EQ or level correction.",
     ));
+    global_bypass.update_property(&[
+        gtk::accessible::Property::Label("Engine enabled"),
+        gtk::accessible::Property::Description(
+            "Master DSP switch. Turning it off removes EQ and all gain correction.",
+        ),
+    ]);
     header.pack_end(&global_bypass);
     let global_bypass_label = gtk::Label::new(Some("ENGINE"));
     global_bypass_label.add_css_class("header-data");
@@ -267,6 +300,12 @@ fn build_ui(app: &adw::Application) {
     device_bypass.set_tooltip_text(Some(
         "Turn filters on or off. Off retains the active profile's perceived gain correction for fair listening comparisons.",
     ));
+    device_bypass.update_property(&[
+        gtk::accessible::Property::Label("Filters enabled for selected output"),
+        gtk::accessible::Property::Description(
+            "Turning filters off retains level matching for a fair comparison.",
+        ),
+    ]);
     let bypass_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bypass_row.set_halign(gtk::Align::Center);
     bypass_row.append(&gtk::Label::new(Some("FILTERS")));
@@ -317,6 +356,8 @@ fn build_ui(app: &adw::Application) {
     let comparison_enabled = gtk::Switch::new();
     comparison_enabled.set_valign(gtk::Align::Center);
     comparison_enabled.set_tooltip_text(Some("Enable this output's comparison bank"));
+    comparison_enabled
+        .update_property(&[gtk::accessible::Property::Label("Comparison bank active")]);
     let comparison_enabled_label = gtk::Label::new(Some("BANK ACTIVE"));
     comparison_enabled_label.add_css_class("section-label");
     comparison_active_row.append(&comparison_enabled_label);
@@ -372,6 +413,12 @@ fn build_ui(app: &adw::Application) {
         model.document.clone(),
         model.selected_filter.clone(),
     );
+    graph.update_property(&[
+        gtk::accessible::Property::Label("Frequency response graph"),
+        gtk::accessible::Property::Description(
+            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Use the filter controls below for keyboard editing.",
+        ),
+    ]);
     let analysis_label = gtk::Label::new(Some("AUTO PREAMP —"));
     analysis_label.set_xalign(0.0);
     analysis_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -706,43 +753,68 @@ fn build_ui(app: &adw::Application) {
         let assign = assign_button.clone();
         let bypass = device_bypass.clone();
         let engine = global_bypass.clone();
+        let engine_readout = graph_hint.clone();
         let comparison_ui = comparison_ui.clone();
         move || {
             if let Ok(devices) = model.client.devices() {
-                let selected_key = model
-                    .devices
-                    .borrow()
-                    .get(drop.selected() as usize)
-                    .map(|device| device.key.as_storage_key());
-                let names = devices
+                let (selected_key, old_identity) = {
+                    let current = model.devices.borrow();
+                    (
+                        current
+                            .get(drop.selected() as usize)
+                            .map(|device| device.key.as_storage_key()),
+                        current
+                            .iter()
+                            .map(|device| (device.key.as_storage_key(), device.description.clone()))
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let new_identity = devices
                     .iter()
-                    .map(|device| device.description.as_str())
+                    .map(|device| (device.key.as_storage_key(), device.description.clone()))
                     .collect::<Vec<_>>();
-                strings.splice(0, strings.n_items(), &names);
+                let list_changed = old_identity != new_identity;
                 *model.devices.borrow_mut() = devices;
-                if let Some(key) = selected_key
-                    && let Some(index) = model
-                        .devices
-                        .borrow()
+                if list_changed {
+                    let names = new_identity
                         .iter()
-                        .position(|device| device.key.as_storage_key() == key)
-                {
-                    drop.set_selected(index as u32);
+                        .map(|(_, description)| description.as_str())
+                        .collect::<Vec<_>>();
+                    strings.splice(0, strings.n_items(), &names);
+                    if let Some(key) = selected_key
+                        && let Some(index) = model
+                            .devices
+                            .borrow()
+                            .iter()
+                            .position(|device| device.key.as_storage_key() == key)
+                    {
+                        drop.set_selected(index as u32);
+                    }
                 }
                 update_device_controls(&model, &drop, &state, &assign, &bypass);
                 if let Ok(comparisons) = model.client.comparisons() {
                     *model.comparisons.borrow_mut() = comparisons;
                 }
-                refresh_comparison_ui(&model, &drop, &comparison_ui);
+                // The candidate rows are an unsaved draft while this popover
+                // is open. Rebuilding them on the health poll loses clicks
+                // and can destroy the widget currently handling input.
+                if !comparison_ui.menu.is_active() {
+                    refresh_comparison_ui(&model, &drop, &comparison_ui);
+                }
             }
             if let Ok(service_status) = model.client.status()
                 && let Some(engine_off) = service_status
                     .get("global_bypass")
                     .and_then(serde_json::Value::as_bool)
             {
+                engine_readout.set_text(&engine_summary(&service_status));
+                engine.set_sensitive(true);
                 model.syncing_engine.set(true);
                 engine.set_active(!engine_off);
                 model.syncing_engine.set(false);
+            } else {
+                engine_readout.set_text("AUDIO SERVICE UNAVAILABLE");
+                engine.set_sensitive(false);
             }
             gtk::glib::ControlFlow::Continue
         }
@@ -1151,12 +1223,19 @@ fn wire_actions(
     delete.connect_clicked({
         let model = model.clone();
         let list = profile_list.clone();
+        let status = status.clone();
         move |_| {
-            if let Some(id) = model.current_id.borrow().clone() {
-                let _ = model.client.delete(&id);
-                refresh_profiles(&model, &list);
-                if let Some(row) = list.row_at_index(0) {
-                    list.select_row(Some(&row));
+            let current_id = model.current_id.borrow().clone();
+            if let Some(id) = current_id {
+                match model.client.delete(&id) {
+                    Ok(()) => {
+                        refresh_profiles(&model, &list);
+                        if let Some(row) = list.row_at_index(0) {
+                            list.select_row(Some(&row));
+                        }
+                        status.set_text("Profile deleted");
+                    }
+                    Err(error) => status.set_text(&error.to_string()),
                 }
             }
         }
@@ -1165,6 +1244,7 @@ fn wire_actions(
         let model = model.clone();
         let list = profile_list.clone();
         let window = window.clone();
+        let status = status.clone();
         move |_| {
             let filter = gtk::FileFilter::new();
             filter.set_name(Some("Equalizer text profiles"));
@@ -1176,12 +1256,28 @@ fn wire_actions(
                 .build();
             let model = model.clone();
             let list = list.clone();
+            let status = status.clone();
             chooser.open(Some(&window), gtk::gio::Cancellable::NONE, move |result| {
                 if let Ok(file) = result
                     && let Some(path) = file.path()
                 {
-                    let _ = model.client.import(&path.display().to_string());
-                    refresh_profiles(&model, &list);
+                    match model.client.import(&path.display().to_string()) {
+                        Ok(imported) => {
+                            refresh_profiles(&model, &list);
+                            let index = model
+                                .profiles
+                                .borrow()
+                                .iter()
+                                .position(|profile| profile.id == imported.id);
+                            if let Some(index) = index
+                                && let Some(row) = list.row_at_index(index as i32)
+                            {
+                                list.select_row(Some(&row));
+                            }
+                            status.set_text("Profile imported");
+                        }
+                        Err(error) => status.set_text(&error.to_string()),
+                    }
                 }
             });
         }
@@ -1189,6 +1285,7 @@ fn wire_actions(
     duplicate.connect_clicked({
         let model = model.clone();
         let list = profile_list.clone();
+        let status = status.clone();
         move |_| {
             let Some(id) = model.current_id.borrow().clone() else {
                 return;
@@ -1202,20 +1299,40 @@ fn wire_actions(
             else {
                 return;
             };
-            if let Ok(created) = model.client.create(&format!("{} Copy", source.name)) {
-                let _ = model.client.put(
+            match model.client.create(&format!("{} Copy", source.name)) {
+                Ok(created) => match model.client.put(
                     &created.id,
                     &created.name,
                     &source.text,
                     source.manual_trim_db,
-                );
-                refresh_profiles(&model, &list);
+                ) {
+                    Ok(_) => {
+                        refresh_profiles(&model, &list);
+                        let index = model
+                            .profiles
+                            .borrow()
+                            .iter()
+                            .position(|profile| profile.id == created.id);
+                        if let Some(index) = index
+                            && let Some(row) = list.row_at_index(index as i32)
+                        {
+                            list.select_row(Some(&row));
+                        }
+                        status.set_text("Profile duplicated");
+                    }
+                    Err(error) => {
+                        let _ = model.client.delete(&created.id);
+                        status.set_text(&error.to_string());
+                    }
+                },
+                Err(error) => status.set_text(&error.to_string()),
             }
         }
     });
     export.connect_clicked({
         let model = model.clone();
         let window = window.clone();
+        let status = status.clone();
         move |_| {
             let Some(id) = model.current_id.borrow().clone() else {
                 return;
@@ -1235,13 +1352,18 @@ fn wire_actions(
                 .initial_name(format!("{}.txt", profile.name.replace('/', "-")))
                 .build();
             let model = model.clone();
+            let status = status.clone();
             dialog.save(Some(&window), gtk::gio::Cancellable::NONE, move |result| {
                 if let Ok(file) = result
                     && let Some(path) = file.path()
                 {
-                    let _ = model
+                    match model
                         .client
-                        .export(&profile.id, &path.display().to_string());
+                        .export(&profile.id, &path.display().to_string())
+                    {
+                        Ok(()) => status.set_text("Profile exported"),
+                        Err(error) => status.set_text(&error.to_string()),
+                    }
                 }
             });
         }
@@ -1253,6 +1375,7 @@ fn wire_actions(
         let state = device_state.clone();
         let assign = assign.clone();
         let bypass = device_bypass.clone();
+        let comparison_ui = comparison_ui.clone();
         move |_| {
             let index = drop.selected() as usize;
             let Some(device) = model.devices.borrow().get(index).cloned() else {
@@ -1268,8 +1391,14 @@ fn wire_actions(
                     .and_then(|errors| errors.get(&storage_key))
                     .is_some()
             });
-            let unassigning =
-                !engine_has_error && device.assigned_profile.as_deref() == Some(&selected_profile);
+            let comparison_active = model
+                .comparisons
+                .borrow()
+                .get(&storage_key)
+                .is_some_and(|comparison| comparison.enabled);
+            let unassigning = !engine_has_error
+                && !comparison_active
+                && device.assigned_profile.as_deref() == Some(&selected_profile);
             let profile = if unassigning { "" } else { &selected_profile };
             match model.client.assign(&storage_key, profile) {
                 Ok(()) => {
@@ -1282,6 +1411,10 @@ fn wire_actions(
                     if let Ok(devices) = model.client.devices() {
                         *model.devices.borrow_mut() = devices;
                     }
+                    if let Ok(comparisons) = model.client.comparisons() {
+                        *model.comparisons.borrow_mut() = comparisons;
+                    }
+                    refresh_comparison_ui(&model, &drop, &comparison_ui);
                     update_device_controls(&model, &drop, &state, &assign, &bypass);
                 }
                 Err(error) => status.set_text(&error.to_string()),
@@ -1464,16 +1597,26 @@ fn wire_actions(
         let drop = device_drop.clone();
         let state = device_state.clone();
         let assign = assign.clone();
+        let status = status.clone();
         move |switch| {
             if model.syncing_device.get() {
                 return;
             }
-            if let Some(device) = model.devices.borrow().get(drop.selected() as usize) {
-                let _ = model
+            let device = {
+                let devices = model.devices.borrow();
+                devices.get(drop.selected() as usize).cloned()
+            };
+            if let Some(device) = device {
+                match model
                     .client
-                    .set_device_bypass(&device.key.as_storage_key(), !switch.is_active());
-                if let Ok(devices) = model.client.devices() {
-                    *model.devices.borrow_mut() = devices;
+                    .set_device_bypass(&device.key.as_storage_key(), !switch.is_active())
+                {
+                    Ok(()) => {
+                        if let Ok(devices) = model.client.devices() {
+                            *model.devices.borrow_mut() = devices;
+                        }
+                    }
+                    Err(error) => status.set_text(&error.to_string()),
                 }
                 update_device_controls(&model, &drop, &state, &assign, switch);
             }
@@ -1481,11 +1624,17 @@ fn wire_actions(
     });
     global_bypass.connect_active_notify({
         let model = model.clone();
+        let status = status.clone();
         move |switch| {
             if model.syncing_engine.get() {
                 return;
             }
-            let _ = model.client.set_global_bypass(!switch.is_active());
+            if let Err(error) = model.client.set_global_bypass(!switch.is_active()) {
+                status.set_text(&error.to_string());
+                model.syncing_engine.set(true);
+                switch.set_active(!switch.is_active());
+                model.syncing_engine.set(false);
+            }
         }
     });
     trim.connect_value_changed({
@@ -1707,6 +1856,10 @@ fn rebuild_filter_list(
         enabled.set_active(filter.enabled);
         enabled.set_valign(gtk::Align::Center);
         enabled.add_css_class("filter-switch");
+        enabled.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Enable filter at {}",
+            format_band_frequency(filter.frequency)
+        ))]);
 
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
@@ -2125,6 +2278,12 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Compariso
         row.append(&label);
         row.append(&selected_mark);
         check.set_child(Some(&row));
+        check.update_property(&[
+            gtk::accessible::Property::Label(&format!("Include {name} in comparison")),
+            gtk::accessible::Property::Description(
+                "Select or remove this profile from the comparison bank draft.",
+            ),
+        ]);
         let selected = comparison
             .as_ref()
             .is_some_and(|comparison| comparison.profile_ids.contains(&profile_id));
@@ -2134,11 +2293,17 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Compariso
         ui.candidates.append(&check);
         ui.checks.borrow_mut().push((profile_id, check.clone()));
         check.connect_toggled({
-            let checks = ui.checks.clone();
+            // These rows are rebuilt when the popover is reopened. Capturing
+            // a strong Rc would form checks -> button -> closure -> checks and
+            // leak every discarded candidate row.
+            let checks = Rc::downgrade(&ui.checks);
             let status = ui.status.clone();
             let save = ui.save.clone();
             let selected_mark = selected_mark.clone();
             move |button| {
+                let Some(checks) = checks.upgrade() else {
+                    return;
+                };
                 let selected = checks
                     .borrow()
                     .iter()
@@ -2248,7 +2413,10 @@ fn install_comparison_shortcuts(
         let ui = comparison_ui.clone();
         move |_, key, _, modifiers| {
             let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
-            if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) && character == Some('b') {
+            if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                && character == Some('b')
+                && bypass.is_sensitive()
+            {
                 bypass.set_active(!bypass.is_active());
                 return gtk::glib::Propagation::Stop;
             }

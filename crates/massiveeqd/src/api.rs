@@ -276,9 +276,19 @@ impl Service {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> fdo::Result<()> {
         let mut state = self.state.lock().await;
+        require_known_device(&state, device_key)?;
         if profile_id.is_empty() {
             state.library.assignments.remove(device_key);
         } else if state.library.profiles.contains_key(profile_id) {
+            let (profile, _) = state
+                .storage
+                .parsed_profile(&state.library, profile_id)
+                .map_err(failed)?;
+            if !profile.is_activatable() {
+                return Err(fdo::Error::Failed(
+                    "profile has validation errors and cannot be assigned".into(),
+                ));
+            }
             state
                 .library
                 .assignments
@@ -287,6 +297,10 @@ impl Service {
             return Err(fdo::Error::Failed(format!(
                 "profile {profile_id} not found"
             )));
+        }
+        state.library.bypassed_devices.remove(device_key);
+        if let Some(comparison) = state.library.comparison_sets.get_mut(device_key) {
+            comparison.enabled = false;
         }
         state.storage.save_library(&state.library).map_err(failed)?;
         refresh_locked(&mut state, true).await.map_err(failed)?;
@@ -300,6 +314,7 @@ impl Service {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> fdo::Result<()> {
         let mut state = self.state.lock().await;
+        require_known_device(&state, device_key)?;
         if bypassed {
             state.library.bypassed_devices.insert(device_key.to_owned());
         } else {
@@ -353,6 +368,20 @@ impl Service {
 
 fn failed(error: impl std::fmt::Display) -> fdo::Error {
     fdo::Error::Failed(error.to_string())
+}
+
+fn require_known_device(state: &crate::AppState, device_key: &str) -> fdo::Result<()> {
+    if state
+        .devices
+        .iter()
+        .any(|device| device.key.as_storage_key() == device_key)
+    {
+        Ok(())
+    } else {
+        Err(fdo::Error::Failed(format!(
+            "output {device_key} is not known to MassiveEQ"
+        )))
+    }
 }
 
 fn legacy_analysis(analysis: &massiveeq_dsp::CompiledAnalysis) -> ProfileAnalysis {

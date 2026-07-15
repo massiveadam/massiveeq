@@ -19,8 +19,6 @@ pub struct ChannelProcessor {
     gain: f32,
     biquads: Vec<Biquad>,
     convolvers: Vec<TwoStageFFTConvolver<f32>>,
-    delay: Vec<f32>,
-    delay_position: usize,
     scratch_a: Vec<f32>,
     scratch_b: Vec<f32>,
 }
@@ -37,8 +35,6 @@ impl ChannelProcessor {
             gain: channel.gain_linear,
             biquads: channel.biquads.iter().copied().map(Biquad::new).collect(),
             convolvers,
-            delay: vec![0.0; channel.delay_frames as usize],
-            delay_position: 0,
             scratch_a: vec![0.0; quantum],
             scratch_b: vec![0.0; quantum],
         })
@@ -60,13 +56,6 @@ impl ChannelProcessor {
             let mut sample = *source * self.gain;
             for biquad in &mut self.biquads {
                 sample = biquad.process(sample);
-            }
-            if !self.delay.is_empty() {
-                std::mem::swap(&mut sample, &mut self.delay[self.delay_position]);
-                self.delay_position += 1;
-                if self.delay_position == self.delay.len() {
-                    self.delay_position = 0;
-                }
             }
             *destination = sample;
         }
@@ -98,8 +87,6 @@ impl ChannelProcessor {
         for convolver in &mut self.convolvers {
             convolver.reset();
         }
-        self.delay.fill(0.0);
-        self.delay_position = 0;
         self.scratch_a.fill(0.0);
         self.scratch_b.fill(0.0);
     }
@@ -212,7 +199,6 @@ mod tests {
                 impulse: vec![0.5, 0.25, -0.125],
                 latency_frames: 0,
             }],
-            delay_frames: 0,
         };
         let mut processor = ChannelProcessor::new(&channel, 64).unwrap();
         let mut input = vec![0.0; 64];
@@ -222,21 +208,5 @@ mod tests {
         assert!((output[0] - 0.5).abs() < 1e-5);
         assert!((output[1] - 0.25).abs() < 1e-5);
         assert!((output[2] + 0.125).abs() < 1e-5);
-    }
-
-    #[test]
-    fn dry_alignment_delay_is_preallocated_and_sample_exact() {
-        let channel = CompiledChannel {
-            gain_linear: 0.5,
-            biquads: Vec::new(),
-            peak_candidates: Vec::new(),
-            convolutions: Vec::new(),
-            delay_frames: 3,
-        };
-        let mut processor = ChannelProcessor::new(&channel, 8).unwrap();
-        let input = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let mut output = [0.0; 8];
-        processor.process(&input, &mut output).unwrap();
-        assert_eq!(output, [0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0]);
     }
 }

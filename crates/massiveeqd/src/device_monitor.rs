@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::sync::mpsc::Sender;
 
-type MonitoredObjects = Rc<RefCell<Vec<(Box<dyn ProxyT>, Box<dyn pw::proxy::Listener>)>>>;
+type MonitoredObjects = Rc<RefCell<Vec<(u32, Box<dyn ProxyT>, Box<dyn pw::proxy::Listener>)>>>;
 
 pub struct DeviceMonitor {
     stop: Arc<AtomicBool>,
@@ -75,6 +75,7 @@ fn run_monitor(
         let registry_weak = registry.downgrade();
         let objects: MonitoredObjects = Rc::new(RefCell::new(Vec::new()));
         let object_store = objects.clone();
+        let removal_store = objects.clone();
         let global_events = events.clone();
         let _listener = registry
             .add_listener_local()
@@ -93,9 +94,11 @@ fn run_monitor(
                                     let _ = update_events.try_send(());
                                 })
                                 .register();
-                            object_store
-                                .borrow_mut()
-                                .push((Box::new(node), Box::new(listener)));
+                            object_store.borrow_mut().push((
+                                object.id,
+                                Box::new(node),
+                                Box::new(listener),
+                            ));
                         }
                     }
                     ObjectType::Metadata => {
@@ -108,15 +111,27 @@ fn run_monitor(
                                     0
                                 })
                                 .register();
-                            object_store
-                                .borrow_mut()
-                                .push((Box::new(metadata), Box::new(listener)));
+                            object_store.borrow_mut().push((
+                                object.id,
+                                Box::new(metadata),
+                                Box::new(listener),
+                            ));
                         }
                     }
                     _ => {}
                 }
             })
-            .global_remove(move |_| {
+            .global_remove(move |id| {
+                let removed = {
+                    let mut objects = removal_store.borrow_mut();
+                    objects
+                        .iter()
+                        .position(|(object_id, _, _)| *object_id == id)
+                        .map(|index| objects.swap_remove(index))
+                };
+                // Listener destruction may interact with PipeWire. Do it
+                // after releasing the RefCell borrow to avoid re-entrancy.
+                drop(removed);
                 let _ = events.try_send(());
             })
             .register();

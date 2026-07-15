@@ -25,7 +25,13 @@ pub enum StorageError {
     MissingProfile(String),
     #[error("profile cannot be activated: {0}")]
     InvalidProfile(String),
+    #[error("state schema {found} is newer than this build supports ({supported})")]
+    UnsupportedSchema { found: u32, supported: u32 },
+    #[error("the final profile cannot be deleted; edit it or create another profile first")]
+    LastProfile,
 }
+
+const LIBRARY_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileRecord {
@@ -66,7 +72,7 @@ pub struct Library {
 impl Default for Library {
     fn default() -> Self {
         Self {
-            schema_version: 3,
+            schema_version: LIBRARY_SCHEMA_VERSION,
             profiles: BTreeMap::new(),
             assignments: HashMap::new(),
             bypassed_devices: HashSet::new(),
@@ -112,7 +118,13 @@ impl Storage {
             return Ok(Library::default());
         }
         let mut library: Library = serde_json::from_slice(&fs::read(&self.state_path)?)?;
-        library.schema_version = 3;
+        if library.schema_version > LIBRARY_SCHEMA_VERSION {
+            return Err(StorageError::UnsupportedSchema {
+                found: library.schema_version,
+                supported: LIBRARY_SCHEMA_VERSION,
+            });
+        }
+        library.schema_version = LIBRARY_SCHEMA_VERSION;
         Ok(library)
     }
 
@@ -178,6 +190,11 @@ impl Storage {
         text: &str,
         manual_trim_db: f64,
     ) -> Result<ProfileInfo, StorageError> {
+        if !manual_trim_db.is_finite() {
+            return Err(StorageError::InvalidProfile(
+                "manual trim must be a finite number".into(),
+            ));
+        }
         let parsed = parse_text(name, text);
         if !parsed.is_activatable() {
             let message = parsed
@@ -310,6 +327,9 @@ impl Storage {
     }
 
     pub fn delete_profile(&self, library: &mut Library, id: &str) -> Result<(), StorageError> {
+        if library.profiles.len() == 1 && library.profiles.contains_key(id) {
+            return Err(StorageError::LastProfile);
+        }
         if library.profiles.remove(id).is_none() {
             return Err(StorageError::MissingProfile(id.into()));
         }
@@ -537,6 +557,44 @@ mod tests {
         assert_eq!(library.schema_version, 3);
         assert!(library.remembered_devices.is_empty());
         assert!(library.comparison_sets.is_empty());
+    }
+
+    #[test]
+    fn newer_state_schema_is_rejected_without_rewriting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        let state = config.join("state.json");
+        let original = br#"{"schema_version":999,"profiles":{},"assignments":{},"bypassed_devices":[],"global_bypass":false}"#;
+        std::fs::write(&state, original).unwrap();
+        let storage = Storage::new(temp.path().join("data"), config).unwrap();
+
+        assert!(matches!(
+            storage.load_library(),
+            Err(StorageError::UnsupportedSchema { found: 999, .. })
+        ));
+        assert_eq!(std::fs::read(state).unwrap(), original);
+    }
+
+    #[test]
+    fn final_profile_and_non_finite_trim_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = Library::default();
+        let profile = storage
+            .create_profile(&mut library, "Only profile")
+            .unwrap();
+
+        assert!(matches!(
+            storage.delete_profile(&mut library, &profile.id),
+            Err(StorageError::LastProfile)
+        ));
+        assert!(library.profiles.contains_key(&profile.id));
+        assert!(matches!(
+            storage.put_profile(&mut library, &profile.id, "Only profile", "", f64::NAN),
+            Err(StorageError::InvalidProfile(_))
+        ));
+        assert_eq!(library.profiles[&profile.id].manual_trim_db, 0.0);
     }
 
     #[test]

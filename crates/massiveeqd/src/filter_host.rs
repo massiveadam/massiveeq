@@ -181,6 +181,7 @@ impl FilterHost {
             .filters
             .iter()
             .map(|(device, active)| {
+                let scheduling_latency_frames = active.latency_frames.max(active.quantum.max(1));
                 let calls = active.filter.stats.process_calls.load(std::sync::atomic::Ordering::Relaxed);
                 let total = active.filter.stats.process_nanos_total.load(std::sync::atomic::Ordering::Relaxed);
                 let average_nanos = if calls == 0 { 0.0 } else { total as f64 / calls as f64 };
@@ -191,8 +192,10 @@ impl FilterHost {
                     "node": active.filter.node_name,
                     "sample_rate": active.sample_rate,
                     "quantum_capacity": active.quantum,
-                    "latency_frames": active.latency_frames,
-                    "latency_ms": active.latency_frames as f64 * 1000.0 / active.sample_rate as f64,
+                    "latency_frames": scheduling_latency_frames,
+                    "latency_ms": scheduling_latency_frames as f64 * 1000.0 / active.sample_rate as f64,
+                    "dsp_latency_frames": active.latency_frames,
+                    "dsp_latency_ms": active.latency_frames as f64 * 1000.0 / active.sample_rate as f64,
                     "revision": active.revision,
                     "input_overflows": active.filter.stats.input_overflows.load(std::sync::atomic::Ordering::Relaxed),
                     "output_underflows": active.filter.stats.output_underflows.load(std::sync::atomic::Ordering::Relaxed),
@@ -284,9 +287,9 @@ fn compile_runtime_profile(
     };
     let active = compile_profile(&profile, &options)?;
     let compiled = if bypassed {
-        // Output A/B retains the active profile's clipping-safe perceived
-        // level and timing. This makes the switch a comparison of filters,
-        // rather than a comparison of loudness or latency.
+        // Filters Off retains the active profile's clipping-safe perceived
+        // level and reported endpoint latency. This makes it a comparison of
+        // filters rather than a comparison of loudness or route stability.
         compile_level_matched_bypass(&active, perceived_output_level_db(&active).min(0.0))
     } else {
         active
@@ -399,13 +402,6 @@ fn compile_level_matched_bypass(active: &CompiledProfile, gain_db: f64) -> Compi
         active.output_channels,
         gain_db,
     );
-    for (dry_channel, active_channel) in dry.channels.iter_mut().zip(&active.channels) {
-        dry_channel.delay_frames = active_channel
-            .convolutions
-            .iter()
-            .map(|kernel| kernel.latency_frames.saturating_sub(active.quantum))
-            .sum();
-    }
     dry.latency_frames = active.latency_frames;
     dry
 }
@@ -633,12 +629,11 @@ mod tests {
             channel.gain_linear == 1.0
                 && channel.biquads.is_empty()
                 && channel.convolutions.is_empty()
-                && channel.delay_frames == 0
         }));
     }
 
     #[test]
-    fn level_matched_convolution_bypass_preserves_latency_and_peak_alignment() {
+    fn level_matched_convolution_bypass_preserves_endpoint_latency() {
         let mut active = compile_bypass_with_gain(48_000, 128, 2, -2.0);
         for channel in &mut active.channels {
             channel.convolutions.push(massiveeq_dsp::ConvolutionKernel {
@@ -654,7 +649,7 @@ mod tests {
         assert!(
             dry.channels
                 .iter()
-                .all(|channel| channel.delay_frames == 17)
+                .all(|channel| { channel.biquads.is_empty() && channel.convolutions.is_empty() })
         );
     }
 
