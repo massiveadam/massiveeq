@@ -10,7 +10,8 @@ mod runtime;
 pub use analysis::{ChannelResponse, CompiledAnalysis, ResponsePoint};
 pub use biquad::{Biquad, BiquadCoefficients};
 pub use compiler::{
-    CompileError, CompileOptions, CompiledProfile, compile_bypass, compile_profile,
+    CompileError, CompileOptions, CompiledProfile, attenuate_for_comparison, compile_bypass,
+    compile_bypass_with_gain, compile_profile, perceived_output_level_db,
 };
 pub use convolution::{ConvolutionKernel, IrData, load_ir};
 pub use graphic::{GraphicDesign, design_graphic_eq};

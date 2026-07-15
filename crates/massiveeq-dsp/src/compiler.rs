@@ -56,6 +56,8 @@ pub enum CompileError {
     AssetOutsideProfile(PathBuf),
     #[error("compiled response contains a non-finite value")]
     NonFiniteResponse,
+    #[error("comparison attenuation must be a finite value at or below 0 dB, got {0}")]
+    InvalidComparisonAttenuation(f64),
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +79,15 @@ pub struct CompiledProfile {
 }
 
 pub fn compile_bypass(sample_rate: u32, quantum: u32, output_channels: u32) -> CompiledProfile {
+    compile_bypass_with_gain(sample_rate, quantum, output_channels, 0.0)
+}
+
+pub fn compile_bypass_with_gain(
+    sample_rate: u32,
+    quantum: u32,
+    output_channels: u32,
+    gain_db: f64,
+) -> CompiledProfile {
     let max_frequency = 20_000.0_f64.min(sample_rate as f64 * 0.499);
     let response = (0..512)
         .map(|index| crate::ResponsePoint {
@@ -90,7 +101,7 @@ pub fn compile_bypass(sample_rate: u32, quantum: u32, output_channels: u32) -> C
         output_channels,
         channels: (0..output_channels)
             .map(|_| CompiledChannel {
-                gain_linear: 1.0,
+                gain_linear: db_to_linear(gain_db) as f32,
                 biquads: Vec::new(),
                 peak_candidates: Vec::new(),
                 convolutions: Vec::new(),
@@ -107,12 +118,36 @@ pub fn compile_bypass(sample_rate: u32, quantum: u32, output_channels: u32) -> C
             match_gain_db: 0.0,
             manual_trim_db: 0.0,
             safety_attenuation_db: 0.0,
-            effective_gain_db: 0.0,
-            final_peak_db: 0.0,
+            effective_gain_db: gain_db,
+            final_peak_db: gain_db,
             headroom_limited: false,
         },
         latency_frames: 0,
     }
+}
+
+/// Adds only attenuation after a profile's own perceptual matching and safety
+/// calculation. Comparison banks use this to bring every candidate down to a
+/// shared safe loudness without allowing any candidate to exceed its normal
+/// clipping-protected output.
+pub fn attenuate_for_comparison(
+    profile: &mut CompiledProfile,
+    attenuation_db: f64,
+) -> Result<(), CompileError> {
+    if !attenuation_db.is_finite() || attenuation_db > 1e-9 {
+        return Err(CompileError::InvalidComparisonAttenuation(attenuation_db));
+    }
+    let gain = db_to_linear(attenuation_db) as f32;
+    for channel in &mut profile.channels {
+        channel.gain_linear *= gain;
+    }
+    profile.analysis.effective_gain_db += attenuation_db;
+    profile.analysis.final_peak_db += attenuation_db;
+    Ok(())
+}
+
+pub fn perceived_output_level_db(profile: &CompiledProfile) -> f64 {
+    profile.analysis.effective_gain_db - profile.analysis.match_gain_db
 }
 
 pub fn compile_profile(
@@ -291,6 +326,31 @@ fn db_to_linear(db: f64) -> f64 {
 }
 
 #[cfg(test)]
+mod comparison_tests {
+    use super::*;
+    use massiveeq_core::parse_text;
+
+    #[test]
+    fn comparison_attenuation_changes_gain_without_spending_headroom() {
+        let profile = parse_text("boost", "Filter: ON PK Fc 1000 Hz Gain 6 dB Q 1");
+        let mut compiled =
+            compile_profile(&profile, &CompileOptions::stereo(48_000, 128, "/tmp")).unwrap();
+        let final_peak = compiled.analysis.final_peak_db;
+        let perceived = perceived_output_level_db(&compiled);
+        attenuate_for_comparison(&mut compiled, -3.0).unwrap();
+        assert!((compiled.analysis.final_peak_db - (final_peak - 3.0)).abs() < 1e-9);
+        assert!((perceived_output_level_db(&compiled) - (perceived - 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gained_bypass_uses_the_requested_runtime_level() {
+        let compiled = compile_bypass_with_gain(48_000, 128, 2, -4.25);
+        assert!((compiled.analysis.effective_gain_db + 4.25).abs() < 1e-9);
+        assert!((compiled.channels[0].gain_linear - 10.0_f32.powf(-4.25 / 20.0)).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use massiveeq_core::parse_text;
@@ -344,6 +404,34 @@ mod tests {
                 compile_profile(&profile, &CompileOptions::stereo(rate, 256, "/tmp")).unwrap();
             assert!((compiled.analysis.match_gain_db + 6.0).abs() < 0.01);
             assert!((compiled.analysis.final_peak_db + 1.0).abs() < 0.01);
+            assert!(compiled.analysis.channels.iter().all(|channel| {
+                channel
+                    .response
+                    .iter()
+                    .all(|point| point.gain_db.abs() < 0.01)
+            }));
+        }
+    }
+
+    #[test]
+    fn output_preamp_does_not_move_the_display_response() {
+        let profile = parse_text("test", "Filter: ON PK Fc 1000 Hz Gain 8 dB Q 1");
+        let normal =
+            compile_profile(&profile, &CompileOptions::stereo(48_000, 256, "/tmp")).unwrap();
+        let mut adjusted_options = CompileOptions::stereo(48_000, 256, "/tmp");
+        adjusted_options.manual_trim_db = -20.0;
+        let adjusted = compile_profile(&profile, &adjusted_options).unwrap();
+
+        assert_ne!(
+            normal.analysis.effective_gain_db,
+            adjusted.analysis.effective_gain_db
+        );
+        for (normal, adjusted) in normal.analysis.channels[0]
+            .response
+            .iter()
+            .zip(&adjusted.analysis.channels[0].response)
+        {
+            assert!((normal.gain_db - adjusted.gain_db).abs() < 1e-12);
         }
     }
 

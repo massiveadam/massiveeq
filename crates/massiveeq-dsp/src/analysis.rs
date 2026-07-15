@@ -167,8 +167,12 @@ pub(crate) fn analyze_compiled(
                 .iter()
                 .map(|frequency| ResponsePoint {
                     frequency: *frequency,
+                    // Match Squiglink's editing model: graph only the EQ/IR
+                    // transfer. Source preamp, perceptual match, correction,
+                    // and safety attenuation belong to the separate preamp
+                    // readout and must not vertically translate the curve.
                     gain_db: linear_to_db(transfer(channel_index, *frequency).norm())
-                        + effective_gain_db,
+                        - source_preamps[channel_index],
                 })
                 .collect(),
         })
@@ -215,52 +219,47 @@ fn log_grid(low: f64, high: f64, count: usize) -> Vec<f64> {
 }
 
 fn k_weight_power(frequency: f64, sample_rate: f64) -> f64 {
-    // IEC-style K weighting: a low-frequency high-pass followed by the
-    // high-frequency shelving stage used by BS.1770 meters.
-    let high_pass = simple_high_pass_transfer(frequency, sample_rate, 38.0, 0.5);
-    let shelf = simple_high_shelf_transfer(
-        frequency,
-        sample_rate,
-        1681.974,
-        4.0,
-        std::f64::consts::FRAC_1_SQRT_2,
-    );
-    (high_pass * shelf).norm_sqr()
+    let (shelf_b, shelf_a, rlb_b, rlb_a) = bs1770_k_weighting_coefficients(sample_rate);
+    (normalized_transfer(frequency, sample_rate, shelf_b, shelf_a)
+        * normalized_transfer(frequency, sample_rate, rlb_b, rlb_a))
+    .norm_sqr()
 }
 
-fn simple_high_pass_transfer(f: f64, rate: f64, center: f64, q: f64) -> Complex64 {
-    let omega = 2.0 * PI * center / rate;
-    let cos = omega.cos();
-    let alpha = omega.sin() / (2.0 * q);
-    normalized_transfer(
-        f,
-        rate,
-        [(1.0 + cos) / 2.0, -(1.0 + cos), (1.0 + cos) / 2.0],
-        [1.0 + alpha, -2.0 * cos, 1.0 - alpha],
-    )
-}
+fn bs1770_k_weighting_coefficients(sample_rate: f64) -> ([f64; 3], [f64; 3], [f64; 3], [f64; 3]) {
+    // ITU-R BS.1770-5 Annex 1 filter parameters. The bilinear-transform
+    // equations reproduce the normative 48 kHz coefficients and retain the
+    // same analogue corner frequencies at every supported PipeWire rate.
+    const SHELF_F0: f64 = 1_681.974_450_955_533;
+    const SHELF_GAIN_DB: f64 = 3.999_843_853_973_347;
+    const SHELF_Q: f64 = 0.707_175_236_955_419_6;
+    const SHELF_VB_EXPONENT: f64 = 0.499_666_774_154_541_6;
+    const RLB_F0: f64 = 38.135_470_876_024_44;
+    const RLB_Q: f64 = 0.500_327_037_323_877_3;
 
-fn simple_high_shelf_transfer(f: f64, rate: f64, center: f64, gain_db: f64, q: f64) -> Complex64 {
-    let omega = 2.0 * PI * center / rate;
-    let cos = omega.cos();
-    let sin = omega.sin();
-    let alpha = sin / (2.0 * q);
-    let amp = 10.0_f64.powf(gain_db / 40.0);
-    let beta = 2.0 * amp.sqrt() * alpha;
-    normalized_transfer(
-        f,
-        rate,
-        [
-            amp * ((amp + 1.0) + (amp - 1.0) * cos + beta),
-            -2.0 * amp * ((amp - 1.0) + (amp + 1.0) * cos),
-            amp * ((amp + 1.0) + (amp - 1.0) * cos - beta),
-        ],
-        [
-            (amp + 1.0) - (amp - 1.0) * cos + beta,
-            2.0 * ((amp - 1.0) - (amp + 1.0) * cos),
-            (amp + 1.0) - (amp - 1.0) * cos - beta,
-        ],
-    )
+    let k = (PI * SHELF_F0 / sample_rate).tan();
+    let vh = 10.0_f64.powf(SHELF_GAIN_DB / 20.0);
+    let vb = vh.powf(SHELF_VB_EXPONENT);
+    let a0 = 1.0 + k / SHELF_Q + k * k;
+    let shelf_b = [
+        (vh + vb * k / SHELF_Q + k * k) / a0,
+        2.0 * (k * k - vh) / a0,
+        (vh - vb * k / SHELF_Q + k * k) / a0,
+    ];
+    let shelf_a = [
+        1.0,
+        2.0 * (k * k - 1.0) / a0,
+        (1.0 - k / SHELF_Q + k * k) / a0,
+    ];
+
+    let k = (PI * RLB_F0 / sample_rate).tan();
+    let a0 = 1.0 + k / RLB_Q + k * k;
+    let rlb_b = [1.0, -2.0, 1.0];
+    let rlb_a = [
+        1.0,
+        2.0 * (k * k - 1.0) / a0,
+        (1.0 - k / RLB_Q + k * k) / a0,
+    ];
+    (shelf_b, shelf_a, rlb_b, rlb_a)
 }
 
 fn normalized_transfer(f: f64, rate: f64, b: [f64; 3], a: [f64; 3]) -> Complex64 {
@@ -271,4 +270,31 @@ fn normalized_transfer(f: f64, rate: f64, b: [f64; 3], a: [f64; 3]) -> Complex64
 
 fn linear_to_db(value: f64) -> f64 {
     20.0 * value.max(1e-30).log10()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bs1770_k_weighting_coefficients;
+
+    #[test]
+    fn k_weighting_reproduces_normative_48khz_coefficients() {
+        let (shelf_b, shelf_a, rlb_b, rlb_a) = bs1770_k_weighting_coefficients(48_000.0);
+        let expected_shelf_b = [
+            1.535_124_859_586_97,
+            -2.691_696_189_406_38,
+            1.198_392_810_852_85,
+        ];
+        let expected_shelf_a = [1.0, -1.690_659_293_182_41, 0.732_480_774_215_85];
+        let expected_rlb_a = [1.0, -1.990_047_454_833_98, 0.990_072_250_366_21];
+        for (actual, expected) in shelf_b.into_iter().zip(expected_shelf_b) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        for (actual, expected) in shelf_a.into_iter().zip(expected_shelf_a) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        assert_eq!(rlb_b, [1.0, -2.0, 1.0]);
+        for (actual, expected) in rlb_a.into_iter().zip(expected_rlb_a) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
 }

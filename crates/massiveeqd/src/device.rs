@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use massiveeq_core::{DeviceInfo, DeviceKey, Library};
+use massiveeq_core::{DeviceInfo, DeviceKey, Library, RememberedDevice};
 use serde_json::{Map, Value};
 use tokio::process::Command;
 
@@ -30,7 +30,7 @@ pub async fn graph_settings() -> GraphSettings {
     }
 }
 
-pub async fn discover(library: &Library) -> Result<Vec<DeviceInfo>> {
+pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
     let output = Command::new("pw-dump")
         .output()
         .await
@@ -98,11 +98,76 @@ pub async fn discover(library: &Library) -> Result<Vec<DeviceInfo>> {
             channels: channels.max(1),
             connected: true,
             assigned_profile: library.assignments.get(&storage_key).cloned(),
-            bypassed: library.global_bypass || library.bypassed_devices.contains(&storage_key),
+            bypassed: library.bypassed_devices.contains(&storage_key),
         });
     }
-    devices.sort_by(|a, b| a.description.cmp(&b.description));
+    let connected_keys = devices
+        .iter()
+        .map(|device| device.key.as_storage_key())
+        .collect::<std::collections::HashSet<_>>();
+    for device in &devices {
+        library
+            .remembered_devices
+            .insert(device.key.as_storage_key(), RememberedDevice::from(device));
+    }
+    let legacy_keys = library
+        .assignments
+        .keys()
+        .chain(library.bypassed_devices.iter())
+        .filter(|key| !library.remembered_devices.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    for storage_key in legacy_keys {
+        if let Some(remembered) = remembered_from_storage_key(&storage_key) {
+            library.remembered_devices.insert(storage_key, remembered);
+        }
+    }
+    devices.extend(
+        library
+            .remembered_devices
+            .iter()
+            .filter(|(key, _)| !connected_keys.contains(*key))
+            .map(|(storage_key, remembered)| DeviceInfo {
+                key: remembered.key.clone(),
+                node_name: remembered.node_name.clone(),
+                description: remembered.description.clone(),
+                channels: remembered.channels,
+                connected: false,
+                assigned_profile: library.assignments.get(storage_key).cloned(),
+                bypassed: library.bypassed_devices.contains(storage_key),
+            }),
+    );
+    devices.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then_with(|| a.description.cmp(&b.description))
+    });
     Ok(devices)
+}
+
+fn remembered_from_storage_key(storage_key: &str) -> Option<RememberedDevice> {
+    let mut parts = storage_key.splitn(3, '|');
+    let backend = parts.next()?.to_owned();
+    let stable_id = parts.next()?.to_owned();
+    let route = parts.next()?.to_owned();
+    if backend.is_empty() || stable_id.is_empty() || route.is_empty() {
+        return None;
+    }
+    let description = if backend == "bluez5" {
+        format!("Previously used Bluetooth output · {stable_id}")
+    } else {
+        format!("Previously used audio output · {stable_id}")
+    };
+    Some(RememberedDevice {
+        key: DeviceKey {
+            backend,
+            stable_id,
+            route,
+        },
+        node_name: String::new(),
+        description,
+        channels: 2,
+    })
 }
 
 fn string<'a>(props: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -150,5 +215,13 @@ mod tests {
         let text = "update: id:0 key:'clock.rate' value:'96000' type:''\nupdate: id:0 key:'clock.max-quantum' value:'4096' type:''";
         assert_eq!(metadata_number(text, "clock.rate"), Some(96_000));
         assert_eq!(metadata_number(text, "clock.max-quantum"), Some(4_096));
+    }
+
+    #[test]
+    fn preserves_legacy_bluetooth_assignment_as_a_remembered_output() {
+        let remembered = remembered_from_storage_key("bluez5|6C:12:70:4B:F7:C9|a2dp-sink").unwrap();
+        assert_eq!(remembered.key.backend, "bluez5");
+        assert_eq!(remembered.key.route, "a2dp-sink");
+        assert!(remembered.description.contains("Bluetooth"));
     }
 }

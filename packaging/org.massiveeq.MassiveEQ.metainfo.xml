@@ -2,18 +2,27 @@
 <component type="desktop-application">
   <id>org.massiveeq.MassiveEQ</id>
   <name>MassiveEQ</name>
-  <summary>Device-aware systemwide equalizer for PipeWire</summary>
+  <summary>Beta device-aware equalizer for PipeWire</summary>
   <metadata_license>MIT</metadata_license>
   <project_license>MIT</project_license>
   <developer id="org.massiveeq"><name>MassiveEQ contributors</name></developer>
   <url type="homepage">https://github.com/massiveadam/massiveeq</url>
   <description>
-    <p>MassiveEQ provides parametric, graphic, per-ear, and convolution equalization for Arch Linux playback devices.</p>
+    <p>MassiveEQ is beta software providing parametric, graphic, per-ear, and convolution equalization for Arch Linux playback devices.</p>
   </description>
   <launchable type="desktop-id">org.massiveeq.MassiveEQ.desktop</launchable>
   <provides><binary>massiveeq</binary></provides>
   <content_rating type="oars-1.1" />
   <releases>
-    <release version="0.2.2" date="2026-07-14" />
+    <release version="0.3.0-beta.1" date="2026-07-15" type="development">
+      <description>
+        <p>Beta 1 adds native real-time DSP, device assignments, level-matched profile comparisons, synchronized visual and text editing, convolution, and optional StatusNotifier controls.</p>
+      </description>
+    </release>
+    <release version="0.2.2" date="2026-07-14" type="development">
+      <description>
+        <p>Public beta tested on Arch Linux x86_64 with niri, PipeWire 1.6.8, WirePlumber 0.5.15, Bluetooth A2DP, and analog stereo output.</p>
+      </description>
+    </release>
   </releases>
 </component>

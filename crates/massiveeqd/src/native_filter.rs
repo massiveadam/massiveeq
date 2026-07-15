@@ -140,7 +140,7 @@ fn run_filter_pair(
     stats: Arc<NativeStats>,
     node_name: &str,
     sample_rate: u32,
-    _quantum: u32,
+    quantum: u32,
     latency_frames: u32,
     started: mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> Result<()> {
@@ -159,7 +159,13 @@ fn run_filter_pair(
             stable_hash(&device.key.as_storage_key())
         );
         let position = if channels == 1 { "MONO" } else { "FL,FR" };
-        let latency = format!("{latency_frames}/{sample_rate}");
+        // A zero-latency suggestion lets low-latency device drivers pull the
+        // complete graph at their minimum quantum. That is useful for live
+        // monitoring, but leaves needlessly little scheduling margin for a
+        // system-wide music processor. Keep the DSP's inherent latency while
+        // requesting at least the session quantum for stable playback.
+        let scheduling_latency_frames = scheduling_latency_frames(latency_frames, quantum);
+        let latency = format!("{scheduling_latency_frames}/{sample_rate}");
         let rate = format!("1/{sample_rate}");
         let channel_count = channels.to_string();
         let target = format!(r#"{{ "node.name": "{}" }}"#, device.node_name);
@@ -408,4 +414,28 @@ fn stable_hash(value: &str) -> u64 {
     value.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
         (hash ^ byte as u64).wrapping_mul(0x100000001b3)
     })
+}
+
+fn scheduling_latency_frames(dsp_latency_frames: u32, session_quantum: u32) -> u32 {
+    dsp_latency_frames.max(session_quantum.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scheduling_latency_frames;
+
+    #[test]
+    fn parametric_processing_requests_the_session_quantum() {
+        assert_eq!(scheduling_latency_frames(0, 1024), 1024);
+    }
+
+    #[test]
+    fn convolution_keeps_larger_inherent_latency() {
+        assert_eq!(scheduling_latency_frames(1536, 1024), 1536);
+    }
+
+    #[test]
+    fn scheduling_latency_is_never_zero() {
+        assert_eq!(scheduling_latency_frames(0, 0), 1);
+    }
 }

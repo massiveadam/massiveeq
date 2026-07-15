@@ -5,11 +5,13 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 use massiveeq_core::{
-    ChannelSelection, DeviceInfo, Filter, FilterKind, ProfileAnalysis, ProfileDocument,
-    ProfileInfo, analyze_profile_preview, parse_text, serialize_profile,
+    COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
+    MAX_COMPARISON_PROFILES, ProfileAnalysis, ProfileDocument, ProfileInfo,
+    analyze_profile_preview, parse_text, serialize_profile,
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
 };
 
@@ -19,6 +21,7 @@ struct Model {
     client: Client,
     profiles: RefCell<Vec<ProfileInfo>>,
     devices: RefCell<Vec<DeviceInfo>>,
+    comparisons: RefCell<HashMap<String, ComparisonSet>>,
     current_id: RefCell<Option<String>>,
     document: Rc<RefCell<Option<ProfileDocument>>>,
     analysis: Rc<RefCell<Option<ProfileAnalysis>>>,
@@ -27,6 +30,7 @@ struct Model {
     sample_rate: Cell<f64>,
     loading: Cell<bool>,
     syncing_device: Cell<bool>,
+    syncing_engine: Cell<bool>,
 }
 
 #[derive(Clone)]
@@ -40,6 +44,21 @@ struct ConvolutionUi {
     add_filter: gtk::Button,
     reset_filters: gtk::Button,
     syncing: Rc<Cell<bool>>,
+}
+
+struct ComparisonUi {
+    menu: gtk::MenuButton,
+    stack: gtk::Stack,
+    candidates: gtk::Box,
+    checks: Rc<RefCell<Vec<(String, gtk::ToggleButton)>>>,
+    listening: gtk::Box,
+    save: gtk::Button,
+    edit: gtk::Button,
+    delete: gtk::Button,
+    status: gtk::Label,
+    device_state: gtk::Label,
+    assign: gtk::Button,
+    bypass: gtk::Switch,
 }
 
 fn main() {
@@ -60,14 +79,42 @@ fn build_ui(app: &adw::Application) {
             return;
         }
     };
-    let engine_status = client.status().unwrap_or_default();
+    let profiles = match client.profiles() {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            show_startup_error(app, &format!("Could not load profiles: {error}"));
+            return;
+        }
+    };
+    let devices = match client.devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            show_startup_error(app, &format!("Could not load audio outputs: {error}"));
+            return;
+        }
+    };
+    let comparisons = match client.comparisons() {
+        Ok(comparisons) => comparisons,
+        Err(error) => {
+            show_startup_error(app, &format!("Could not load comparison banks: {error}"));
+            return;
+        }
+    };
+    let engine_status = match client.status() {
+        Ok(status) => status,
+        Err(error) => {
+            show_startup_error(app, &format!("Could not read audio engine status: {error}"));
+            return;
+        }
+    };
     let active_sample_rate = engine_status
         .pointer("/engine/active/0/sample_rate")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(48_000) as f64;
     let model = Rc::new(Model {
-        profiles: RefCell::new(client.profiles().unwrap_or_default()),
-        devices: RefCell::new(client.devices().unwrap_or_default()),
+        profiles: RefCell::new(profiles),
+        devices: RefCell::new(devices),
+        comparisons: RefCell::new(comparisons),
         client,
         current_id: RefCell::new(None),
         document: Rc::new(RefCell::new(None)),
@@ -77,6 +124,7 @@ fn build_ui(app: &adw::Application) {
         sample_rate: Cell::new(active_sample_rate),
         loading: Cell::new(false),
         syncing_device: Cell::new(false),
+        syncing_engine: Cell::new(false),
     });
 
     let window = adw::ApplicationWindow::builder()
@@ -139,20 +187,32 @@ fn build_ui(app: &adw::Application) {
     profile_menu.set_popover(Some(&profile_popover));
     profile_menu.add_css_class("profile-menu");
     header.pack_start(&profile_menu);
+    let header_add_profile = gtk::Button::with_label("+ NEW PROFILE");
+    header_add_profile.add_css_class("profile-add");
+    header_add_profile.set_tooltip_text(Some("Create and select a new profile"));
+    header.pack_start(&header_add_profile);
 
     let global_bypass = gtk::Switch::new();
     global_bypass.set_valign(gtk::Align::Center);
     global_bypass.set_active(
-        model
+        !model
             .client
             .status()
             .ok()
             .and_then(|value| value.get("global_bypass").and_then(|value| value.as_bool()))
             .unwrap_or(false),
     );
-    global_bypass.set_tooltip_text(Some("Bypass every MassiveEQ filter"));
+    global_bypass.set_tooltip_text(Some(
+        "Master DSP engine. Off is true dry audio at 0 dB with no EQ or level correction.",
+    ));
+    global_bypass.update_property(&[
+        gtk::accessible::Property::Label("Engine enabled"),
+        gtk::accessible::Property::Description(
+            "Master DSP switch. Turning it off removes EQ and all gain correction.",
+        ),
+    ]);
     header.pack_end(&global_bypass);
-    let global_bypass_label = gtk::Label::new(Some("ENGINE BYPASS"));
+    let global_bypass_label = gtk::Label::new(Some("ENGINE"));
     global_bypass_label.add_css_class("header-data");
     header.pack_end(&global_bypass_label);
     toolbar.add_top_bar(&header);
@@ -206,6 +266,11 @@ fn build_ui(app: &adw::Application) {
     );
     let device_drop = gtk::DropDown::new(Some(device_strings.clone()), gtk::Expression::NONE);
     device_drop.set_hexpand(true);
+    device_drop.set_size_request(1, -1);
+    device_drop.add_css_class("device-dropdown");
+    device_drop.set_factory(Some(&ellipsized_string_factory(32)));
+    device_drop.set_list_factory(Some(&ellipsized_string_factory(48)));
+    device_column.set_size_request(1, -1);
     device_column.append(&device_drop);
     let device_state = gtk::Label::new(Some("Not applied"));
     device_state.set_xalign(0.0);
@@ -229,13 +294,106 @@ fn build_ui(app: &adw::Application) {
             .devices
             .borrow()
             .first()
-            .is_some_and(|device| device.bypassed),
+            .is_some_and(|device| !device.bypassed),
     );
+    device_bypass.set_tooltip_text(Some(
+        "Turn filters on or off. Off retains the active profile's perceived gain correction for fair listening comparisons.",
+    ));
+    device_bypass.update_property(&[
+        gtk::accessible::Property::Label("Filters enabled for selected output"),
+        gtk::accessible::Property::Description(
+            "Turning filters off retains level matching for a fair comparison.",
+        ),
+    ]);
     let bypass_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bypass_row.set_halign(gtk::Align::Center);
-    bypass_row.append(&gtk::Label::new(Some("Bypass output")));
+    bypass_row.append(&gtk::Label::new(Some("FILTERS")));
     bypass_row.append(&device_bypass);
     device_actions.append(&bypass_row);
+    let comparison_popover = gtk::Popover::new();
+    let comparison_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    comparison_box.set_margin_top(14);
+    comparison_box.set_margin_bottom(14);
+    comparison_box.set_margin_start(14);
+    comparison_box.set_margin_end(14);
+    comparison_box.set_size_request(310, 390);
+    let comparison_title = gtk::Label::new(Some("PROFILE COMPARISON"));
+    comparison_title.set_xalign(0.0);
+    comparison_title.add_css_class("panel-title");
+    comparison_box.append(&comparison_title);
+
+    let comparison_stack = gtk::Stack::new();
+    comparison_stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
+    comparison_stack.set_transition_duration(160);
+    comparison_stack.set_vexpand(true);
+
+    let comparison_setup = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let comparison_help = gtk::Label::new(Some("Choose 2–9 profiles to compare."));
+    comparison_help.set_xalign(0.0);
+    comparison_help.add_css_class("level-code");
+    comparison_setup.append(&comparison_help);
+    let comparison_candidates = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let comparison_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&comparison_candidates)
+        .build();
+    comparison_setup.append(&comparison_scroll);
+    let comparison_save = gtk::Button::with_label("START COMPARISON");
+    comparison_save.add_css_class("suggested-action");
+    comparison_setup.append(&comparison_save);
+    comparison_stack.add_named(&comparison_setup, Some("setup"));
+
+    let comparison_listen = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let listening_help = gtk::Label::new(Some("Tap a profile to hear it immediately."));
+    listening_help.set_xalign(0.0);
+    listening_help.add_css_class("level-code");
+    comparison_listen.append(&listening_help);
+    let comparison_listening_buttons = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    let comparison_listening_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&comparison_listening_buttons)
+        .build();
+    comparison_listen.append(&comparison_listening_scroll);
+    let comparison_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    comparison_actions.set_homogeneous(true);
+    let comparison_edit = gtk::Button::with_label("EDIT SET");
+    let comparison_delete = gtk::Button::with_label("END COMPARE");
+    comparison_actions.append(&comparison_edit);
+    comparison_actions.append(&comparison_delete);
+    comparison_listen.append(&comparison_actions);
+    comparison_stack.add_named(&comparison_listen, Some("listen"));
+    comparison_box.append(&comparison_stack);
+
+    let comparison_status = gtk::Label::new(Some("No comparison bank"));
+    comparison_status.set_xalign(0.0);
+    comparison_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    comparison_status.add_css_class("level-code");
+    comparison_box.append(&comparison_status);
+    comparison_popover.set_child(Some(&comparison_box));
+    let comparison_menu = gtk::MenuButton::new();
+    comparison_menu.set_label("COMPARE");
+    comparison_menu.set_popover(Some(&comparison_popover));
+    comparison_menu.add_css_class("comparison-menu");
+    comparison_menu.set_tooltip_text(Some(
+        "Compare profiles at a shared BS.1770 K-weighted pink-noise level",
+    ));
+    let comparison_ui = Rc::new(ComparisonUi {
+        menu: comparison_menu,
+        stack: comparison_stack,
+        candidates: comparison_candidates,
+        checks: Rc::new(RefCell::new(Vec::new())),
+        listening: comparison_listening_buttons,
+        save: comparison_save,
+        edit: comparison_edit,
+        delete: comparison_delete,
+        status: comparison_status,
+        device_state: device_state.clone(),
+        assign: assign_button.clone(),
+        bypass: device_bypass.clone(),
+    });
+    device_actions.append(&comparison_ui.menu);
     device_actions.append(&assign_button);
     controls_card.append(&device_actions);
     dashboard.append(&controls_card);
@@ -259,8 +417,13 @@ fn build_ui(app: &adw::Application) {
         model.document.clone(),
         model.selected_filter.clone(),
     );
-    graph_card.append(&graph);
-    let analysis_label = gtk::Label::new(Some("Select a profile"));
+    graph.update_property(&[
+        gtk::accessible::Property::Label("Frequency response graph"),
+        gtk::accessible::Property::Description(
+            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Use the filter controls below for keyboard editing.",
+        ),
+    ]);
+    let analysis_label = gtk::Label::new(Some("AUTO PREAMP —"));
     analysis_label.set_xalign(0.0);
     analysis_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     analysis_label.add_css_class("level-code");
@@ -271,7 +434,10 @@ fn build_ui(app: &adw::Application) {
     let trim = gtk::SpinButton::with_range(-24.0, 24.0, 0.1);
     trim.set_digits(1);
     trim.set_width_chars(5);
-    let trim_label = gtk::Label::new(Some("TRIM"));
+    trim.set_tooltip_text(Some(
+        "Fine-tune the perceptually matched preamp; safety attenuation still prevents clipping",
+    ));
+    let trim_label = gtk::Label::new(Some("ADJUST"));
     trim_label.add_css_class("section-label");
     let trim_unit = gtk::Label::new(Some("dB"));
     trim_unit.add_css_class("level-code");
@@ -282,6 +448,7 @@ fn build_ui(app: &adw::Application) {
     trim_controls.append(&trim_unit);
     level_row.append(&trim_controls);
     graph_card.append(&level_row);
+    graph_card.append(&graph);
     dashboard.append(&graph_card);
     content.append(&dashboard);
 
@@ -306,12 +473,17 @@ fn build_ui(app: &adw::Application) {
         "min-children-per-line",
         Some(&1_u32.to_value()),
     );
-    narrow_filters.add_setter(
+    let narrow_route = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        1040.0,
+        adw::LengthUnit::Px,
+    ));
+    narrow_route.add_setter(
         &controls_card,
         "orientation",
         Some(&gtk::Orientation::Vertical.to_value()),
     );
-    narrow_filters.add_setter(
+    narrow_route.add_setter(
         &route_rule,
         "orientation",
         Some(&gtk::Orientation::Horizontal.to_value()),
@@ -338,7 +510,9 @@ fn build_ui(app: &adw::Application) {
     );
     narrow_filters.add_setter(&title, "visible", Some(&false.to_value()));
     narrow_filters.add_setter(&global_bypass_label, "visible", Some(&false.to_value()));
-    view_stack.add_titled(&filter_list, Some("filters"), "Parametric");
+    let parametric_stack = gtk::Stack::new();
+    parametric_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    parametric_stack.add_named(&filter_list, Some("visual"));
     view_stack.set_valign(gtk::Align::Start);
 
     let convolution_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -391,26 +565,96 @@ fn build_ui(app: &adw::Application) {
     let text_view = gtk::TextView::new();
     text_view.set_monospace(true);
     text_view.set_wrap_mode(gtk::WrapMode::None);
-    let switcher = adw::ViewSwitcher::new();
-    switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
-    switcher.set_stack(Some(&view_stack));
+    text_view.buffer().set_enable_undo(true);
+    let text_scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(420)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&text_view)
+        .build();
+    text_scroll.add_css_class("code-editor");
+    parametric_stack.add_named(&text_scroll, Some("text"));
+    view_stack.add_titled(&parametric_stack, Some("filters"), "Parametric");
+    let switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     switcher.set_halign(gtk::Align::Center);
     switcher.add_css_class("mode-switcher");
+    let parametric_mode = gtk::ToggleButton::with_label("PARAMETRIC");
+    parametric_mode.set_active(true);
+    let convolution_mode = gtk::ToggleButton::with_label("CONVOLUTION");
+    convolution_mode.set_group(Some(&parametric_mode));
+    parametric_mode.connect_clicked({
+        let stack = view_stack.clone();
+        move |button| {
+            button.set_active(true);
+            stack.set_visible_child_name("filters");
+        }
+    });
+    convolution_mode.connect_clicked({
+        let stack = view_stack.clone();
+        move |button| {
+            button.set_active(true);
+            stack.set_visible_child_name("convolution");
+        }
+    });
+    view_stack.connect_visible_child_name_notify({
+        let parametric_mode = parametric_mode.clone();
+        let convolution_mode = convolution_mode.clone();
+        move |stack| {
+            let convolution = stack.visible_child_name().as_deref() == Some("convolution");
+            parametric_mode.set_active(!convolution);
+            convolution_mode.set_active(convolution);
+        }
+    });
+    switcher.append(&parametric_mode);
+    switcher.append(&convolution_mode);
+    let editor_switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    editor_switcher.add_css_class("editor-switcher");
+    let visual_mode = gtk::ToggleButton::with_label("VISUAL");
+    visual_mode.set_active(true);
+    let text_mode = gtk::ToggleButton::with_label("TEXT");
+    text_mode.set_group(Some(&visual_mode));
+    visual_mode.connect_clicked({
+        let stack = parametric_stack.clone();
+        move |button| {
+            button.set_active(true);
+            stack.set_visible_child_name("visual");
+        }
+    });
+    text_mode.connect_clicked({
+        let stack = parametric_stack.clone();
+        move |button| {
+            button.set_active(true);
+            stack.set_visible_child_name("text");
+        }
+    });
+    parametric_stack.connect_visible_child_name_notify({
+        let visual_mode = visual_mode.clone();
+        let text_mode = text_mode.clone();
+        move |stack| {
+            let text = stack.visible_child_name().as_deref() == Some("text");
+            visual_mode.set_active(!text);
+            text_mode.set_active(text);
+        }
+    });
+    editor_switcher.append(&visual_mode);
+    editor_switcher.append(&text_mode);
     let reset_filters_button = gtk::Button::with_label("RESET FILTERS");
     reset_filters_button.add_css_class("reset-filters");
     reset_filters_button.set_tooltip_text(Some(
         "Flatten every parametric band to 0 dB without changing its frequency or Q",
     ));
-    let filter_toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    switcher.set_hexpand(true);
-    filter_toolbar.append(&switcher);
-    filter_toolbar.append(&reset_filters_button);
+    let filter_toolbar = gtk::CenterBox::new();
+    filter_toolbar.set_hexpand(true);
+    filter_toolbar.set_start_widget(Some(&editor_switcher));
+    filter_toolbar.set_center_widget(Some(&switcher));
+    filter_toolbar.set_end_widget(Some(&reset_filters_button));
     narrow_filters.add_setter(
         &filter_toolbar,
         "orientation",
         Some(&gtk::Orientation::Vertical.to_value()),
     );
     window.add_breakpoint(narrow_filters);
+    window.add_breakpoint(narrow_route);
     let add_filter_button = gtk::Button::with_label("＋  ADD PARAMETRIC BAND");
     add_filter_button.add_css_class("band-add");
     add_filter_button.set_hexpand(true);
@@ -428,10 +672,28 @@ fn build_ui(app: &adw::Application) {
     view_stack.connect_visible_child_name_notify({
         let add_filter = add_filter_button.clone();
         let reset_filters = reset_filters_button.clone();
+        let editor_switcher = editor_switcher.clone();
+        let parametric_stack = parametric_stack.clone();
         move |stack| {
             let parametric = stack.visible_child_name().as_deref() == Some("filters");
-            add_filter.set_visible(parametric);
-            reset_filters.set_visible(parametric);
+            let visual = parametric_stack.visible_child_name().as_deref() == Some("visual");
+            editor_switcher.set_visible(parametric);
+            add_filter.set_visible(parametric && visual);
+            reset_filters.set_visible(true);
+            reset_filters.set_sensitive(parametric && visual);
+            reset_filters.set_opacity(if parametric && visual { 1.0 } else { 0.0 });
+        }
+    });
+    parametric_stack.connect_visible_child_name_notify({
+        let view_stack = view_stack.clone();
+        let add_filter = add_filter_button.clone();
+        let reset_filters = reset_filters_button.clone();
+        move |stack| {
+            let parametric = view_stack.visible_child_name().as_deref() == Some("filters");
+            let visual = stack.visible_child_name().as_deref() == Some("visual");
+            add_filter.set_visible(parametric && visual);
+            reset_filters.set_sensitive(parametric && visual);
+            reset_filters.set_opacity(if parametric && visual { 1.0 } else { 0.0 });
         }
     });
     content.append(&filter_toolbar);
@@ -473,6 +735,7 @@ fn build_ui(app: &adw::Application) {
         &device_drop,
         &device_state,
         &add_button,
+        &header_add_profile,
         &add_filter_button,
         &reset_filters_button,
         &convolution_ui,
@@ -483,6 +746,7 @@ fn build_ui(app: &adw::Application) {
         &assign_button,
         &device_bypass,
         &global_bypass,
+        &comparison_ui,
         &trim,
     );
     gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), {
@@ -492,29 +756,69 @@ fn build_ui(app: &adw::Application) {
         let state = device_state.clone();
         let assign = assign_button.clone();
         let bypass = device_bypass.clone();
+        let engine = global_bypass.clone();
+        let engine_readout = graph_hint.clone();
+        let comparison_ui = comparison_ui.clone();
         move || {
             if let Ok(devices) = model.client.devices() {
-                let selected_key = model
-                    .devices
-                    .borrow()
-                    .get(drop.selected() as usize)
-                    .map(|device| device.key.as_storage_key());
-                let names = devices
+                let (selected_key, old_identity) = {
+                    let current = model.devices.borrow();
+                    (
+                        current
+                            .get(drop.selected() as usize)
+                            .map(|device| device.key.as_storage_key()),
+                        current
+                            .iter()
+                            .map(|device| (device.key.as_storage_key(), device.description.clone()))
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let new_identity = devices
                     .iter()
-                    .map(|device| device.description.as_str())
+                    .map(|device| (device.key.as_storage_key(), device.description.clone()))
                     .collect::<Vec<_>>();
-                strings.splice(0, strings.n_items(), &names);
+                let list_changed = old_identity != new_identity;
                 *model.devices.borrow_mut() = devices;
-                if let Some(key) = selected_key
-                    && let Some(index) = model
-                        .devices
-                        .borrow()
+                if list_changed {
+                    let names = new_identity
                         .iter()
-                        .position(|device| device.key.as_storage_key() == key)
-                {
-                    drop.set_selected(index as u32);
+                        .map(|(_, description)| description.as_str())
+                        .collect::<Vec<_>>();
+                    strings.splice(0, strings.n_items(), &names);
+                    if let Some(key) = selected_key
+                        && let Some(index) = model
+                            .devices
+                            .borrow()
+                            .iter()
+                            .position(|device| device.key.as_storage_key() == key)
+                    {
+                        drop.set_selected(index as u32);
+                    }
                 }
                 update_device_controls(&model, &drop, &state, &assign, &bypass);
+                if let Ok(comparisons) = model.client.comparisons() {
+                    *model.comparisons.borrow_mut() = comparisons;
+                }
+                // The candidate rows are an unsaved draft while this popover
+                // is open. Rebuilding them on the health poll loses clicks
+                // and can destroy the widget currently handling input.
+                if !comparison_ui.menu.is_active() {
+                    refresh_comparison_ui(&model, &drop, &comparison_ui);
+                }
+            }
+            if let Ok(service_status) = model.client.status()
+                && let Some(engine_off) = service_status
+                    .get("global_bypass")
+                    .and_then(serde_json::Value::as_bool)
+            {
+                engine_readout.set_text(&engine_summary(&service_status));
+                engine.set_sensitive(true);
+                model.syncing_engine.set(true);
+                engine.set_active(!engine_off);
+                model.syncing_engine.set(false);
+            } else {
+                engine_readout.set_text("AUDIO SERVICE UNAVAILABLE");
+                engine.set_sensitive(false);
             }
             gtk::glib::ControlFlow::Continue
         }
@@ -529,6 +833,15 @@ fn build_ui(app: &adw::Application) {
         &assign_button,
         &device_bypass,
     );
+    refresh_comparison_ui(&model, &device_drop, &comparison_ui);
+    install_comparison_shortcuts(
+        &window,
+        &model,
+        &device_drop,
+        &device_bypass,
+        &comparison_ui,
+    );
+    install_editor_shortcut(&window, &view_stack, &parametric_stack);
     window.present();
 }
 
@@ -548,6 +861,7 @@ fn wire_actions(
     device_drop: &gtk::DropDown,
     device_state: &gtk::Label,
     add: &gtk::Button,
+    header_add_profile: &gtk::Button,
     add_filter: &gtk::Button,
     reset_filters: &gtk::Button,
     convolution_ui: &ConvolutionUi,
@@ -558,6 +872,7 @@ fn wire_actions(
     assign: &gtk::Button,
     device_bypass: &gtk::Switch,
     global_bypass: &gtk::Switch,
+    comparison_ui: &Rc<ComparisonUi>,
     trim: &gtk::SpinButton,
 ) {
     let buffer = text_view.buffer();
@@ -773,20 +1088,23 @@ fn wire_actions(
             update_device_controls(&model, &device_drop, &device_state, &assign, &device_bypass);
         }
     };
-    profile_list.connect_row_selected({
-        let profile_popover = profile_popover.clone();
-        move |_, row| {
-            if let Some(row) = row {
-                reload(row.index() as usize);
-                profile_popover.popdown();
-            }
+    profile_list.connect_row_selected(move |_, row| {
+        if let Some(row) = row {
+            reload(row.index() as usize);
         }
+    });
+    profile_list.connect_row_activated({
+        let profile_popover = profile_popover.clone();
+        move |_, _| profile_popover.popdown()
     });
 
     let pending_save: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
     buffer.connect_changed({
         let model = model.clone();
         let buffer = buffer.clone();
+        let text_view = text_view.clone();
+        let filter_list = filter_list.clone();
+        let convolution_ui = convolution_ui.clone();
         let name = name_entry.clone();
         let status = status.clone();
         let graph = graph.clone();
@@ -803,6 +1121,9 @@ fn wire_actions(
             }
             let model = model.clone();
             let buffer = buffer.clone();
+            let text_view = text_view.clone();
+            let filter_list = filter_list.clone();
+            let convolution_ui = convolution_ui.clone();
             let name = name.clone();
             let status = status.clone();
             let graph = graph.clone();
@@ -815,7 +1136,13 @@ fn wire_actions(
                     let text = buffer
                         .text(&buffer.start_iter(), &buffer.end_iter(), false)
                         .to_string();
-                    save_current(
+                    let draft = parse_text(name.text(), &text);
+                    if draft.is_activatable() {
+                        text_view.remove_css_class("invalid-draft");
+                    } else {
+                        text_view.add_css_class("invalid-draft");
+                    }
+                    let saved = save_current(
                         &model,
                         &name.text(),
                         &text,
@@ -823,6 +1150,10 @@ fn wire_actions(
                         &graph,
                         &analysis_label,
                     );
+                    if saved {
+                        rebuild_filter_list(&filter_list, &draft, &model, &buffer, &graph);
+                        update_convolution_ui(&convolution_ui, &draft);
+                    }
                 },
             ));
         }
@@ -871,27 +1202,44 @@ fn wire_actions(
         }
     });
 
-    add.connect_clicked({
-        let model = model.clone();
-        let list = profile_list.clone();
-        move |_| {
-            if model.client.create("Untitled Profile").is_ok() {
-                refresh_profiles(&model, &list);
-                if let Some(row) = list.row_at_index((model.profiles.borrow().len() - 1) as i32) {
-                    list.select_row(Some(&row));
+    for button in [add, header_add_profile] {
+        button.connect_clicked({
+            let model = model.clone();
+            let list = profile_list.clone();
+            let status = status.clone();
+            move |_| match model.client.create("Untitled Profile") {
+                Ok(created) => {
+                    refresh_profiles(&model, &list);
+                    let index = model
+                        .profiles
+                        .borrow()
+                        .iter()
+                        .position(|profile| profile.id == created.id);
+                    if let Some(row) = index.and_then(|index| list.row_at_index(index as i32)) {
+                        list.select_row(Some(&row));
+                    }
+                    status.set_text("New profile created");
                 }
+                Err(error) => status.set_text(&error.to_string()),
             }
-        }
-    });
+        });
+    }
     delete.connect_clicked({
         let model = model.clone();
         let list = profile_list.clone();
+        let status = status.clone();
         move |_| {
-            if let Some(id) = model.current_id.borrow().clone() {
-                let _ = model.client.delete(&id);
-                refresh_profiles(&model, &list);
-                if let Some(row) = list.row_at_index(0) {
-                    list.select_row(Some(&row));
+            let current_id = model.current_id.borrow().clone();
+            if let Some(id) = current_id {
+                match model.client.delete(&id) {
+                    Ok(()) => {
+                        refresh_profiles(&model, &list);
+                        if let Some(row) = list.row_at_index(0) {
+                            list.select_row(Some(&row));
+                        }
+                        status.set_text("Profile deleted");
+                    }
+                    Err(error) => status.set_text(&error.to_string()),
                 }
             }
         }
@@ -900,6 +1248,7 @@ fn wire_actions(
         let model = model.clone();
         let list = profile_list.clone();
         let window = window.clone();
+        let status = status.clone();
         move |_| {
             let filter = gtk::FileFilter::new();
             filter.set_name(Some("Equalizer text profiles"));
@@ -911,12 +1260,28 @@ fn wire_actions(
                 .build();
             let model = model.clone();
             let list = list.clone();
+            let status = status.clone();
             chooser.open(Some(&window), gtk::gio::Cancellable::NONE, move |result| {
                 if let Ok(file) = result
                     && let Some(path) = file.path()
                 {
-                    let _ = model.client.import(&path.display().to_string());
-                    refresh_profiles(&model, &list);
+                    match model.client.import(&path.display().to_string()) {
+                        Ok(imported) => {
+                            refresh_profiles(&model, &list);
+                            let index = model
+                                .profiles
+                                .borrow()
+                                .iter()
+                                .position(|profile| profile.id == imported.id);
+                            if let Some(index) = index
+                                && let Some(row) = list.row_at_index(index as i32)
+                            {
+                                list.select_row(Some(&row));
+                            }
+                            status.set_text("Profile imported");
+                        }
+                        Err(error) => status.set_text(&error.to_string()),
+                    }
                 }
             });
         }
@@ -924,6 +1289,7 @@ fn wire_actions(
     duplicate.connect_clicked({
         let model = model.clone();
         let list = profile_list.clone();
+        let status = status.clone();
         move |_| {
             let Some(id) = model.current_id.borrow().clone() else {
                 return;
@@ -937,20 +1303,40 @@ fn wire_actions(
             else {
                 return;
             };
-            if let Ok(created) = model.client.create(&format!("{} Copy", source.name)) {
-                let _ = model.client.put(
+            match model.client.create(&format!("{} Copy", source.name)) {
+                Ok(created) => match model.client.put(
                     &created.id,
                     &created.name,
                     &source.text,
                     source.manual_trim_db,
-                );
-                refresh_profiles(&model, &list);
+                ) {
+                    Ok(_) => {
+                        refresh_profiles(&model, &list);
+                        let index = model
+                            .profiles
+                            .borrow()
+                            .iter()
+                            .position(|profile| profile.id == created.id);
+                        if let Some(index) = index
+                            && let Some(row) = list.row_at_index(index as i32)
+                        {
+                            list.select_row(Some(&row));
+                        }
+                        status.set_text("Profile duplicated");
+                    }
+                    Err(error) => {
+                        let _ = model.client.delete(&created.id);
+                        status.set_text(&error.to_string());
+                    }
+                },
+                Err(error) => status.set_text(&error.to_string()),
             }
         }
     });
     export.connect_clicked({
         let model = model.clone();
         let window = window.clone();
+        let status = status.clone();
         move |_| {
             let Some(id) = model.current_id.borrow().clone() else {
                 return;
@@ -970,13 +1356,18 @@ fn wire_actions(
                 .initial_name(format!("{}.txt", profile.name.replace('/', "-")))
                 .build();
             let model = model.clone();
+            let status = status.clone();
             dialog.save(Some(&window), gtk::gio::Cancellable::NONE, move |result| {
                 if let Ok(file) = result
                     && let Some(path) = file.path()
                 {
-                    let _ = model
+                    match model
                         .client
-                        .export(&profile.id, &path.display().to_string());
+                        .export(&profile.id, &path.display().to_string())
+                    {
+                        Ok(()) => status.set_text("Profile exported"),
+                        Err(error) => status.set_text(&error.to_string()),
+                    }
                 }
             });
         }
@@ -988,20 +1379,46 @@ fn wire_actions(
         let state = device_state.clone();
         let assign = assign.clone();
         let bypass = device_bypass.clone();
+        let comparison_ui = comparison_ui.clone();
         move |_| {
             let index = drop.selected() as usize;
             let Some(device) = model.devices.borrow().get(index).cloned() else {
                 return;
             };
-            let Some(profile) = model.current_id.borrow().clone() else {
+            let Some(selected_profile) = model.current_id.borrow().clone() else {
                 return;
             };
-            match model.client.assign(&device.key.as_storage_key(), &profile) {
+            let storage_key = device.key.as_storage_key();
+            let engine_has_error = model.client.status().ok().is_some_and(|status| {
+                status
+                    .pointer("/engine/errors")
+                    .and_then(|errors| errors.get(&storage_key))
+                    .is_some()
+            });
+            let comparison_active = model
+                .comparisons
+                .borrow()
+                .get(&storage_key)
+                .is_some_and(|comparison| comparison.enabled);
+            let unassigning = !engine_has_error
+                && !comparison_active
+                && device.assigned_profile.as_deref() == Some(&selected_profile);
+            let profile = if unassigning { "" } else { &selected_profile };
+            match model.client.assign(&storage_key, profile) {
                 Ok(()) => {
-                    status.set_text(&format!("Active on {}", device.description));
+                    let message = if unassigning {
+                        format!("{} is now unassigned", device.description)
+                    } else {
+                        format!("Active on {}", device.description)
+                    };
+                    status.set_text(&message);
                     if let Ok(devices) = model.client.devices() {
                         *model.devices.borrow_mut() = devices;
                     }
+                    if let Ok(comparisons) = model.client.comparisons() {
+                        *model.comparisons.borrow_mut() = comparisons;
+                    }
+                    refresh_comparison_ui(&model, &drop, &comparison_ui);
                     update_device_controls(&model, &drop, &state, &assign, &bypass);
                 }
                 Err(error) => status.set_text(&error.to_string()),
@@ -1013,8 +1430,101 @@ fn wire_actions(
         let state = device_state.clone();
         let assign = assign.clone();
         let bypass = device_bypass.clone();
+        let comparison_ui = comparison_ui.clone();
         move |drop| {
             update_device_controls(&model, drop, &state, &assign, &bypass);
+            refresh_comparison_ui(&model, drop, &comparison_ui);
+        }
+    });
+    comparison_ui.menu.connect_active_notify({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let ui = comparison_ui.clone();
+        move |menu| {
+            if menu.is_active() {
+                if let Ok(comparisons) = model.client.comparisons() {
+                    *model.comparisons.borrow_mut() = comparisons;
+                }
+                refresh_comparison_ui(&model, &drop, &ui);
+            }
+        }
+    });
+    comparison_ui.edit.connect_clicked({
+        let ui = comparison_ui.clone();
+        move |_| {
+            ui.stack.set_visible_child_name("setup");
+            ui.status.set_text("Choose the profiles in this comparison");
+        }
+    });
+    comparison_ui.save.connect_clicked({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let ui = comparison_ui.clone();
+        let state = device_state.clone();
+        let assign = assign.clone();
+        let bypass = device_bypass.clone();
+        move |_| {
+            let Some(device) = model
+                .devices
+                .borrow()
+                .get(drop.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            let selected = ui
+                .checks
+                .borrow()
+                .iter()
+                .filter(|(_, check)| check.is_active())
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            match model
+                .client
+                .configure_comparison(&device.key.as_storage_key(), &selected)
+            {
+                Ok(comparison) => {
+                    model
+                        .comparisons
+                        .borrow_mut()
+                        .insert(device.key.as_storage_key(), comparison);
+                    if let Ok(devices) = model.client.devices() {
+                        *model.devices.borrow_mut() = devices;
+                    }
+                    refresh_comparison_ui(&model, &drop, &ui);
+                    update_device_controls(&model, &drop, &state, &assign, &bypass);
+                }
+                Err(error) => ui.status.set_text(&error.to_string()),
+            }
+        }
+    });
+    comparison_ui.delete.connect_clicked({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let ui = comparison_ui.clone();
+        let state = device_state.clone();
+        let assign = assign.clone();
+        let bypass = device_bypass.clone();
+        move |_| {
+            let Some(device) = model
+                .devices
+                .borrow()
+                .get(drop.selected() as usize)
+                .cloned()
+            else {
+                return;
+            };
+            match model.client.delete_comparison(&device.key.as_storage_key()) {
+                Ok(()) => {
+                    model
+                        .comparisons
+                        .borrow_mut()
+                        .remove(&device.key.as_storage_key());
+                    refresh_comparison_ui(&model, &drop, &ui);
+                    update_device_controls(&model, &drop, &state, &assign, &bypass);
+                }
+                Err(error) => ui.status.set_text(&error.to_string()),
+            }
         }
     });
     device_bypass.connect_active_notify({
@@ -1022,16 +1532,26 @@ fn wire_actions(
         let drop = device_drop.clone();
         let state = device_state.clone();
         let assign = assign.clone();
+        let status = status.clone();
         move |switch| {
             if model.syncing_device.get() {
                 return;
             }
-            if let Some(device) = model.devices.borrow().get(drop.selected() as usize) {
-                let _ = model
+            let device = {
+                let devices = model.devices.borrow();
+                devices.get(drop.selected() as usize).cloned()
+            };
+            if let Some(device) = device {
+                match model
                     .client
-                    .set_device_bypass(&device.key.as_storage_key(), switch.is_active());
-                if let Ok(devices) = model.client.devices() {
-                    *model.devices.borrow_mut() = devices;
+                    .set_device_bypass(&device.key.as_storage_key(), !switch.is_active())
+                {
+                    Ok(()) => {
+                        if let Ok(devices) = model.client.devices() {
+                            *model.devices.borrow_mut() = devices;
+                        }
+                    }
+                    Err(error) => status.set_text(&error.to_string()),
                 }
                 update_device_controls(&model, &drop, &state, &assign, switch);
             }
@@ -1039,8 +1559,17 @@ fn wire_actions(
     });
     global_bypass.connect_active_notify({
         let model = model.clone();
+        let status = status.clone();
         move |switch| {
-            let _ = model.client.set_global_bypass(switch.is_active());
+            if model.syncing_engine.get() {
+                return;
+            }
+            if let Err(error) = model.client.set_global_bypass(!switch.is_active()) {
+                status.set_text(&error.to_string());
+                model.syncing_engine.set(true);
+                switch.set_active(!switch.is_active());
+                model.syncing_engine.set(false);
+            }
         }
     });
     trim.connect_value_changed({
@@ -1079,11 +1608,6 @@ fn wire_actions(
             let Some(document) = model.document.borrow().as_ref().cloned() else {
                 return;
             };
-            let effective_gain = model
-                .analysis
-                .borrow()
-                .as_ref()
-                .map_or(0.0, |analysis| analysis.effective_gain_db);
             let width = graph.width().max(1) as f64;
             let height = graph.height().max(1) as f64;
             let closest = document
@@ -1092,32 +1616,17 @@ fn wire_actions(
                 .enumerate()
                 .filter(|(_, filter)| filter.enabled)
                 .min_by(|(_, a), (_, b)| {
-                    let (ax, ay) = graph::filter_point_position(
-                        a.frequency,
-                        a.gain_db,
-                        effective_gain,
-                        width,
-                        height,
-                    );
-                    let (bx, by) = graph::filter_point_position(
-                        b.frequency,
-                        b.gain_db,
-                        effective_gain,
-                        width,
-                        height,
-                    );
+                    let (ax, ay) =
+                        graph::filter_point_position(a.frequency, a.gain_db, width, height);
+                    let (bx, by) =
+                        graph::filter_point_position(b.frequency, b.gain_db, width, height);
                     let da = ((ax - x).powi(2) + (ay - y).powi(2)).sqrt();
                     let db = ((bx - x).powi(2) + (by - y).powi(2)).sqrt();
                     da.total_cmp(&db)
                 });
             if let Some((index, filter)) = closest {
-                let (point_x, point_y) = graph::filter_point_position(
-                    filter.frequency,
-                    filter.gain_db,
-                    effective_gain,
-                    width,
-                    height,
-                );
+                let (point_x, point_y) =
+                    graph::filter_point_position(filter.frequency, filter.gain_db, width, height);
                 if ((point_x - x).powi(2) + (point_y - y).powi(2)).sqrt() <= 34.0 {
                     *state.borrow_mut() = Some((index, filter.frequency, filter.gain_db));
                     model.selected_filter.set(Some(index));
@@ -1130,6 +1639,7 @@ fn wire_actions(
         let model = model.clone();
         let state = drag_state.clone();
         let graph = graph.clone();
+        let analysis_label = analysis_label.clone();
         move |_, dx, dy| {
             let Some((index, start_frequency, start_gain)) = *state.borrow() else {
                 return;
@@ -1148,9 +1658,10 @@ fn wire_actions(
                 };
                 filter.frequency =
                     (start_frequency * (1000.0_f64).powf(dx / width)).clamp(20.0, 20_000.0);
-                filter.gain_db = (start_gain - dy / height * 36.0).clamp(-24.0, 24.0);
+                filter.gain_db = graph::gain_after_drag(start_gain, dy, height);
                 analyze_profile_preview(document, model.sample_rate.get(), model.manual_trim.get())
             };
+            set_analysis_label(&analysis_label, &preview);
             *model.analysis.borrow_mut() = Some(preview);
             graph.queue_draw();
         }
@@ -1239,7 +1750,10 @@ fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
     }
     let parametric = profile.convolutions.is_empty();
     ui.add_filter.set_visible(parametric);
-    ui.reset_filters.set_visible(parametric);
+    ui.reset_filters.set_visible(true);
+    ui.reset_filters.set_sensitive(parametric);
+    ui.reset_filters
+        .set_opacity(if parametric { 1.0 } else { 0.0 });
     ui.syncing.set(false);
 }
 
@@ -1251,16 +1765,6 @@ fn rebuild_filter_list(
     graph: &gtk::DrawingArea,
 ) {
     list.remove_all();
-    if profile.filters.is_empty() {
-        let empty = adw::StatusPage::builder()
-            .title("No parametric filters")
-            .description("Add a band or import an Equalizer APO profile")
-            .icon_name("audio-speakers-symbolic")
-            .build();
-        empty.set_vexpand(false);
-        empty.set_size_request(-1, 180);
-        list.insert(&empty, -1);
-    }
 
     let mut filter_button_group: Option<gtk::ToggleButton> = None;
     for (index, filter) in profile.filters.iter().enumerate() {
@@ -1287,6 +1791,10 @@ fn rebuild_filter_list(
         enabled.set_active(filter.enabled);
         enabled.set_valign(gtk::Align::Center);
         enabled.add_css_class("filter-switch");
+        enabled.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Enable filter at {}",
+            format_band_frequency(filter.frequency)
+        ))]);
 
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
@@ -1596,6 +2104,36 @@ fn update_filter(
     buffer.set_text(&text);
 }
 
+fn ellipsized_string_factory(max_chars: i32) -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(move |_, object| {
+        let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let label = gtk::Label::new(None);
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_width_chars(1);
+        label.set_max_width_chars(max_chars);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_, object| {
+        let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(label) = item.child().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        let Some(value) = item.item().and_downcast::<gtk::StringObject>() else {
+            return;
+        };
+        label.set_text(&value.string());
+        label.set_tooltip_text(Some(&value.string()));
+    });
+    factory
+}
+
 fn spin_field(label: &str, unit: &str, spin: &gtk::SpinButton) -> gtk::Box {
     let field = gtk::Box::new(gtk::Orientation::Vertical, 5);
     field.set_hexpand(true);
@@ -1617,6 +2155,331 @@ fn format_band_frequency(frequency: f64) -> String {
     }
 }
 
+fn comparison_candidate_name(model: &Model, profile_id: &str) -> String {
+    if profile_id == COMPARISON_BYPASS_ID {
+        return "OFF · LEVEL MATCHED".into();
+    }
+    model
+        .profiles
+        .borrow()
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .map(|profile| profile.name.clone())
+        .unwrap_or_else(|| "Missing profile".into())
+}
+
+fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Rc<ComparisonUi>) {
+    while let Some(child) = ui.candidates.first_child() {
+        ui.candidates.remove(&child);
+    }
+    while let Some(child) = ui.listening.first_child() {
+        ui.listening.remove(&child);
+    }
+    ui.checks.borrow_mut().clear();
+    let Some(device) = model
+        .devices
+        .borrow()
+        .get(drop.selected() as usize)
+        .cloned()
+    else {
+        ui.menu.set_sensitive(false);
+        ui.menu.set_label("COMPARE");
+        ui.stack.set_visible_child_name("setup");
+        ui.status.set_text("No output selected");
+        return;
+    };
+    ui.menu.set_sensitive(matches!(device.channels, 1 | 2));
+    let key = device.key.as_storage_key();
+    let comparison = model.comparisons.borrow().get(&key).cloned();
+
+    let mut candidates = Vec::with_capacity(model.profiles.borrow().len() + 1);
+    candidates.push((
+        COMPARISON_BYPASS_ID.to_owned(),
+        "OFF · level matched".to_owned(),
+    ));
+    candidates.extend(
+        model
+            .profiles
+            .borrow()
+            .iter()
+            .map(|profile| (profile.id.clone(), profile.name.clone())),
+    );
+    for (profile_id, name) in candidates {
+        let check = gtk::ToggleButton::new();
+        check.set_hexpand(true);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let label = gtk::Label::new(Some(&name));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let selected_mark = gtk::Label::new(None);
+        selected_mark.add_css_class("comparison-mark");
+        row.append(&label);
+        row.append(&selected_mark);
+        check.set_child(Some(&row));
+        check.update_property(&[
+            gtk::accessible::Property::Label(&format!("Include {name} in comparison")),
+            gtk::accessible::Property::Description(
+                "Select or remove this profile from the comparison bank draft.",
+            ),
+        ]);
+        let selected = comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.profile_ids.contains(&profile_id));
+        check.set_active(selected);
+        selected_mark.set_text(if selected { "SELECTED" } else { "ADD" });
+        check.add_css_class("comparison-candidate");
+        ui.candidates.append(&check);
+        ui.checks.borrow_mut().push((profile_id, check.clone()));
+        check.connect_toggled({
+            // These rows are rebuilt when the popover is reopened. Capturing
+            // a strong Rc would form checks -> button -> closure -> checks and
+            // leak every discarded candidate row.
+            let checks = Rc::downgrade(&ui.checks);
+            let status = ui.status.clone();
+            let save = ui.save.clone();
+            let selected_mark = selected_mark.clone();
+            move |button| {
+                let Some(checks) = checks.upgrade() else {
+                    return;
+                };
+                let selected = checks
+                    .borrow()
+                    .iter()
+                    .filter(|(_, candidate)| candidate.is_active())
+                    .count();
+                if selected > MAX_COMPARISON_PROFILES && button.is_active() {
+                    button.set_active(false);
+                    status.set_text(&format!(
+                        "Choose no more than {MAX_COMPARISON_PROFILES} candidates"
+                    ));
+                    return;
+                }
+                selected_mark.set_text(if button.is_active() {
+                    "SELECTED"
+                } else {
+                    "ADD"
+                });
+                save.set_sensitive((2..=MAX_COMPARISON_PROFILES).contains(&selected));
+                status.set_text(&if selected < 2 {
+                    format!("{selected} selected · choose at least two")
+                } else {
+                    format!("{selected} selected · ready to save")
+                });
+            }
+        });
+    }
+
+    let selected_ids = comparison
+        .as_ref()
+        .map(|comparison| comparison.profile_ids.clone())
+        .unwrap_or_default();
+    ui.save
+        .set_sensitive((2..=MAX_COMPARISON_PROFILES).contains(&selected_ids.len()));
+    if let Some(comparison) = &comparison {
+        ui.save.set_label("UPDATE COMPARISON");
+        ui.delete.set_sensitive(true);
+        ui.stack.set_visible_child_name("listen");
+
+        for (index, profile_id) in comparison.profile_ids.iter().enumerate() {
+            let name = comparison_candidate_name(model, profile_id);
+            let button = gtk::Button::new();
+            button.set_hexpand(true);
+            button.add_css_class("comparison-listen");
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let label = gtk::Label::new(Some(&name));
+            label.set_xalign(0.0);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let state_text = if comparison.enabled && profile_id == &comparison.active_profile_id {
+                "PLAYING".to_owned()
+            } else {
+                format!("ALT+{}", index + 1)
+            };
+            let state = gtk::Label::new(Some(&state_text));
+            state.add_css_class("comparison-mark");
+            row.append(&label);
+            row.append(&state);
+            button.set_child(Some(&row));
+            if comparison.enabled && profile_id == &comparison.active_profile_id {
+                button.add_css_class("active");
+            }
+            button.update_property(&[
+                gtk::accessible::Property::Label(&format!("Listen to {name}")),
+                gtk::accessible::Property::Description(
+                    if comparison.enabled && profile_id == &comparison.active_profile_id {
+                        "This is the profile currently playing."
+                    } else {
+                        "Switch immediately to this level-matched profile."
+                    },
+                ),
+            ]);
+            button.connect_clicked({
+                let model = model.clone();
+                let drop = drop.clone();
+                let ui = Rc::downgrade(ui);
+                let key = key.clone();
+                let profile_id = profile_id.clone();
+                move |_| match model.client.select_comparison_profile(&key, &profile_id) {
+                    Ok(()) => {
+                        if let Ok(comparisons) = model.client.comparisons() {
+                            *model.comparisons.borrow_mut() = comparisons;
+                        }
+                        if let Ok(devices) = model.client.devices() {
+                            *model.devices.borrow_mut() = devices;
+                        }
+                        let model = model.clone();
+                        let drop = drop.clone();
+                        if let Some(ui) = ui.upgrade() {
+                            gtk::glib::idle_add_local_once(move || {
+                                refresh_comparison_ui(&model, &drop, &ui);
+                                update_device_controls(
+                                    &model,
+                                    &drop,
+                                    &ui.device_state,
+                                    &ui.assign,
+                                    &ui.bypass,
+                                );
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(ui) = ui.upgrade() {
+                            ui.status.set_text(&error.to_string());
+                        }
+                    }
+                }
+            });
+            ui.listening.append(&button);
+        }
+
+        let active_name = comparison_candidate_name(model, &comparison.active_profile_id);
+        if comparison.enabled {
+            let active_position = comparison
+                .profile_ids
+                .iter()
+                .position(|id| id == &comparison.active_profile_id)
+                .unwrap_or_default()
+                + 1;
+            ui.menu.set_label(&format!(
+                "COMPARE · {active_position}/{}",
+                comparison.profile_ids.len()
+            ));
+            ui.menu.set_tooltip_text(Some(&format!(
+                "BS.1770 K-weighted comparison · {active_name}"
+            )));
+            ui.status
+                .set_text(&format!("LEVEL MATCHED · {active_name}"));
+        } else {
+            ui.menu.set_label("COMPARE · PAUSED");
+            ui.menu
+                .set_tooltip_text(Some("This output's comparison bank is paused"));
+            ui.status.set_text("PAUSED · choose a profile to resume");
+        }
+    } else {
+        ui.save.set_label("START COMPARISON");
+        ui.delete.set_sensitive(false);
+        ui.stack.set_visible_child_name("setup");
+        ui.menu.set_label("COMPARE");
+        ui.menu.set_tooltip_text(Some(
+            "Compare profiles at a shared BS.1770 K-weighted pink-noise level",
+        ));
+        ui.status.set_text("Choose at least two candidates");
+    }
+}
+
+fn install_comparison_shortcuts(
+    window: &adw::ApplicationWindow,
+    model: &Rc<Model>,
+    device_drop: &gtk::DropDown,
+    device_bypass: &gtk::Switch,
+    comparison_ui: &Rc<ComparisonUi>,
+) {
+    let controller = gtk::EventControllerKey::new();
+    controller.connect_key_pressed({
+        let model = model.clone();
+        let drop = device_drop.clone();
+        let bypass = device_bypass.clone();
+        let ui = comparison_ui.clone();
+        move |_, key, _, modifiers| {
+            let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
+            if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                && character == Some('b')
+                && bypass.is_sensitive()
+            {
+                bypass.set_active(!bypass.is_active());
+                return gtk::glib::Propagation::Stop;
+            }
+            if !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK) {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let Some(index) = character
+                .and_then(|value| value.to_digit(10))
+                .filter(|value| (1..=9).contains(value))
+                .map(|value| value as usize - 1)
+            else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let Some(device) = model
+                .devices
+                .borrow()
+                .get(drop.selected() as usize)
+                .cloned()
+            else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let key = device.key.as_storage_key();
+            let Some(comparison) = model.comparisons.borrow().get(&key).cloned() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            if !comparison.enabled {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let Some(profile_id) = comparison.profile_ids.get(index).cloned() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            match model.client.select_comparison_profile(&key, &profile_id) {
+                Ok(()) => {
+                    if let Some(comparison) = model.comparisons.borrow_mut().get_mut(&key) {
+                        comparison.active_profile_id = profile_id;
+                    }
+                    refresh_comparison_ui(&model, &drop, &ui);
+                }
+                Err(error) => ui.status.set_text(&error.to_string()),
+            }
+            gtk::glib::Propagation::Stop
+        }
+    });
+    window.add_controller(controller);
+}
+
+fn install_editor_shortcut(
+    window: &adw::ApplicationWindow,
+    mode_stack: &adw::ViewStack,
+    editor_stack: &gtk::Stack,
+) {
+    let controller = gtk::EventControllerKey::new();
+    controller.connect_key_pressed({
+        let mode_stack = mode_stack.clone();
+        let editor_stack = editor_stack.clone();
+        move |_, key, _, modifiers| {
+            let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
+            if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) || character != Some('e') {
+                return gtk::glib::Propagation::Proceed;
+            }
+            mode_stack.set_visible_child_name("filters");
+            let next = if editor_stack.visible_child_name().as_deref() == Some("text") {
+                "visual"
+            } else {
+                "text"
+            };
+            editor_stack.set_visible_child_name(next);
+            gtk::glib::Propagation::Stop
+        }
+    });
+    window.add_controller(controller);
+}
+
 fn update_device_controls(
     model: &Rc<Model>,
     drop: &gtk::DropDown,
@@ -1632,14 +2495,17 @@ fn update_device_controls(
     else {
         state.set_text("No output connected");
         assign.set_sensitive(false);
+        bypass.set_sensitive(false);
         return;
     };
 
     model.syncing_device.set(true);
-    if bypass.is_active() != device.bypassed {
-        bypass.set_active(device.bypassed);
+    let filters_active = !device.bypassed;
+    if bypass.is_active() != filters_active {
+        bypass.set_active(filters_active);
     }
     model.syncing_device.set(false);
+    drop.set_tooltip_text(Some(&device.description));
 
     let assigned_name = device.assigned_profile.as_ref().and_then(|id| {
         model
@@ -1657,6 +2523,13 @@ fn update_device_controls(
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     });
+    let comparison = model
+        .comparisons
+        .borrow()
+        .get(&device.key.as_storage_key())
+        .filter(|comparison| comparison.enabled)
+        .cloned();
+    let has_ab_source = comparison.is_some() || assigned_name.is_some();
 
     if let Some(error) = engine_error {
         state.set_text(&format!("Last valid audio retained · {error}"));
@@ -1666,30 +2539,43 @@ fn update_device_controls(
         state.set_text("Unsupported surround output · bypassed");
         assign.set_label("Unavailable");
         assign.set_sensitive(false);
+    } else if let Some(comparison) = comparison {
+        let active_name = comparison_candidate_name(model, &comparison.active_profile_id);
+        state.set_text(&if device.bypassed {
+            format!("Filters off · level matched to {active_name}")
+        } else if comparison.active_profile_id == COMPARISON_BYPASS_ID {
+            format!("Comparing · {active_name}")
+        } else {
+            format!("Comparing · {active_name} · level matched")
+        });
+        assign.set_label("Set selected as normal profile");
+        assign.set_sensitive(model.current_id.borrow().is_some());
     } else if device.bypassed {
         state.set_text(&match assigned_name {
-            Some(name) => format!("Assigned to {name} · currently bypassed"),
-            None => "Not applied · currently bypassed".to_owned(),
+            Some(name) => format!("Filters off · level matched to {name}"),
+            None => "Not applied · filters unavailable".to_owned(),
         });
         assign.set_label(if selected_matches {
-            "Applied"
+            "Unassign from output"
         } else {
             "Apply selected profile"
         });
-        assign.set_sensitive(!selected_matches && model.current_id.borrow().is_some());
+        assign.set_sensitive(model.current_id.borrow().is_some());
     } else if let Some(name) = assigned_name {
         state.set_text(&format!("Active · {name}"));
         assign.set_label(if selected_matches {
-            "Applied"
+            "Unassign from output"
         } else {
             "Replace with selected"
         });
-        assign.set_sensitive(!selected_matches && model.current_id.borrow().is_some());
+        assign.set_sensitive(model.current_id.borrow().is_some());
     } else {
         state.set_text("Not applied · output is unchanged");
         assign.set_label("Apply selected profile");
         assign.set_sensitive(model.current_id.borrow().is_some());
     }
+
+    bypass.set_sensitive(has_ab_source && matches!(device.channels, 1 | 2));
 }
 
 fn engine_summary(status: &serde_json::Value) -> String {
@@ -1780,8 +2666,8 @@ fn install_css() {
         .graph-card { padding: 20px 18px 10px 18px; }
 
         .level-readout {
-            border-top: 1px solid #292c2d;
-            padding: 8px 2px 1px 2px;
+            border-bottom: 1px solid #292c2d;
+            padding: 4px 2px 9px 2px;
         }
 
         .level-code {
@@ -1804,6 +2690,91 @@ fn install_css() {
             font-weight: 700;
             min-width: 150px;
             padding: 7px 16px;
+        }
+
+        .profile-add {
+            border-radius: 999px;
+            font-family: monospace;
+            font-size: 9px;
+            font-weight: 700;
+            padding: 7px 12px;
+        }
+
+        .comparison-menu > button {
+            border-radius: 999px;
+            font-family: monospace;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 7px 12px;
+        }
+
+        .comparison-candidate {
+            background-color: #1b1d1e;
+            border: 1px solid #2d3031;
+            border-radius: 10px;
+            padding: 6px 8px;
+            font-family: monospace;
+            box-shadow: none;
+        }
+
+        .comparison-candidate:checked {
+            background-color: rgba(230, 75, 47, 0.10);
+            border-color: rgba(230, 75, 47, 0.72);
+            color: #f2f1ec;
+        }
+
+        .comparison-listen {
+            background-color: #1b1d1e;
+            border: 1px solid #2d3031;
+            border-radius: 10px;
+            padding: 8px 10px;
+            font-family: monospace;
+            box-shadow: none;
+        }
+
+        .comparison-listen.active {
+            background-color: #e64b2f;
+            border-color: #ef5a3e;
+            color: #fff8f4;
+        }
+
+        .comparison-listen.active .comparison-mark {
+            color: #fff8f4;
+        }
+
+        .comparison-mark {
+            color: #e66a53;
+            font-family: monospace;
+            font-size: 9px;
+            font-weight: 700;
+        }
+
+        .editor-switcher button {
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            border-bottom: 2px solid transparent;
+            color: #8f9394;
+            font-family: monospace;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 8px 12px;
+        }
+
+        .editor-switcher button:checked {
+            background: transparent;
+            border-bottom-color: #e64b2f;
+            color: #f1f1ec;
+        }
+
+        .code-editor {
+            background-color: #151718;
+            border: 1px solid #292c2d;
+            border-radius: 22px;
+        }
+
+        textview.invalid-draft {
+            color: #ff9b88;
         }
 
         .profile-name {
@@ -1984,8 +2955,34 @@ fn install_css() {
 
         .mode-switcher button {
             min-width: 130px;
+            min-height: 28px;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            border-radius: 0;
+            box-shadow: none;
+            color: #858a8b;
             font-family: monospace;
             font-size: 11px;
+            font-weight: 700;
+            padding: 5px 12px 7px 12px;
+        }
+
+        .mode-switcher button:hover {
+            background: transparent;
+            color: #c6c9c8;
+        }
+
+        .mode-switcher button:checked {
+            background: transparent;
+            border-bottom-color: #e64b2f;
+            box-shadow: none;
+            color: #ecece8;
+        }
+
+        .device-dropdown,
+        .device-dropdown > button {
+            min-width: 0;
         }
 
         .console-status {
@@ -2037,9 +3034,9 @@ fn save_current(
     status: &gtk::Label,
     graph: &gtk::DrawingArea,
     analysis_label: &gtk::Label,
-) {
+) -> bool {
     let Some(id) = model.current_id.borrow().clone() else {
-        return;
+        return false;
     };
     let parsed = parse_text(name, text);
     if !parsed.is_activatable() {
@@ -2050,7 +3047,7 @@ fn save_current(
                 .map(|d| format!("Line {}: {}", d.line, d.message))
                 .unwrap_or_else(|| "Invalid profile".into()),
         );
-        return;
+        return false;
     }
     match model.client.put(&id, name, text, model.manual_trim.get()) {
         Ok(profile) => {
@@ -2069,19 +3066,29 @@ fn save_current(
                 *model.analysis.borrow_mut() = Some(analysis);
                 graph.queue_draw();
             }
+            true
         }
-        Err(error) => status.set_text(&error.to_string()),
+        Err(error) => {
+            status.set_text(&error.to_string());
+            false
+        }
     }
 }
 
 fn set_analysis_label(label: &gtk::Label, analysis: &ProfileAnalysis) {
+    let left_preamp = analysis.left.preamp_db + analysis.effective_gain_db;
+    let right_preamp = analysis.right.preamp_db + analysis.effective_gain_db;
+    let preamp = if (left_preamp - right_preamp).abs() < 0.01 {
+        format!("AUTO PREAMP {left_preamp:+.2} dB")
+    } else {
+        format!("AUTO PREAMP  L {left_preamp:+.2} dB  /  R {right_preamp:+.2} dB")
+    };
     label.set_text(&format!(
-        "Match {:+.2} dB   •   Safety {:+.2} dB   •   Effective {:+.2} dB{}",
+        "{preamp}   •   MATCH {:+.2} dB   •   SAFETY {:+.2} dB{}",
         analysis.match_gain_db,
         analysis.safety_attenuation_db,
-        analysis.effective_gain_db,
         if analysis.headroom_limited {
-            "   •   Headroom limited"
+            "   •   HEADROOM LIMITED"
         } else {
             ""
         }
