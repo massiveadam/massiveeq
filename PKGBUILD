@@ -1,20 +1,20 @@
 pkgname=massiveeq-git
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Device-aware systemwide equalizer for PipeWire and Wayland desktops'
 arch=('x86_64')
-url='https://github.com/massiveeq/massiveeq'
+url='https://github.com/massiveadam/massiveeq'
 license=('MIT')
-depends=('pipewire>=1:1.4' 'wireplumber>=0.5' 'gtk4>=4.18' 'libadwaita>=1.8' 'libsndfile')
-makedepends=('cargo' 'git')
+depends=('pipewire>=1:1.4' 'wireplumber>=0.5' 'gtk4>=4.18' 'libadwaita>=1.8' 'libsndfile' 'libsamplerate')
+makedepends=('cargo' 'clang' 'git')
 provides=('massiveeq')
 conflicts=('massiveeq')
-source=("$pkgname::git+https://github.com/massiveeq/massiveeq.git")
+source=("$pkgname::git+https://github.com/massiveadam/massiveeq.git")
 sha256sums=('SKIP')
 
 pkgver() {
   cd "$pkgname"
-  git describe --long --tags 2>/dev/null | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' || printf '0.1.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  git describe --long --tags 2>/dev/null | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' || printf '0.2.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 build() {

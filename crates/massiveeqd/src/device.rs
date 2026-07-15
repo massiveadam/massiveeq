@@ -3,6 +3,33 @@ use massiveeq_core::{DeviceInfo, DeviceKey, Library};
 use serde_json::{Map, Value};
 use tokio::process::Command;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphSettings {
+    pub sample_rate: u32,
+    pub quantum: u32,
+}
+
+pub async fn graph_settings() -> GraphSettings {
+    let output = Command::new("pw-metadata")
+        .args(["-n", "settings", "0"])
+        .output()
+        .await;
+    let text = output
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    GraphSettings {
+        sample_rate: metadata_number(&text, "clock.rate").unwrap_or(48_000),
+        // Capacity must cover a runtime quantum increase without allocating in
+        // the audio callback. Recompilation later reduces this after a graph
+        // setting change is observed.
+        quantum: metadata_number(&text, "clock.max-quantum")
+            .or_else(|| metadata_number(&text, "clock.quantum"))
+            .unwrap_or(2_048),
+    }
+}
+
 pub async fn discover(library: &Library) -> Result<Vec<DeviceInfo>> {
     let output = Command::new("pw-dump")
         .output()
@@ -96,4 +123,32 @@ fn channel_count(position: Option<&str>) -> u64 {
         })
         .filter(|v| *v > 0)
         .unwrap_or(2)
+}
+
+fn metadata_number(text: &str, key: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        line.contains(&format!("key:'{key}'"))
+            .then(|| {
+                line.split("value:'")
+                    .nth(1)?
+                    .split('\'')
+                    .next()?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+            .flatten()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_graph_settings_metadata() {
+        let text = "update: id:0 key:'clock.rate' value:'96000' type:''\nupdate: id:0 key:'clock.max-quantum' value:'4096' type:''";
+        assert_eq!(metadata_number(text, "clock.rate"), Some(96_000));
+        assert_eq!(metadata_number(text, "clock.max-quantum"), Some(4_096));
+    }
 }

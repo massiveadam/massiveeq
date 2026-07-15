@@ -1,5 +1,6 @@
 use crate::{AppState, refresh_locked};
-use massiveeq_core::{ChannelSelection, analyze_profile};
+use massiveeq_core::{ChannelAnalysis, ChannelSelection, ProfileAnalysis};
+use massiveeq_dsp::{CompileOptions, compile_profile};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use zbus::fdo;
@@ -13,7 +14,7 @@ pub struct Service {
 #[zbus::interface(name = "org.massiveeq.Service1")]
 impl Service {
     async fn ping(&self) -> &'static str {
-        "MassiveEQ 0.1.0"
+        concat!("MassiveEQ ", env!("CARGO_PKG_VERSION"))
     }
 
     async fn list_profiles(&self) -> fdo::Result<String> {
@@ -193,17 +194,23 @@ impl Service {
             .storage
             .parsed_profile(&state.library, id)
             .map_err(failed)?;
-        serde_json::to_string(&analyze_profile(
+        let compiled = compile_profile(
             &profile,
-            sample_rate.clamp(8000, 384000) as f64,
-            trim,
-        ))
-        .map_err(failed)
+            &CompileOptions {
+                sample_rate: sample_rate.clamp(8_000, 384_000),
+                quantum: 2_048,
+                output_channels: 2,
+                manual_trim_db: trim,
+                profile_dir: state.storage.profile_dir(id),
+            },
+        )
+        .map_err(failed)?;
+        serde_json::to_string(&legacy_analysis(&compiled.analysis)).map_err(failed)
     }
 
     async fn status(&self) -> fdo::Result<String> {
         let state = self.state.lock().await;
-        Ok(serde_json::json!({ "version": "0.1.0", "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass }).to_string())
+        Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass, "engine": state.host.status_json() }).to_string())
     }
 
     #[zbus(signal)]
@@ -212,4 +219,35 @@ impl Service {
 
 fn failed(error: impl std::fmt::Display) -> fdo::Error {
     fdo::Error::Failed(error.to_string())
+}
+
+fn legacy_analysis(analysis: &massiveeq_dsp::CompiledAnalysis) -> ProfileAnalysis {
+    let channel = |index: usize| {
+        let source = analysis
+            .channels
+            .get(index)
+            .or_else(|| analysis.channels.first())
+            .expect("compiled analysis contains an output channel");
+        ChannelAnalysis {
+            preamp_db: source.source_preamp_db,
+            peak_db: source.uncorrected_peak_db,
+            response: source
+                .response
+                .iter()
+                .map(|point| massiveeq_core::analysis::ResponsePoint {
+                    frequency: point.frequency,
+                    gain_db: point.gain_db,
+                })
+                .collect(),
+        }
+    };
+    ProfileAnalysis {
+        left: channel(0),
+        right: channel(1),
+        match_gain_db: analysis.match_gain_db,
+        manual_trim_db: analysis.manual_trim_db,
+        safety_attenuation_db: analysis.safety_attenuation_db,
+        effective_gain_db: analysis.effective_gain_db,
+        headroom_limited: analysis.headroom_limited,
+    }
 }

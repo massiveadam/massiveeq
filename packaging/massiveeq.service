@@ -1,6 +1,6 @@
 [Unit]
 Description=MassiveEQ systemwide playback equalizer
-Documentation=https://github.com/massiveeq/massiveeq
+Documentation=https://github.com/massiveadam/massiveeq
 After=pipewire.service wireplumber.service
 Wants=pipewire.service wireplumber.service
 
@@ -13,4 +13,3 @@ RestartSec=1
 
 [Install]
 WantedBy=default.target
-

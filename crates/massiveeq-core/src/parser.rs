@@ -111,7 +111,9 @@ fn parse_lines(
                     "Only ALL, L, R, 1, and 2 channels are supported in version 1",
                 ),
             },
-            "preamp" => match first_number(args) {
+            "preamp" => match first_number(args)
+                .filter(|value| value.is_finite() && (-120.0..=60.0).contains(value))
+            {
                 Some(value) => profile.preamps.push(ChannelGain {
                     channels: state.channels,
                     gain_db: value,
@@ -147,14 +149,24 @@ fn parse_lines(
                 ),
             },
             "convolution" => {
-                let path = source_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(unquote(args));
-                profile.convolutions.push(Convolution {
-                    channels: state.channels,
-                    path,
-                });
+                if unquote(args).trim().is_empty() {
+                    diagnostic(
+                        profile,
+                        DiagnosticLevel::Error,
+                        source_path,
+                        line_no,
+                        "Convolution is missing an impulse-response path",
+                    );
+                } else {
+                    let path = source_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(unquote(args));
+                    profile.convolutions.push(Convolution {
+                        channels: state.channels,
+                        path,
+                    });
+                }
             }
             "include" => {
                 let path = source_path
@@ -246,11 +258,11 @@ fn parse_filter(args: &str, channels: ChannelSelection) -> Result<Filter, String
         "AP" => FilterKind::AllPass,
         _ => return Err(format!("Unsupported filter type: {}", tokens[1])),
     };
-    let frequency = number_after(&tokens, "Fc").ok_or("Filter is missing Fc")?;
-    let gain_db = number_after(&tokens, "Gain").unwrap_or(0.0);
-    let q = if let Some(q) = number_after(&tokens, "Q") {
+    let frequency = required_number_after(&tokens, "Fc")?;
+    let gain_db = optional_number_after(&tokens, "Gain")?.unwrap_or(0.0);
+    let q = if let Some(q) = optional_number_after(&tokens, "Q")? {
         q
-    } else if let Some(bw) = bandwidth_after(&tokens) {
+    } else if let Some(bw) = bandwidth_after(&tokens)? {
         bandwidth_to_q(bw)
     } else {
         std::f64::consts::FRAC_1_SQRT_2
@@ -291,8 +303,14 @@ fn parse_graphic_eq(args: &str, channels: ChannelSelection) -> Result<GraphicEq,
         let gain_db = values[1]
             .parse::<f64>()
             .map_err(|_| format!("Invalid GraphicEQ gain: {}", values[1]))?;
-        if frequency <= 0.0 {
+        if !frequency.is_finite() || !gain_db.is_finite() {
+            return Err("GraphicEQ values must be finite".into());
+        }
+        if frequency <= 0.0 || frequency > 384_000.0 {
             return Err("GraphicEQ frequencies must be positive".into());
+        }
+        if !(-60.0..=60.0).contains(&gain_db) {
+            return Err("GraphicEQ gain is outside -60–60 dB".into());
         }
         points.push(GraphicPoint { frequency, gain_db });
     }
@@ -300,27 +318,61 @@ fn parse_graphic_eq(args: &str, channels: ChannelSelection) -> Result<GraphicEq,
     if points.is_empty() {
         return Err("GraphicEQ needs at least one point".into());
     }
+    if points
+        .windows(2)
+        .any(|pair| pair[0].frequency == pair[1].frequency)
+    {
+        return Err("GraphicEQ frequencies must be unique".into());
+    }
     Ok(GraphicEq { channels, points })
 }
 
-fn number_after(tokens: &[&str], key: &str) -> Option<f64> {
-    tokens
+fn optional_number_after(tokens: &[&str], key: &str) -> Result<Option<f64>, String> {
+    let Some(index) = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case(key))
-        .and_then(|index| tokens.get(index + 1))
-        .and_then(|value| value.parse().ok())
+    else {
+        return Ok(None);
+    };
+    let value = tokens
+        .get(index + 1)
+        .ok_or_else(|| format!("Filter is missing a value after {key}"))?
+        .parse::<f64>()
+        .map_err(|_| format!("Invalid numeric value after {key}"))?;
+    if !value.is_finite() {
+        return Err(format!("Value after {key} must be finite"));
+    }
+    Ok(Some(value))
 }
 
-fn bandwidth_after(tokens: &[&str]) -> Option<f64> {
-    let index = tokens
+fn required_number_after(tokens: &[&str], key: &str) -> Result<f64, String> {
+    optional_number_after(tokens, key)?.ok_or_else(|| format!("Filter is missing {key}"))
+}
+
+fn bandwidth_after(tokens: &[&str]) -> Result<Option<f64>, String> {
+    let Some(index) = tokens
         .iter()
-        .position(|token| token.eq_ignore_ascii_case("BW"))?;
-    let next = tokens.get(index + 1)?;
-    if next.eq_ignore_ascii_case("Oct") {
-        tokens.get(index + 2)?.parse().ok()
+        .position(|token| token.eq_ignore_ascii_case("BW"))
+    else {
+        return Ok(None);
+    };
+    let next = tokens
+        .get(index + 1)
+        .ok_or_else(|| "Filter is missing a BW value".to_owned())?;
+    let raw = if next.eq_ignore_ascii_case("Oct") {
+        tokens
+            .get(index + 2)
+            .ok_or_else(|| "Filter is missing a BW Oct value".to_owned())?
     } else {
-        next.parse().ok()
+        next
+    };
+    let value = raw
+        .parse::<f64>()
+        .map_err(|_| "Invalid BW value".to_owned())?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err("BW must be positive and finite".into());
     }
+    Ok(Some(value))
 }
 
 fn first_number(text: &str) -> Option<f64> {
@@ -357,6 +409,16 @@ fn diagnostic(
 }
 
 fn enforce_limits(profile: &mut ProfileDocument) {
+    if !profile.convolutions.is_empty()
+        && (!profile.filters.is_empty() || !profile.graphic_eqs.is_empty())
+    {
+        profile.diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Error,
+            line: 0,
+            source: profile.name.clone(),
+            message: "Parametric/GraphicEQ processing and convolution cannot be active in the same profile".into(),
+        });
+    }
     for channel in [Channel::Left, Channel::Right] {
         if profile.filters_for(channel).count() > MAX_FILTERS_PER_CHANNEL {
             profile.diagnostics.push(Diagnostic {
@@ -481,6 +543,27 @@ Filter 3: OFF HSC Fc 8000 Hz Gain -1.5 dB Q 0.8
         let profile = parse_text("fixture", "GraphicEQ: 20 1; 1000 -2.5; 20000 0");
         assert!(profile.is_activatable());
         assert_eq!(profile.graphic_eqs[0].points.len(), 3);
+    }
+
+    #[test]
+    fn rejects_duplicate_or_non_finite_graphic_points() {
+        assert!(!parse_text("fixture", "GraphicEQ: 100 1; 100 -2").is_activatable());
+        assert!(!parse_text("fixture", "GraphicEQ: 100 NaN").is_activatable());
+    }
+
+    #[test]
+    fn rejects_invalid_optional_filter_numbers() {
+        assert!(!parse_text("fixture", "Filter: ON PK Fc 1000 Hz Gain nope Q 1").is_activatable());
+        assert!(!parse_text("fixture", "Filter: ON PK Fc 1000 Hz Gain 1 Q NaN").is_activatable());
+    }
+
+    #[test]
+    fn rejects_mixed_eq_and_convolution_modes() {
+        let profile = parse_text(
+            "fixture",
+            "Filter: ON PK Fc 1000 Hz Gain 1 dB Q 1\nConvolution: room.wav",
+        );
+        assert!(!profile.is_activatable());
     }
 
     #[test]

@@ -6,9 +6,12 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytemuck.workspace = true
 massiveeq-core = { path = "../massiveeq-core" }
+massiveeq-dsp = { path = "../massiveeq-dsp" }
+pipewire.workspace = true
+rtrb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 zbus.workspace = true
-

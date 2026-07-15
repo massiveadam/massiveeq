@@ -24,6 +24,7 @@ struct Model {
     analysis: Rc<RefCell<Option<ProfileAnalysis>>>,
     selected_filter: Rc<Cell<Option<usize>>>,
     manual_trim: Cell<f64>,
+    sample_rate: Cell<f64>,
     loading: Cell<bool>,
     syncing_device: Cell<bool>,
 }
@@ -59,6 +60,11 @@ fn build_ui(app: &adw::Application) {
             return;
         }
     };
+    let engine_status = client.status().unwrap_or_default();
+    let active_sample_rate = engine_status
+        .pointer("/engine/active/0/sample_rate")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(48_000) as f64;
     let model = Rc::new(Model {
         profiles: RefCell::new(client.profiles().unwrap_or_default()),
         devices: RefCell::new(client.devices().unwrap_or_default()),
@@ -68,6 +74,7 @@ fn build_ui(app: &adw::Application) {
         analysis: Rc::new(RefCell::new(None)),
         selected_filter: Rc::new(Cell::new(None)),
         manual_trim: Cell::new(0.0),
+        sample_rate: Cell::new(active_sample_rate),
         loading: Cell::new(false),
         syncing_device: Cell::new(false),
     });
@@ -242,8 +249,9 @@ fn build_ui(app: &adw::Application) {
     graph_title.add_css_class("panel-title");
     graph_title.set_hexpand(true);
     graph_header.append(&graph_title);
-    let graph_hint = gtk::Label::new(Some("DRAG POINTS TO EDIT"));
-    graph_hint.add_css_class("section-label");
+    let graph_hint = gtk::Label::new(Some(&engine_summary(&engine_status)));
+    graph_hint.add_css_class("level-code");
+    graph_hint.set_tooltip_text(Some("Drag response points to edit parametric filters"));
     graph_header.append(&graph_hint);
     graph_card.append(&graph_header);
     let graph = graph::response_graph(
@@ -1119,7 +1127,7 @@ fn wire_actions(
                 filter.frequency =
                     (start_frequency * (1000.0_f64).powf(dx / width)).clamp(20.0, 20_000.0);
                 filter.gain_db = (start_gain - dy / height * 36.0).clamp(-24.0, 24.0);
-                analyze_profile_preview(document, 48_000.0, model.manual_trim.get())
+                analyze_profile_preview(document, model.sample_rate.get(), model.manual_trim.get())
             };
             *model.analysis.borrow_mut() = Some(preview);
             graph.queue_draw();
@@ -1558,7 +1566,7 @@ fn update_filter(
         update(filter);
         (
             serialize_profile(document),
-            analyze_profile_preview(document, 48_000.0, model.manual_trim.get()),
+            analyze_profile_preview(document, model.sample_rate.get(), model.manual_trim.get()),
         )
     };
     *model.analysis.borrow_mut() = Some(preview);
@@ -1620,8 +1628,19 @@ fn update_device_controls(
             .map(|profile| profile.name.clone())
     });
     let selected_matches = device.assigned_profile.as_ref() == model.current_id.borrow().as_ref();
+    let engine_error = model.client.status().ok().and_then(|status| {
+        status
+            .pointer("/engine/errors")
+            .and_then(|errors| errors.get(device.key.as_storage_key()))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
 
-    if device.channels > 2 {
+    if let Some(error) = engine_error {
+        state.set_text(&format!("Last valid audio retained · {error}"));
+        assign.set_label("Retry profile");
+        assign.set_sensitive(model.current_id.borrow().is_some());
+    } else if device.channels > 2 {
         state.set_text("Unsupported surround output · bypassed");
         assign.set_label("Unavailable");
         assign.set_sensitive(false);
@@ -1648,6 +1667,34 @@ fn update_device_controls(
         state.set_text("Not applied · output is unchanged");
         assign.set_label("Apply selected profile");
         assign.set_sensitive(model.current_id.borrow().is_some());
+    }
+}
+
+fn engine_summary(status: &serde_json::Value) -> String {
+    let Some(active) = status.pointer("/engine/active/0") else {
+        return "NATIVE DSP · IDLE".into();
+    };
+    let rate = active
+        .get("sample_rate")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(48_000) as f64
+        / 1000.0;
+    let latency = active
+        .get("latency_ms")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default();
+    let cpu = active
+        .get("cpu_percent_of_deadline")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_default();
+    if active
+        .get("cpu_warning")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        format!("NATIVE DSP · {rate:.1} kHz · {latency:.1} ms · CPU {cpu:.0}% ⚠")
+    } else {
+        format!("NATIVE DSP · {rate:.1} kHz · {latency:.1} ms")
     }
 }
 

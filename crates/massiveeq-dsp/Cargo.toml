@@ -1,0 +1,16 @@
+[package]
+name = "massiveeq-dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fft-convolver.workspace = true
+massiveeq-core = { path = "../massiveeq-core" }
+realfft.workspace = true
+rustfft.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

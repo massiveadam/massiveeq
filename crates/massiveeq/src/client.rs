@@ -82,7 +82,17 @@ impl Client {
             .context("global bypass failed")
     }
     pub fn analyze(&self, id: &str) -> Result<ProfileAnalysis> {
-        self.call_json("Analyze", &(id, 48_000_u32))
+        let sample_rate = self
+            .status()
+            .ok()
+            .and_then(|status| {
+                status
+                    .pointer("/engine/active/0/sample_rate")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .and_then(|rate| u32::try_from(rate).ok())
+            .unwrap_or(48_000);
+        self.call_json("Analyze", &(id, sample_rate))
     }
     pub fn status(&self) -> Result<serde_json::Value> {
         self.call_json("Status", &())

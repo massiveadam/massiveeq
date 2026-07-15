@@ -169,6 +169,7 @@ impl Storage {
                 .join("; ");
             return Err(StorageError::InvalidProfile(message));
         }
+        self.validate_stored_convolutions(id, &parsed)?;
         let record = library
             .profiles
             .get_mut(id)
@@ -343,6 +344,59 @@ impl Storage {
         let text = fs::read_to_string(self.profile_path(id))?;
         Ok((parse_text(&record.name, &text), record.manual_trim_db))
     }
+
+    fn validate_stored_convolutions(
+        &self,
+        id: &str,
+        profile: &ProfileDocument,
+    ) -> Result<(), StorageError> {
+        if profile.convolutions.is_empty() {
+            return Ok(());
+        }
+        let root = fs::canonicalize(self.profile_dir(id))?;
+        for convolution in &profile.convolutions {
+            if convolution.path.is_absolute() {
+                return Err(StorageError::InvalidProfile(format!(
+                    "Convolution asset must use a portable path inside the profile: {}",
+                    convolution.path.display()
+                )));
+            }
+            let requested = self.profile_dir(id).join(&convolution.path);
+            let canonical = fs::canonicalize(&requested).map_err(|_| {
+                StorageError::InvalidProfile(format!(
+                    "Convolution asset does not exist: {}",
+                    convolution.path.display()
+                ))
+            })?;
+            if !canonical.starts_with(&root) {
+                return Err(StorageError::InvalidProfile(format!(
+                    "Convolution asset escapes the profile directory: {}",
+                    convolution.path.display()
+                )));
+            }
+            let Some((frames, sample_rate, channels)) =
+                crate::pipewire::audio_file_info(&canonical)
+            else {
+                return Err(StorageError::InvalidProfile(format!(
+                    "Could not decode convolution asset {}",
+                    convolution.path.display()
+                )));
+            };
+            if frames <= 0 || sample_rate <= 0 || channels == 0 {
+                return Err(StorageError::InvalidProfile(format!(
+                    "Convolution asset is empty: {}",
+                    convolution.path.display()
+                )));
+            }
+            if frames as f64 / sample_rate as f64 > 10.0 {
+                return Err(StorageError::InvalidProfile(format!(
+                    "Convolution asset is longer than 10 seconds: {}",
+                    convolution.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
@@ -489,6 +543,36 @@ mod tests {
                 .profile_dir(&profile.id)
                 .join(&parsed.convolutions[0].path)
                 .exists()
+        );
+    }
+
+    #[test]
+    fn raw_profile_update_rejects_missing_or_external_convolution_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "IR").unwrap();
+        assert!(
+            storage
+                .put_profile(
+                    &mut library,
+                    &profile.id,
+                    "IR",
+                    "Convolution: assets/missing.wav",
+                    0.0,
+                )
+                .is_err()
+        );
+        assert!(
+            storage
+                .put_profile(
+                    &mut library,
+                    &profile.id,
+                    "IR",
+                    "Convolution: /tmp/external.wav",
+                    0.0,
+                )
+                .is_err()
         );
     }
 }
