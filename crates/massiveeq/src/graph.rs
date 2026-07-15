@@ -9,8 +9,8 @@ const LEFT: f64 = 58.0;
 const RIGHT: f64 = 24.0;
 const TOP: f64 = 34.0;
 const BOTTOM: f64 = 42.0;
-const MIN_DB: f64 = -18.0;
-const MAX_DB: f64 = 18.0;
+const MIN_DB: f64 = -10.0;
+const MAX_DB: f64 = 10.0;
 
 pub fn response_graph(
     analysis: Rc<RefCell<Option<ProfileAnalysis>>>,
@@ -108,7 +108,7 @@ fn draw_background(cr: &cairo::Context, width: f64, height: f64, foreground: (f6
         let _ = cr.show_text(label);
     }
 
-    for db in [-18.0_f64, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0] {
+    for db in [-10.0_f64, -5.0, 0.0, 5.0, 10.0] {
         let y = y_for(db, height);
         let alpha = if db == 0.0 { 0.25 } else { 0.085 };
         cr.set_source_rgba(foreground.0, foreground.1, foreground.2, alpha);
@@ -342,6 +342,11 @@ pub fn filter_point_position(
     point_position(frequency, filter_gain, width, height)
 }
 
+pub fn gain_after_drag(start_gain: f64, delta_y: f64, height: f64) -> f64 {
+    let (_, plot_height) = plot_size(1.0 + LEFT + RIGHT, height);
+    (start_gain - delta_y / plot_height * (MAX_DB - MIN_DB)).clamp(MIN_DB, MAX_DB)
+}
+
 fn plot_size(width: f64, height: f64) -> (f64, f64) {
     (
         (width - LEFT - RIGHT).max(1.0),
@@ -393,5 +398,18 @@ mod tests {
             filter_point_position(1_000.0, 9.0, 1_000.0, 500.0),
             point_position(1_000.0, 9.0, 1_000.0, 500.0)
         );
+    }
+
+    #[test]
+    fn display_and_drag_use_the_ten_db_range() {
+        let height = 500.0;
+        let (_, plot_height) = plot_size(1.0 + LEFT + RIGHT, height);
+        assert_eq!(point_position(1_000.0, 10.0, 1_000.0, height).1, TOP);
+        assert_eq!(
+            point_position(1_000.0, -10.0, 1_000.0, height).1,
+            TOP + plot_height
+        );
+        assert_eq!(gain_after_drag(0.0, -plot_height / 2.0, height), 10.0);
+        assert_eq!(gain_after_drag(0.0, plot_height / 2.0, height), -10.0);
     }
 }

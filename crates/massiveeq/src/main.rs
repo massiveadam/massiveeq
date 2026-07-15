@@ -1192,7 +1192,7 @@ fn wire_actions(
                 };
                 filter.frequency =
                     (start_frequency * (1000.0_f64).powf(dx / width)).clamp(20.0, 20_000.0);
-                filter.gain_db = (start_gain - dy / height * 36.0).clamp(-24.0, 24.0);
+                filter.gain_db = graph::gain_after_drag(start_gain, dy, height);
                 analyze_profile_preview(document, model.sample_rate.get(), model.manual_trim.get())
             };
             set_analysis_label(&analysis_label, &preview);
