@@ -6,8 +6,8 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use massiveeq_core::{
     COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
-    ProfileAnalysis, ProfileDocument, ProfileInfo, analyze_profile_preview, parse_text,
-    serialize_profile,
+    MAX_COMPARISON_PROFILES, ProfileAnalysis, ProfileDocument, ProfileInfo,
+    analyze_profile_preview, parse_text, serialize_profile,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -30,6 +30,7 @@ struct Model {
     sample_rate: Cell<f64>,
     loading: Cell<bool>,
     syncing_device: Cell<bool>,
+    syncing_engine: Cell<bool>,
     syncing_comparison: Cell<bool>,
 }
 
@@ -50,7 +51,7 @@ struct ConvolutionUi {
 struct ComparisonUi {
     menu: gtk::MenuButton,
     candidates: gtk::Box,
-    checks: Rc<RefCell<Vec<(String, gtk::CheckButton)>>>,
+    checks: Rc<RefCell<Vec<(String, gtk::ToggleButton)>>>,
     active_strings: gtk::StringList,
     active_ids: Rc<RefCell<Vec<String>>>,
     active_drop: gtk::DropDown,
@@ -96,6 +97,7 @@ fn build_ui(app: &adw::Application) {
         sample_rate: Cell::new(active_sample_rate),
         loading: Cell::new(false),
         syncing_device: Cell::new(false),
+        syncing_engine: Cell::new(false),
         syncing_comparison: Cell::new(false),
     });
 
@@ -167,16 +169,18 @@ fn build_ui(app: &adw::Application) {
     let global_bypass = gtk::Switch::new();
     global_bypass.set_valign(gtk::Align::Center);
     global_bypass.set_active(
-        model
+        !model
             .client
             .status()
             .ok()
             .and_then(|value| value.get("global_bypass").and_then(|value| value.as_bool()))
             .unwrap_or(false),
     );
-    global_bypass.set_tooltip_text(Some("Bypass every MassiveEQ filter"));
+    global_bypass.set_tooltip_text(Some(
+        "Master DSP engine. Off is true dry audio at 0 dB with no EQ or level correction.",
+    ));
     header.pack_end(&global_bypass);
-    let global_bypass_label = gtk::Label::new(Some("ENGINE BYPASS"));
+    let global_bypass_label = gtk::Label::new(Some("ENGINE"));
     global_bypass_label.add_css_class("header-data");
     header.pack_end(&global_bypass_label);
     toolbar.add_top_bar(&header);
@@ -258,11 +262,14 @@ fn build_ui(app: &adw::Application) {
             .devices
             .borrow()
             .first()
-            .is_some_and(|device| device.bypassed),
+            .is_some_and(|device| !device.bypassed),
     );
+    device_bypass.set_tooltip_text(Some(
+        "Level-matched filter A/B. Off removes the filters but retains the active profile's perceived gain correction.",
+    ));
     let bypass_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     bypass_row.set_halign(gtk::Align::Center);
-    bypass_row.append(&gtk::Label::new(Some("Bypass output")));
+    bypass_row.append(&gtk::Label::new(Some("FILTER A/B")));
     bypass_row.append(&device_bypass);
     device_actions.append(&bypass_row);
     let comparison_popover = gtk::Popover::new();
@@ -277,7 +284,7 @@ fn build_ui(app: &adw::Application) {
     comparison_title.add_css_class("panel-title");
     comparison_box.append(&comparison_title);
     let comparison_help = gtk::Label::new(Some(
-        "Choose 2–9 candidates. Every choice is matched to the quietest safe level.",
+        "Select 2–9 candidates. Each full-width row is a stable multi-select; every saved choice is matched to the quietest safe level.",
     ));
     comparison_help.set_wrap(true);
     comparison_help.set_xalign(0.0);
@@ -310,6 +317,9 @@ fn build_ui(app: &adw::Application) {
     let comparison_enabled = gtk::Switch::new();
     comparison_enabled.set_valign(gtk::Align::Center);
     comparison_enabled.set_tooltip_text(Some("Enable this output's comparison bank"));
+    let comparison_enabled_label = gtk::Label::new(Some("BANK ACTIVE"));
+    comparison_enabled_label.add_css_class("section-label");
+    comparison_active_row.append(&comparison_enabled_label);
     comparison_active_row.append(&comparison_enabled);
     comparison_box.append(&comparison_active_row);
     let comparison_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -695,6 +705,7 @@ fn build_ui(app: &adw::Application) {
         let state = device_state.clone();
         let assign = assign_button.clone();
         let bypass = device_bypass.clone();
+        let engine = global_bypass.clone();
         let comparison_ui = comparison_ui.clone();
         move || {
             if let Ok(devices) = model.client.devices() {
@@ -723,6 +734,15 @@ fn build_ui(app: &adw::Application) {
                     *model.comparisons.borrow_mut() = comparisons;
                 }
                 refresh_comparison_ui(&model, &drop, &comparison_ui);
+            }
+            if let Ok(service_status) = model.client.status()
+                && let Some(engine_off) = service_status
+                    .get("global_bypass")
+                    .and_then(serde_json::Value::as_bool)
+            {
+                model.syncing_engine.set(true);
+                engine.set_active(!engine_off);
+                model.syncing_engine.set(false);
             }
             gtk::glib::ControlFlow::Continue
         }
@@ -1451,7 +1471,7 @@ fn wire_actions(
             if let Some(device) = model.devices.borrow().get(drop.selected() as usize) {
                 let _ = model
                     .client
-                    .set_device_bypass(&device.key.as_storage_key(), switch.is_active());
+                    .set_device_bypass(&device.key.as_storage_key(), !switch.is_active());
                 if let Ok(devices) = model.client.devices() {
                     *model.devices.borrow_mut() = devices;
                 }
@@ -1462,7 +1482,10 @@ fn wire_actions(
     global_bypass.connect_active_notify({
         let model = model.clone();
         move |switch| {
-            let _ = model.client.set_global_bypass(switch.is_active());
+            if model.syncing_engine.get() {
+                return;
+            }
+            let _ = model.client.set_global_bypass(!switch.is_active());
         }
     });
     trim.connect_value_changed({
@@ -2090,21 +2113,65 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Compariso
             .map(|profile| (profile.id.clone(), profile.name.clone())),
     );
     for (profile_id, name) in candidates {
-        let check = gtk::CheckButton::with_label(&name);
-        check.set_active(
-            comparison
-                .as_ref()
-                .is_some_and(|comparison| comparison.profile_ids.contains(&profile_id)),
-        );
+        let check = gtk::ToggleButton::new();
+        check.set_hexpand(true);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let label = gtk::Label::new(Some(&name));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        let selected_mark = gtk::Label::new(None);
+        selected_mark.add_css_class("comparison-mark");
+        row.append(&label);
+        row.append(&selected_mark);
+        check.set_child(Some(&row));
+        let selected = comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.profile_ids.contains(&profile_id));
+        check.set_active(selected);
+        selected_mark.set_text(if selected { "SELECTED" } else { "ADD" });
         check.add_css_class("comparison-candidate");
         ui.candidates.append(&check);
-        ui.checks.borrow_mut().push((profile_id, check));
+        ui.checks.borrow_mut().push((profile_id, check.clone()));
+        check.connect_toggled({
+            let checks = ui.checks.clone();
+            let status = ui.status.clone();
+            let save = ui.save.clone();
+            let selected_mark = selected_mark.clone();
+            move |button| {
+                let selected = checks
+                    .borrow()
+                    .iter()
+                    .filter(|(_, candidate)| candidate.is_active())
+                    .count();
+                if selected > MAX_COMPARISON_PROFILES && button.is_active() {
+                    button.set_active(false);
+                    status.set_text(&format!(
+                        "Choose no more than {MAX_COMPARISON_PROFILES} candidates"
+                    ));
+                    return;
+                }
+                selected_mark.set_text(if button.is_active() {
+                    "SELECTED"
+                } else {
+                    "ADD"
+                });
+                save.set_sensitive((2..=MAX_COMPARISON_PROFILES).contains(&selected));
+                status.set_text(&if selected < 2 {
+                    format!("{selected} selected · choose at least two")
+                } else {
+                    format!("{selected} selected · ready to save")
+                });
+            }
+        });
     }
 
     let active_ids = comparison
         .as_ref()
         .map(|comparison| comparison.profile_ids.clone())
         .unwrap_or_default();
+    ui.save
+        .set_sensitive((2..=MAX_COMPARISON_PROFILES).contains(&active_ids.len()));
     let active_names = active_ids
         .iter()
         .map(|profile_id| comparison_candidate_name(model, profile_id))
@@ -2115,6 +2182,7 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Compariso
         .splice(0, ui.active_strings.n_items(), &active_name_refs);
     *ui.active_ids.borrow_mut() = active_ids.clone();
     if let Some(comparison) = &comparison {
+        ui.save.set_label("UPDATE + START");
         let selected = active_ids
             .iter()
             .position(|id| id == &comparison.active_profile_id)
@@ -2152,6 +2220,7 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Compariso
             ));
         }
     } else {
+        ui.save.set_label("SAVE + START");
         ui.enabled.set_active(false);
         ui.enabled.set_sensitive(false);
         ui.active_drop.set_sensitive(false);
@@ -2268,12 +2337,14 @@ fn update_device_controls(
     else {
         state.set_text("No output connected");
         assign.set_sensitive(false);
+        bypass.set_sensitive(false);
         return;
     };
 
     model.syncing_device.set(true);
-    if bypass.is_active() != device.bypassed {
-        bypass.set_active(device.bypassed);
+    let filters_active = !device.bypassed;
+    if bypass.is_active() != filters_active {
+        bypass.set_active(filters_active);
     }
     model.syncing_device.set(false);
     drop.set_tooltip_text(Some(&device.description));
@@ -2300,6 +2371,7 @@ fn update_device_controls(
         .get(&device.key.as_storage_key())
         .filter(|comparison| comparison.enabled)
         .cloned();
+    let has_ab_source = comparison.is_some() || assigned_name.is_some();
 
     if let Some(error) = engine_error {
         state.set_text(&format!("Last valid audio retained · {error}"));
@@ -2311,7 +2383,9 @@ fn update_device_controls(
         assign.set_sensitive(false);
     } else if let Some(comparison) = comparison {
         let active_name = comparison_candidate_name(model, &comparison.active_profile_id);
-        state.set_text(&if comparison.active_profile_id == COMPARISON_BYPASS_ID {
+        state.set_text(&if device.bypassed {
+            format!("A/B · filters off · level matched to {active_name}")
+        } else if comparison.active_profile_id == COMPARISON_BYPASS_ID {
             format!("Comparing · {active_name}")
         } else {
             format!("Comparing · {active_name} · level matched")
@@ -2320,8 +2394,8 @@ fn update_device_controls(
         assign.set_sensitive(model.current_id.borrow().is_some());
     } else if device.bypassed {
         state.set_text(&match assigned_name {
-            Some(name) => format!("Assigned to {name} · currently bypassed"),
-            None => "Not applied · currently bypassed".to_owned(),
+            Some(name) => format!("A/B · filters off · level matched to {name}"),
+            None => "Not applied · filter A/B unavailable".to_owned(),
         });
         assign.set_label(if selected_matches {
             "Unassign from output"
@@ -2342,6 +2416,8 @@ fn update_device_controls(
         assign.set_label("Apply selected profile");
         assign.set_sensitive(model.current_id.borrow().is_some());
     }
+
+    bypass.set_sensitive(has_ab_source && matches!(device.channels, 1 | 2));
 }
 
 fn engine_summary(status: &serde_json::Value) -> String {
@@ -2475,13 +2551,25 @@ fn install_css() {
         }
 
         .comparison-candidate {
+            background-color: #1b1d1e;
+            border: 1px solid #2d3031;
             border-radius: 10px;
             padding: 6px 8px;
             font-family: monospace;
+            box-shadow: none;
         }
 
         .comparison-candidate:checked {
             background-color: rgba(230, 75, 47, 0.10);
+            border-color: rgba(230, 75, 47, 0.72);
+            color: #f2f1ec;
+        }
+
+        .comparison-mark {
+            color: #e66a53;
+            font-family: monospace;
+            font-size: 9px;
+            font-weight: 700;
         }
 
         .editor-switcher button {

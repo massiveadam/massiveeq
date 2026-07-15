@@ -53,7 +53,7 @@ impl MassiveEqTray {
         if !self.snapshot.online {
             "Unavailable"
         } else if self.snapshot.global_bypass {
-            "Bypassed"
+            "Engine off"
         } else if self.snapshot.devices.iter().any(|device| {
             let key = device.key.as_storage_key();
             device.connected
@@ -110,7 +110,7 @@ impl MassiveEqTray {
         let assignment_key = key.clone();
         let assignment_ids = profile_ids;
         let bypass_key = key;
-        let bypassed = device.bypassed;
+        let filters_active = !device.bypassed;
         let mut submenu = vec![
             RadioGroup {
                 selected,
@@ -182,12 +182,12 @@ impl MassiveEqTray {
         submenu.push(MenuItem::Separator);
         submenu.push(
             CheckmarkItem {
-                label: "Bypass this output".into(),
-                checked: bypassed,
+                label: "Filters active (level-matched A/B)".into(),
+                checked: filters_active,
                 activate: Box::new(move |tray: &mut Self| {
                     tray.send(Action::SetDeviceBypass {
                         key: bypass_key.clone(),
-                        bypassed: !bypassed,
+                        bypassed: filters_active,
                     });
                 }),
                 ..Default::default()
@@ -280,7 +280,14 @@ impl ksni::Tray for MassiveEqTray {
                                 .map_or("Unassigned", |profile| profile.name.as_str())
                                 .to_owned()
                         });
-                    format!("{} — {profile}", device.description)
+                    if device.bypassed {
+                        format!(
+                            "{} — Filters off · level matched to {profile}",
+                            device.description
+                        )
+                    } else {
+                        format!("{} — {profile}", device.description)
+                    }
                 })
                 .collect::<Vec<_>>();
             if active.is_empty() {
@@ -339,8 +346,8 @@ impl ksni::Tray for MassiveEqTray {
             menu.push(MenuItem::Separator);
             menu.push(
                 CheckmarkItem {
-                    label: "Bypass all EQ".into(),
-                    checked: self.snapshot.global_bypass,
+                    label: "Engine enabled".into(),
+                    checked: !self.snapshot.global_bypass,
                     activate: Box::new(|tray: &mut Self| {
                         tray.send(Action::ToggleGlobalBypass);
                     }),

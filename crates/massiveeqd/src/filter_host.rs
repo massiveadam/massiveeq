@@ -86,9 +86,8 @@ impl FilterHost {
             if !desired.contains(&key) {
                 continue;
             }
-            let bypassed = device.bypassed || library.global_bypass;
             let (compiled, revision) =
-                match compile_runtime_profile(storage, library, device, settings, bypassed) {
+                match compile_output_state(storage, library, device, settings) {
                     Ok(value) => value,
                     Err(error) => {
                         self.errors.insert(key, error.to_string());
@@ -213,6 +212,25 @@ impl FilterHost {
     }
 }
 
+fn compile_output_state(
+    storage: &Storage,
+    library: &Library,
+    device: &DeviceInfo,
+    settings: device::GraphSettings,
+) -> Result<(CompiledProfile, u64)> {
+    if library.global_bypass {
+        let compiled =
+            compile_bypass_with_gain(settings.sample_rate, settings.quantum, device.channels, 0.0);
+        let revision = stable_hash(&format!(
+            "engine-off|{}|{}|{}",
+            settings.sample_rate, settings.quantum, device.channels
+        ));
+        Ok((compiled, revision))
+    } else {
+        compile_runtime_profile(storage, library, device, settings, device.bypassed)
+    }
+}
+
 fn device_has_runtime_profile(library: &Library, device_key: &str) -> bool {
     let comparison = library
         .comparison_sets
@@ -266,15 +284,10 @@ fn compile_runtime_profile(
     };
     let active = compile_profile(&profile, &options)?;
     let compiled = if bypassed {
-        // Keep dry comparisons at the same perceived level as the active
-        // profile. The gain is never allowed to exceed the profile's own
-        // clipping-protected output level.
-        compile_bypass_with_gain(
-            settings.sample_rate,
-            settings.quantum,
-            device.channels,
-            perceived_output_level_db(&active).min(0.0),
-        )
+        // Output A/B retains the active profile's clipping-safe perceived
+        // level and timing. This makes the switch a comparison of filters,
+        // rather than a comparison of loudness or latency.
+        compile_level_matched_bypass(&active, perceived_output_level_db(&active).min(0.0))
     } else {
         active
     };
@@ -312,16 +325,6 @@ fn compile_comparison_profile(
     let mut signature = serde_json::to_string(comparison).unwrap_or_default();
     for profile_id in &comparison.profile_ids {
         if profile_id == COMPARISON_BYPASS_ID {
-            candidates.push((
-                profile_id.clone(),
-                compile_bypass_with_gain(
-                    settings.sample_rate,
-                    settings.quantum,
-                    device.channels,
-                    0.0,
-                ),
-                0.0,
-            ));
             signature.push_str("|bypass");
             continue;
         }
@@ -346,6 +349,11 @@ fn compile_comparison_profile(
         candidates.push((profile_id.clone(), compiled, perceived));
     }
 
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "a comparison bank needs at least one processed profile"
+    );
+
     let latency = candidates
         .first()
         .map(|(_, compiled, _)| compiled.latency_frames)
@@ -367,12 +375,7 @@ fn compile_comparison_profile(
         comparison.active_profile_id.as_str()
     };
     let mut selected = if selected_id == COMPARISON_BYPASS_ID {
-        compile_bypass_with_gain(
-            settings.sample_rate,
-            settings.quantum,
-            device.channels,
-            target_level,
-        )
+        compile_level_matched_bypass(&candidates[0].1, target_level)
     } else {
         let (_, mut compiled, perceived) = candidates
             .into_iter()
@@ -381,17 +384,30 @@ fn compile_comparison_profile(
         attenuate_for_comparison(&mut compiled, target_level - perceived)?;
         compiled
     };
-    // A dry candidate is only admitted when every bank member has zero
-    // latency. Preserve the common latency for processed candidates; an
-    // explicit engine bypass still reports its true zero processing latency.
-    if selected_id != COMPARISON_BYPASS_ID {
-        selected.latency_frames = latency;
-    }
+    selected.latency_frames = latency;
     signature.push_str(&format!(
         "|active={selected_id}|bypassed={bypassed}|target={target_level:.9}|{}|{}|{}",
         settings.sample_rate, settings.quantum, device.channels
     ));
     Ok((selected, stable_hash(&signature)))
+}
+
+fn compile_level_matched_bypass(active: &CompiledProfile, gain_db: f64) -> CompiledProfile {
+    let mut dry = compile_bypass_with_gain(
+        active.sample_rate,
+        active.quantum,
+        active.output_channels,
+        gain_db,
+    );
+    for (dry_channel, active_channel) in dry.channels.iter_mut().zip(&active.channels) {
+        dry_channel.delay_frames = active_channel
+            .convolutions
+            .iter()
+            .map(|kernel| kernel.latency_frames.saturating_sub(active.quantum))
+            .sum();
+    }
+    dry.latency_frames = active.latency_frames;
+    dry
 }
 
 pub(crate) fn validate_comparison_set(
@@ -516,6 +532,129 @@ mod tests {
         assert_eq!(
             node_id_from_status_line(line, "bluez_output.AA_BB.1"),
             Some(97)
+        );
+    }
+
+    #[test]
+    fn output_ab_preserves_the_assigned_profiles_perceived_level() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = Library::default();
+        let profile = storage
+            .create_profile(&mut library, "A/B reference")
+            .unwrap();
+        storage
+            .put_profile(
+                &mut library,
+                &profile.id,
+                "A/B reference",
+                "Filter: ON LSC Fc 90 Hz Gain 8 dB Q 0.707\nFilter: ON PK Fc 3500 Hz Gain -5 dB Q 1.4",
+                0.0,
+            )
+            .unwrap();
+        let device = DeviceInfo {
+            key: DeviceKey {
+                backend: "test".into(),
+                stable_id: "headphones".into(),
+                route: "stereo".into(),
+            },
+            node_name: "test.headphones".into(),
+            description: "Headphones".into(),
+            channels: 2,
+            connected: true,
+            assigned_profile: Some(profile.id.clone()),
+            bypassed: false,
+        };
+        library
+            .assignments
+            .insert(device.key.as_storage_key(), profile.id);
+        let settings = device::GraphSettings {
+            sample_rate: 48_000,
+            quantum: 1_024,
+        };
+        let (filtered, filtered_revision) =
+            compile_runtime_profile(&storage, &library, &device, settings, false).unwrap();
+        let (dry, dry_revision) =
+            compile_runtime_profile(&storage, &library, &device, settings, true).unwrap();
+
+        assert_ne!(filtered_revision, dry_revision);
+        assert_eq!(filtered.latency_frames, dry.latency_frames);
+        assert!(
+            (perceived_output_level_db(&filtered) - perceived_output_level_db(&dry)).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn engine_off_is_true_zero_db_dry_audio() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = Library::default();
+        let profile = storage.create_profile(&mut library, "Loud EQ").unwrap();
+        storage
+            .put_profile(
+                &mut library,
+                &profile.id,
+                "Loud EQ",
+                "Filter: ON PK Fc 1000 Hz Gain 12 dB Q 1",
+                0.0,
+            )
+            .unwrap();
+        let device = DeviceInfo {
+            key: DeviceKey {
+                backend: "test".into(),
+                stable_id: "headphones".into(),
+                route: "stereo".into(),
+            },
+            node_name: "test.headphones".into(),
+            description: "Headphones".into(),
+            channels: 2,
+            connected: true,
+            assigned_profile: Some(profile.id.clone()),
+            bypassed: true,
+        };
+        library
+            .assignments
+            .insert(device.key.as_storage_key(), profile.id);
+        library.global_bypass = true;
+        let (dry, _) = compile_output_state(
+            &storage,
+            &library,
+            &device,
+            device::GraphSettings {
+                sample_rate: 48_000,
+                quantum: 1_024,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(dry.latency_frames, 0);
+        assert_eq!(perceived_output_level_db(&dry), 0.0);
+        assert!(dry.channels.iter().all(|channel| {
+            channel.gain_linear == 1.0
+                && channel.biquads.is_empty()
+                && channel.convolutions.is_empty()
+                && channel.delay_frames == 0
+        }));
+    }
+
+    #[test]
+    fn level_matched_convolution_bypass_preserves_latency_and_peak_alignment() {
+        let mut active = compile_bypass_with_gain(48_000, 128, 2, -2.0);
+        for channel in &mut active.channels {
+            channel.convolutions.push(massiveeq_dsp::ConvolutionKernel {
+                sample_rate: 48_000,
+                impulse: vec![0.0; 18],
+                latency_frames: 145,
+            });
+        }
+        active.latency_frames = 145;
+
+        let dry = compile_level_matched_bypass(&active, -2.0);
+        assert_eq!(dry.latency_frames, 145);
+        assert!(
+            dry.channels
+                .iter()
+                .all(|channel| channel.delay_frames == 17)
         );
     }
 
