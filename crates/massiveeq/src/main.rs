@@ -210,6 +210,11 @@ fn build_ui(app: &adw::Application) {
     );
     let device_drop = gtk::DropDown::new(Some(device_strings.clone()), gtk::Expression::NONE);
     device_drop.set_hexpand(true);
+    device_drop.set_size_request(1, -1);
+    device_drop.add_css_class("device-dropdown");
+    device_drop.set_factory(Some(&ellipsized_string_factory(32)));
+    device_drop.set_list_factory(Some(&ellipsized_string_factory(48)));
+    device_column.set_size_request(1, -1);
     device_column.append(&device_drop);
     let device_state = gtk::Label::new(Some("Not applied"));
     device_state.set_xalign(0.0);
@@ -401,10 +406,9 @@ fn build_ui(app: &adw::Application) {
     let switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     switcher.set_halign(gtk::Align::Center);
     switcher.add_css_class("mode-switcher");
-    switcher.add_css_class("linked");
-    let parametric_mode = gtk::ToggleButton::with_label("Parametric");
+    let parametric_mode = gtk::ToggleButton::with_label("PARAMETRIC");
     parametric_mode.set_active(true);
-    let convolution_mode = gtk::ToggleButton::with_label("Convolution");
+    let convolution_mode = gtk::ToggleButton::with_label("CONVOLUTION");
     convolution_mode.set_group(Some(&parametric_mode));
     parametric_mode.connect_clicked({
         let stack = view_stack.clone();
@@ -1630,6 +1634,36 @@ fn update_filter(
     buffer.set_text(&text);
 }
 
+fn ellipsized_string_factory(max_chars: i32) -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(move |_, object| {
+        let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let label = gtk::Label::new(None);
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_width_chars(1);
+        label.set_max_width_chars(max_chars);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_, object| {
+        let Some(item) = object.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let Some(label) = item.child().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        let Some(value) = item.item().and_downcast::<gtk::StringObject>() else {
+            return;
+        };
+        label.set_text(&value.string());
+        label.set_tooltip_text(Some(&value.string()));
+    });
+    factory
+}
+
 fn spin_field(label: &str, unit: &str, spin: &gtk::SpinButton) -> gtk::Box {
     let field = gtk::Box::new(gtk::Orientation::Vertical, 5);
     field.set_hexpand(true);
@@ -1674,6 +1708,7 @@ fn update_device_controls(
         bypass.set_active(device.bypassed);
     }
     model.syncing_device.set(false);
+    drop.set_tooltip_text(Some(&device.description));
 
     let assigned_name = device.assigned_profile.as_ref().and_then(|id| {
         model
@@ -2026,8 +2061,34 @@ fn install_css() {
 
         .mode-switcher button {
             min-width: 130px;
+            min-height: 28px;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            border-radius: 0;
+            box-shadow: none;
+            color: #858a8b;
             font-family: monospace;
             font-size: 11px;
+            font-weight: 700;
+            padding: 5px 12px 7px 12px;
+        }
+
+        .mode-switcher button:hover {
+            background: transparent;
+            color: #c6c9c8;
+        }
+
+        .mode-switcher button:checked {
+            background: transparent;
+            border-bottom-color: #e64b2f;
+            box-shadow: none;
+            color: #ecece8;
+        }
+
+        .device-dropdown,
+        .device-dropdown > button {
+            min-width: 0;
         }
 
         .console-status {
