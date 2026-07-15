@@ -139,6 +139,10 @@ fn build_ui(app: &adw::Application) {
     profile_menu.set_popover(Some(&profile_popover));
     profile_menu.add_css_class("profile-menu");
     header.pack_start(&profile_menu);
+    let header_add_profile = gtk::Button::with_label("+ NEW PROFILE");
+    header_add_profile.add_css_class("profile-add");
+    header_add_profile.set_tooltip_text(Some("Create and select a new profile"));
+    header.pack_start(&header_add_profile);
 
     let global_bypass = gtk::Switch::new();
     global_bypass.set_valign(gtk::Align::Center);
@@ -394,11 +398,39 @@ fn build_ui(app: &adw::Application) {
     let text_view = gtk::TextView::new();
     text_view.set_monospace(true);
     text_view.set_wrap_mode(gtk::WrapMode::None);
-    let switcher = adw::ViewSwitcher::new();
-    switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
-    switcher.set_stack(Some(&view_stack));
+    let switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     switcher.set_halign(gtk::Align::Center);
     switcher.add_css_class("mode-switcher");
+    switcher.add_css_class("linked");
+    let parametric_mode = gtk::ToggleButton::with_label("Parametric");
+    parametric_mode.set_active(true);
+    let convolution_mode = gtk::ToggleButton::with_label("Convolution");
+    convolution_mode.set_group(Some(&parametric_mode));
+    parametric_mode.connect_clicked({
+        let stack = view_stack.clone();
+        move |button| {
+            button.set_active(true);
+            stack.set_visible_child_name("filters");
+        }
+    });
+    convolution_mode.connect_clicked({
+        let stack = view_stack.clone();
+        move |button| {
+            button.set_active(true);
+            stack.set_visible_child_name("convolution");
+        }
+    });
+    view_stack.connect_visible_child_name_notify({
+        let parametric_mode = parametric_mode.clone();
+        let convolution_mode = convolution_mode.clone();
+        move |stack| {
+            let convolution = stack.visible_child_name().as_deref() == Some("convolution");
+            parametric_mode.set_active(!convolution);
+            convolution_mode.set_active(convolution);
+        }
+    });
+    switcher.append(&parametric_mode);
+    switcher.append(&convolution_mode);
     let reset_filters_button = gtk::Button::with_label("RESET FILTERS");
     reset_filters_button.add_css_class("reset-filters");
     reset_filters_button.set_tooltip_text(Some(
@@ -476,6 +508,7 @@ fn build_ui(app: &adw::Application) {
         &device_drop,
         &device_state,
         &add_button,
+        &header_add_profile,
         &add_filter_button,
         &reset_filters_button,
         &convolution_ui,
@@ -551,6 +584,7 @@ fn wire_actions(
     device_drop: &gtk::DropDown,
     device_state: &gtk::Label,
     add: &gtk::Button,
+    header_add_profile: &gtk::Button,
     add_filter: &gtk::Button,
     reset_filters: &gtk::Button,
     convolution_ui: &ConvolutionUi,
@@ -874,18 +908,28 @@ fn wire_actions(
         }
     });
 
-    add.connect_clicked({
-        let model = model.clone();
-        let list = profile_list.clone();
-        move |_| {
-            if model.client.create("Untitled Profile").is_ok() {
-                refresh_profiles(&model, &list);
-                if let Some(row) = list.row_at_index((model.profiles.borrow().len() - 1) as i32) {
-                    list.select_row(Some(&row));
+    for button in [add, header_add_profile] {
+        button.connect_clicked({
+            let model = model.clone();
+            let list = profile_list.clone();
+            let status = status.clone();
+            move |_| match model.client.create("Untitled Profile") {
+                Ok(created) => {
+                    refresh_profiles(&model, &list);
+                    let index = model
+                        .profiles
+                        .borrow()
+                        .iter()
+                        .position(|profile| profile.id == created.id);
+                    if let Some(row) = index.and_then(|index| list.row_at_index(index as i32)) {
+                        list.select_row(Some(&row));
+                    }
+                    status.set_text("New profile created");
                 }
+                Err(error) => status.set_text(&error.to_string()),
             }
-        }
-    });
+        });
+    }
     delete.connect_clicked({
         let model = model.clone();
         let list = profile_list.clone();
@@ -1794,6 +1838,14 @@ fn install_css() {
             font-weight: 700;
             min-width: 150px;
             padding: 7px 16px;
+        }
+
+        .profile-add {
+            border-radius: 999px;
+            font-family: monospace;
+            font-size: 9px;
+            font-weight: 700;
+            padding: 7px 12px;
         }
 
         .profile-name {
