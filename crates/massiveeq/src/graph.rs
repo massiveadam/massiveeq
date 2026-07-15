@@ -1,5 +1,7 @@
 use gtk4::{DrawingArea, cairo, prelude::*};
-use massiveeq_core::{ChannelSelection, ProfileAnalysis, ProfileDocument, analysis::ResponsePoint};
+use massiveeq_core::{
+    ChannelSelection, Filter, ProfileAnalysis, ProfileDocument, analysis::ResponsePoint,
+};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -11,6 +13,19 @@ const TOP: f64 = 34.0;
 const BOTTOM: f64 = 42.0;
 const MIN_DB: f64 = -10.0;
 const MAX_DB: f64 = 10.0;
+const MIN_FREQUENCY: f64 = 20.0;
+const MAX_FREQUENCY: f64 = 20_000.0;
+const FINE_FREQUENCY_OCTAVES: f64 = 1.0 / 48.0;
+const COARSE_FREQUENCY_OCTAVES: f64 = 1.0 / 6.0;
+const Q_STEP_FACTOR: f64 = 1.1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NudgeDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
 
 pub fn response_graph(
     analysis: Rc<RefCell<Option<ProfileAnalysis>>>,
@@ -244,7 +259,7 @@ fn draw_filter_points(
         let _ = cr.show_text(&label);
 
         if is_selected {
-            let text = format_frequency_gain(filter.frequency, filter.gain_db);
+            let text = format_filter_readout(filter);
             cr.select_font_face(
                 "Monospace",
                 cairo::FontSlant::Normal,
@@ -347,6 +362,49 @@ pub fn gain_after_drag(start_gain: f64, delta_y: f64, height: f64) -> f64 {
     (start_gain - delta_y / plot_height * (MAX_DB - MIN_DB)).clamp(MIN_DB, MAX_DB)
 }
 
+pub fn values_at_position(x: f64, y: f64, width: f64, height: f64) -> Option<(f64, f64)> {
+    let (plot_width, plot_height) = plot_size(width, height);
+    if x < LEFT || x > LEFT + plot_width || y < TOP || y > TOP + plot_height {
+        return None;
+    }
+    let frequency_position = ((x - LEFT) / plot_width).clamp(0.0, 1.0);
+    let frequency = MIN_FREQUENCY * (MAX_FREQUENCY / MIN_FREQUENCY).powf(frequency_position);
+    let gain_position = ((y - TOP) / plot_height).clamp(0.0, 1.0);
+    let gain = MAX_DB - gain_position * (MAX_DB - MIN_DB);
+    Some((frequency, gain))
+}
+
+pub fn nudge_filter(filter: &mut Filter, direction: NudgeDirection, shifted: bool) {
+    match (direction, shifted) {
+        (NudgeDirection::Up, false) => {
+            filter.gain_db = (filter.gain_db + 0.1).clamp(MIN_DB, MAX_DB);
+        }
+        (NudgeDirection::Down, false) => {
+            filter.gain_db = (filter.gain_db - 0.1).clamp(MIN_DB, MAX_DB);
+        }
+        (NudgeDirection::Up, true) => {
+            filter.q = (filter.q * Q_STEP_FACTOR).clamp(0.01, 1_000.0);
+        }
+        (NudgeDirection::Down, true) => {
+            filter.q = (filter.q / Q_STEP_FACTOR).clamp(0.01, 1_000.0);
+        }
+        (NudgeDirection::Left, shifted) | (NudgeDirection::Right, shifted) => {
+            let octaves = if shifted {
+                COARSE_FREQUENCY_OCTAVES
+            } else {
+                FINE_FREQUENCY_OCTAVES
+            };
+            let direction = if matches!(direction, NudgeDirection::Left) {
+                -1.0
+            } else {
+                1.0
+            };
+            filter.frequency = (filter.frequency * 2.0_f64.powf(direction * octaves))
+                .clamp(MIN_FREQUENCY, MAX_FREQUENCY);
+        }
+    }
+}
+
 fn plot_size(width: f64, height: f64) -> (f64, f64) {
     (
         (width - LEFT - RIGHT).max(1.0),
@@ -379,13 +437,13 @@ fn frequency_label(frequency: f64) -> &'static str {
     }
 }
 
-fn format_frequency_gain(frequency: f64, gain: f64) -> String {
-    let frequency = if frequency >= 1000.0 {
-        format!("{:.2} kHz", frequency / 1000.0)
+fn format_filter_readout(filter: &Filter) -> String {
+    let frequency = if filter.frequency >= 1000.0 {
+        format!("{:.2} kHz", filter.frequency / 1000.0)
     } else {
-        format!("{frequency:.0} Hz")
+        format!("{:.0} Hz", filter.frequency)
     };
-    format!("{frequency}  {gain:+.1} dB")
+    format!("{frequency}  {:+.1} dB  Q {:.2}", filter.gain_db, filter.q)
 }
 
 #[cfg(test)]
@@ -411,5 +469,42 @@ mod tests {
         );
         assert_eq!(gain_after_drag(0.0, -plot_height / 2.0, height), 10.0);
         assert_eq!(gain_after_drag(0.0, plot_height / 2.0, height), -10.0);
+    }
+
+    #[test]
+    fn graph_coordinates_round_trip_to_frequency_and_gain() {
+        let width = 1_000.0;
+        let height = 500.0;
+        for (frequency, gain) in [(20.0, 10.0), (632.455_532, 0.0), (20_000.0, -10.0)] {
+            let (x, y) = point_position(frequency, gain, width, height);
+            let (actual_frequency, actual_gain) =
+                values_at_position(x, y, width, height).expect("point should be inside graph");
+            assert!((actual_frequency - frequency).abs() < 0.001);
+            assert!((actual_gain - gain).abs() < 0.001);
+        }
+        assert!(values_at_position(0.0, 0.0, width, height).is_none());
+    }
+
+    #[test]
+    fn keyboard_nudges_gain_frequency_and_q() {
+        let mut filter = Filter {
+            enabled: true,
+            kind: massiveeq_core::FilterKind::Peaking,
+            frequency: 1_000.0,
+            gain_db: 0.0,
+            q: 1.0,
+            channels: ChannelSelection::All,
+        };
+
+        nudge_filter(&mut filter, NudgeDirection::Up, false);
+        assert!((filter.gain_db - 0.1).abs() < f64::EPSILON);
+        nudge_filter(&mut filter, NudgeDirection::Right, false);
+        let fine_frequency = filter.frequency;
+        nudge_filter(&mut filter, NudgeDirection::Right, true);
+        assert!(filter.frequency / fine_frequency > 1.1);
+        nudge_filter(&mut filter, NudgeDirection::Up, true);
+        assert!((filter.q - 1.1).abs() < f64::EPSILON);
+        nudge_filter(&mut filter, NudgeDirection::Down, true);
+        assert!((filter.q - 1.0).abs() < 0.000_001);
     }
 }

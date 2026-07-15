@@ -6,8 +6,8 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use massiveeq_core::{
     COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
-    MAX_COMPARISON_PROFILES, ProfileAnalysis, ProfileDocument, ProfileInfo,
-    analyze_profile_preview, parse_text, serialize_profile,
+    MAX_COMPARISON_PROFILES, MAX_FILTERS_PER_CHANNEL, ProfileAnalysis, ProfileDocument,
+    ProfileInfo, analyze_profile_preview, parse_text, serialize_profile,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -417,7 +417,9 @@ fn build_ui(app: &adw::Application) {
     graph_header.append(&graph_title);
     let graph_hint = gtk::Label::new(Some(&engine_summary(&engine_status)));
     graph_hint.add_css_class("level-code");
-    graph_hint.set_tooltip_text(Some("Drag response points to edit parametric filters"));
+    graph_hint.set_tooltip_text(Some(
+        "Click empty graph space to add a band, drag points to edit, or use arrows on the selected point",
+    ));
     graph_header.append(&graph_hint);
     graph_card.append(&graph_header);
     let graph = graph::response_graph(
@@ -425,10 +427,17 @@ fn build_ui(app: &adw::Application) {
         model.document.clone(),
         model.selected_filter.clone(),
     );
+    graph.set_focusable(true);
+    graph.set_focus_on_click(true);
+    graph.set_accessible_role(gtk::AccessibleRole::Group);
+    graph.add_css_class("response-graph");
+    graph.set_tooltip_text(Some(
+        "Click an empty position to add a peak filter. Arrows edit gain and frequency; Shift+Up/Down edits Q; Shift+Left/Right moves frequency farther.",
+    ));
     graph.update_property(&[
         gtk::accessible::Property::Label("Frequency response graph"),
         gtk::accessible::Property::Description(
-            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Use the filter controls below for keyboard editing.",
+            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Click empty graph space to add a filter. Use arrow keys to edit the selected filter; hold Shift for Q or larger frequency steps.",
         ),
     ]);
     let analysis_label = gtk::Label::new(Some("AUTO PREAMP —"));
@@ -889,6 +898,7 @@ fn wire_actions(
         let buffer = buffer.clone();
         let list = filter_list.clone();
         let graph = graph.clone();
+        let status = status.clone();
         let convolution_ui = convolution_ui.clone();
         move |_| {
             let (text, snapshot) = {
@@ -896,6 +906,10 @@ fn wire_actions(
                 let Some(document) = document.as_mut() else {
                     return;
                 };
+                if !can_add_filter(document, ChannelSelection::All) {
+                    status.set_text("This profile already has 64 bands on one channel");
+                    return;
+                }
                 document.convolutions.clear();
                 document.graphic_eqs.clear();
                 document.filters.push(Filter {
@@ -1637,7 +1651,10 @@ fn wire_actions(
         let model = model.clone();
         let state = drag_state.clone();
         let graph = graph.clone();
+        let status = status.clone();
+        let analysis_label = analysis_label.clone();
         move |_, x, y| {
+            graph.grab_focus();
             let Some(document) = model.document.borrow().as_ref().cloned() else {
                 return;
             };
@@ -1664,8 +1681,54 @@ fn wire_actions(
                     *state.borrow_mut() = Some((index, filter.frequency, filter.gain_db));
                     model.selected_filter.set(Some(index));
                     graph.queue_draw();
+                    return;
                 }
             }
+
+            let Some((frequency, gain_db)) = graph::values_at_position(x, y, width, height) else {
+                return;
+            };
+            let (index, preview) = {
+                let mut document = model.document.borrow_mut();
+                let Some(document) = document.as_mut() else {
+                    return;
+                };
+                if !document.convolutions.is_empty() {
+                    status.set_text(
+                        "Convolution is active · remove the impulse response before adding a band",
+                    );
+                    return;
+                }
+                if !can_add_filter(document, ChannelSelection::All) {
+                    status.set_text("This profile already has 64 bands on one channel");
+                    return;
+                }
+                document.graphic_eqs.clear();
+                document.filters.push(Filter {
+                    enabled: true,
+                    kind: FilterKind::Peaking,
+                    frequency,
+                    gain_db,
+                    q: 1.0,
+                    channels: ChannelSelection::All,
+                });
+                let index = document.filters.len() - 1;
+                let preview = analyze_profile_preview(
+                    document,
+                    model.sample_rate.get(),
+                    model.manual_trim.get(),
+                );
+                (index, preview)
+            };
+            *state.borrow_mut() = Some((index, frequency, gain_db));
+            model.selected_filter.set(Some(index));
+            set_analysis_label(&analysis_label, &preview);
+            *model.analysis.borrow_mut() = Some(preview);
+            status.set_text(&format!(
+                "Added peak filter at {}",
+                format_band_frequency(frequency)
+            ));
+            graph.queue_draw();
         }
     });
     gesture.connect_drag_update({
@@ -1717,6 +1780,50 @@ fn wire_actions(
         }
     });
     graph.add_controller(gesture);
+
+    let keyboard = gtk::EventControllerKey::new();
+    keyboard.connect_key_pressed({
+        let model = model.clone();
+        let buffer = buffer.clone();
+        let graph = graph.clone();
+        let status = status.clone();
+        move |_, key, _, modifiers| {
+            if modifiers
+                .intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK)
+            {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let direction = match key {
+                gtk::gdk::Key::Up => graph::NudgeDirection::Up,
+                gtk::gdk::Key::Down => graph::NudgeDirection::Down,
+                gtk::gdk::Key::Left => graph::NudgeDirection::Left,
+                gtk::gdk::Key::Right => graph::NudgeDirection::Right,
+                _ => return gtk::glib::Propagation::Proceed,
+            };
+            let Some(index) = model.selected_filter.get() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let shifted = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            update_filter(&model, &buffer, &graph, index, |filter| {
+                graph::nudge_filter(filter, direction, shifted);
+            });
+            if let Some(filter) = model
+                .document
+                .borrow()
+                .as_ref()
+                .and_then(|document| document.filters.get(index))
+            {
+                status.set_text(&format!(
+                    "{} · {:+.1} dB · Q {:.3}",
+                    format_band_frequency(filter.frequency),
+                    filter.gain_db,
+                    filter.q
+                ));
+            }
+            gtk::glib::Propagation::Stop
+        }
+    });
+    graph.add_controller(keyboard);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1940,6 +2047,7 @@ fn rebuild_filter_list(
             move |button| {
                 if button.is_active() {
                     model.selected_filter.set(Some(index));
+                    graph.grab_focus();
                     graph.queue_draw();
                 }
             }
@@ -2146,6 +2254,33 @@ fn update_filter(
     *model.analysis.borrow_mut() = Some(preview);
     graph.queue_draw();
     buffer.set_text(&text);
+}
+
+fn can_add_filter(document: &ProfileDocument, channels: ChannelSelection) -> bool {
+    let left_bands = document
+        .filters
+        .iter()
+        .filter(|filter| {
+            matches!(
+                filter.channels,
+                ChannelSelection::All | ChannelSelection::Left
+            )
+        })
+        .count();
+    let right_bands = document
+        .filters
+        .iter()
+        .filter(|filter| {
+            matches!(
+                filter.channels,
+                ChannelSelection::All | ChannelSelection::Right
+            )
+        })
+        .count();
+    (!matches!(channels, ChannelSelection::All | ChannelSelection::Left)
+        || left_bands < MAX_FILTERS_PER_CHANNEL)
+        && (!matches!(channels, ChannelSelection::All | ChannelSelection::Right)
+            || right_bands < MAX_FILTERS_PER_CHANNEL)
 }
 
 fn ellipsized_string_factory(max_chars: i32) -> gtk::SignalListItemFactory {
@@ -3201,7 +3336,10 @@ fn show_startup_error(app: &adw::Application, message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingDeviceBypass, displayed_device_bypass};
+    use super::{
+        ChannelSelection, Filter, FilterKind, PendingDeviceBypass, ProfileDocument, can_add_filter,
+        displayed_device_bypass,
+    };
 
     #[test]
     fn pending_filter_toggle_wins_over_stale_service_poll() {
@@ -3229,5 +3367,24 @@ mod tests {
             false,
             Some(&pending)
         ));
+    }
+
+    #[test]
+    fn graph_add_respects_the_per_channel_band_limit() {
+        let mut document = ProfileDocument::empty("limit");
+        document.filters = (0..64)
+            .map(|_| Filter {
+                enabled: true,
+                kind: FilterKind::Peaking,
+                frequency: 1_000.0,
+                gain_db: 0.0,
+                q: 1.0,
+                channels: ChannelSelection::Left,
+            })
+            .collect();
+
+        assert!(!can_add_filter(&document, ChannelSelection::All));
+        assert!(!can_add_filter(&document, ChannelSelection::Left));
+        assert!(can_add_filter(&document, ChannelSelection::Right));
     }
 }
