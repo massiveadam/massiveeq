@@ -1079,6 +1079,11 @@ fn wire_actions(
             let Some(document) = model.document.borrow().as_ref().cloned() else {
                 return;
             };
+            let effective_gain = model
+                .analysis
+                .borrow()
+                .as_ref()
+                .map_or(0.0, |analysis| analysis.effective_gain_db);
             let width = graph.width().max(1) as f64;
             let height = graph.height().max(1) as f64;
             let closest = document
@@ -1087,15 +1092,32 @@ fn wire_actions(
                 .enumerate()
                 .filter(|(_, filter)| filter.enabled)
                 .min_by(|(_, a), (_, b)| {
-                    let (ax, ay) = graph::point_position(a.frequency, a.gain_db, width, height);
-                    let (bx, by) = graph::point_position(b.frequency, b.gain_db, width, height);
+                    let (ax, ay) = graph::filter_point_position(
+                        a.frequency,
+                        a.gain_db,
+                        effective_gain,
+                        width,
+                        height,
+                    );
+                    let (bx, by) = graph::filter_point_position(
+                        b.frequency,
+                        b.gain_db,
+                        effective_gain,
+                        width,
+                        height,
+                    );
                     let da = ((ax - x).powi(2) + (ay - y).powi(2)).sqrt();
                     let db = ((bx - x).powi(2) + (by - y).powi(2)).sqrt();
                     da.total_cmp(&db)
                 });
             if let Some((index, filter)) = closest {
-                let (point_x, point_y) =
-                    graph::point_position(filter.frequency, filter.gain_db, width, height);
+                let (point_x, point_y) = graph::filter_point_position(
+                    filter.frequency,
+                    filter.gain_db,
+                    effective_gain,
+                    width,
+                    height,
+                );
                 if ((point_x - x).powi(2) + (point_y - y).powi(2)).sqrt() <= 34.0 {
                     *state.borrow_mut() = Some((index, filter.frequency, filter.gain_db));
                     model.selected_filter.set(Some(index));
