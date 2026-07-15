@@ -1,6 +1,6 @@
 pkgbase = massiveeq-git
 	pkgdesc = Device-aware systemwide equalizer for PipeWire and Wayland desktops
-	pkgver = 0.2.0
+	pkgver = 0.2.0.r0.g7ea32e5
 	pkgrel = 1
 	url = https://github.com/massiveadam/massiveeq
 	arch = x86_64

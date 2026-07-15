@@ -1,5 +1,9 @@
 /target/
+/.makepkg/
+/src/
+/pkg/
+/massiveeq-git/
+/*.pkg.tar*
 /.cache/
 *.swp
 *~
-

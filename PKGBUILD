@@ -1,5 +1,5 @@
 pkgname=massiveeq-git
-pkgver=0.2.0
+pkgver=0.2.0.r0.g7ea32e5
 pkgrel=1
 pkgdesc='Device-aware systemwide equalizer for PipeWire and Wayland desktops'
 arch=('x86_64')
