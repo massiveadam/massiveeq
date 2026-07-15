@@ -1,7 +1,7 @@
 # AUR release preparation
 
 The repository root `PKGBUILD` defines the rolling `massiveeq-git` package.
-MassiveEQ 0.3.0-beta.1 is a public beta. The package description and upstream README
+MassiveEQ 0.3.0-beta.2 is a public beta. The package description and upstream README
 must retain that designation until the project is declared stable.
 
 Before every AUR push:
