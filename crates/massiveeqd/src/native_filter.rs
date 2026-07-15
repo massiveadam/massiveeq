@@ -268,17 +268,19 @@ fn run_filter_pair(
 
         let playback_stats = stats.clone();
         let _playback_listener = playback
-            .add_local_listener_with_user_data(())
-            .process(move |stream, _| {
+            .add_local_listener_with_user_data(0_u64)
+            .process(move |stream, last_capture_call| {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
                 };
+                let requested_frames = buffer.requested() as usize;
                 let Some(data) = buffer.datas_mut().first_mut() else {
                     playback_stats
                         .invalid_buffers
                         .fetch_add(1, Ordering::Relaxed);
                     return;
                 };
+                let stride = mem::size_of::<f32>() * channels;
                 let byte_len = {
                     let Some(bytes) = data.data() else {
                         playback_stats
@@ -286,27 +288,41 @@ fn run_filter_pair(
                             .fetch_add(1, Ordering::Relaxed);
                         return;
                     };
-                    let byte_len = bytes.len();
-                    let Ok(samples) = bytemuck::try_cast_slice_mut::<u8, f32>(bytes) else {
+                    let byte_len = if requested_frames == 0 {
+                        bytes.len()
+                    } else {
+                        requested_frames.saturating_mul(stride).min(bytes.len())
+                    };
+                    let Ok(samples) =
+                        bytemuck::try_cast_slice_mut::<u8, f32>(&mut bytes[..byte_len])
+                    else {
                         playback_stats
                             .invalid_buffers
                             .fetch_add(1, Ordering::Relaxed);
                         return;
                     };
+                    let capture_call = playback_stats.process_calls.load(Ordering::Acquire);
+                    // A passive output can be scheduled while its sink is idle.
+                    // Silence in that state is intentional, not an audio XRUN.
+                    // Count missing samples only when fresh captured audio was
+                    // expected in this playback cycle.
+                    let fresh_input = capture_call != *last_capture_call;
                     for sample in samples.iter_mut() {
                         *sample = match audio_consumer.pop() {
                             Ok(value) => value,
                             Err(_) => {
-                                playback_stats
-                                    .output_underflows
-                                    .fetch_add(1, Ordering::Relaxed);
+                                if fresh_input {
+                                    playback_stats
+                                        .output_underflows
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                                 0.0
                             }
                         };
                     }
+                    *last_capture_call = capture_call;
                     byte_len
                 };
-                let stride = mem::size_of::<f32>() * channels;
                 let chunk = data.chunk_mut();
                 *chunk.offset_mut() = 0;
                 *chunk.stride_mut() = stride as i32;
