@@ -30,7 +30,14 @@ struct Model {
     sample_rate: Cell<f64>,
     loading: Cell<bool>,
     syncing_device: Cell<bool>,
+    pending_device_bypass: RefCell<Option<PendingDeviceBypass>>,
     syncing_engine: Cell<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingDeviceBypass {
+    device_key: String,
+    bypassed: bool,
 }
 
 #[derive(Clone)]
@@ -124,6 +131,7 @@ fn build_ui(app: &adw::Application) {
         sample_rate: Cell::new(active_sample_rate),
         loading: Cell::new(false),
         syncing_device: Cell::new(false),
+        pending_device_bypass: RefCell::new(None),
         syncing_engine: Cell::new(false),
     });
 
@@ -1534,7 +1542,7 @@ fn wire_actions(
         let assign = assign.clone();
         let status = status.clone();
         move |switch| {
-            if model.syncing_device.get() {
+            if model.syncing_device.get() || model.pending_device_bypass.borrow().is_some() {
                 return;
             }
             let device = {
@@ -1542,18 +1550,43 @@ fn wire_actions(
                 devices.get(drop.selected() as usize).cloned()
             };
             if let Some(device) = device {
-                match model
-                    .client
-                    .set_device_bypass(&device.key.as_storage_key(), !switch.is_active())
-                {
-                    Ok(()) => {
-                        if let Ok(devices) = model.client.devices() {
-                            *model.devices.borrow_mut() = devices;
+                let device_key = device.key.as_storage_key();
+                let bypassed = !switch.is_active();
+                *model.pending_device_bypass.borrow_mut() = Some(PendingDeviceBypass {
+                    device_key: device_key.clone(),
+                    bypassed,
+                });
+                state.set_text(if bypassed {
+                    "Turning filters off…"
+                } else {
+                    "Turning filters on…"
+                });
+                switch.set_sensitive(false);
+
+                // Let GTK paint the thumb at its requested position before
+                // making the synchronous service call. The pending state also
+                // prevents the health poll from repainting the old value while
+                // this transition is being committed.
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(40), {
+                    let model = model.clone();
+                    let drop = drop.clone();
+                    let state = state.clone();
+                    let assign = assign.clone();
+                    let status = status.clone();
+                    let switch = switch.clone();
+                    move || {
+                        match model.client.set_device_bypass(&device_key, bypassed) {
+                            Ok(()) => {
+                                if let Ok(devices) = model.client.devices() {
+                                    *model.devices.borrow_mut() = devices;
+                                }
+                            }
+                            Err(error) => status.set_text(&error.to_string()),
                         }
+                        *model.pending_device_bypass.borrow_mut() = None;
+                        update_device_controls(&model, &drop, &state, &assign, &switch);
                     }
-                    Err(error) => status.set_text(&error.to_string()),
-                }
-                update_device_controls(&model, &drop, &state, &assign, switch);
+                });
             }
         }
     });
@@ -1916,9 +1949,20 @@ fn rebuild_filter_list(
             let buffer = buffer.clone();
             let graph = graph.clone();
             move |switch| {
-                update_filter(&model, &buffer, &graph, index, |filter| {
-                    filter.enabled = switch.is_active()
-                })
+                let enabled = switch.is_active();
+                // Response analysis and text serialization can be noticeable
+                // for a large bank. Defer them until after GTK has painted the
+                // switch, just like the output-level Filters control.
+                gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(40), {
+                    let model = model.clone();
+                    let buffer = buffer.clone();
+                    let graph = graph.clone();
+                    move || {
+                        update_filter(&model, &buffer, &graph, index, |filter| {
+                            filter.enabled = enabled
+                        });
+                    }
+                });
             }
         });
         kind_drop.connect_selected_notify({
@@ -2499,8 +2543,15 @@ fn update_device_controls(
         return;
     };
 
+    let device_key = device.key.as_storage_key();
+    let pending_bypass = model.pending_device_bypass.borrow();
+    let pending_bypassed = pending_bypass
+        .as_ref()
+        .filter(|pending| pending.device_key == device_key);
+    let displayed_bypassed =
+        displayed_device_bypass(&device_key, device.bypassed, pending_bypass.as_ref());
     model.syncing_device.set(true);
-    let filters_active = !device.bypassed;
+    let filters_active = !displayed_bypassed;
     if bypass.is_active() != filters_active {
         bypass.set_active(filters_active);
     }
@@ -2541,7 +2592,7 @@ fn update_device_controls(
         assign.set_sensitive(false);
     } else if let Some(comparison) = comparison {
         let active_name = comparison_candidate_name(model, &comparison.active_profile_id);
-        state.set_text(&if device.bypassed {
+        state.set_text(&if displayed_bypassed {
             format!("Filters off · level matched to {active_name}")
         } else if comparison.active_profile_id == COMPARISON_BYPASS_ID {
             format!("Comparing · {active_name}")
@@ -2550,7 +2601,7 @@ fn update_device_controls(
         });
         assign.set_label("Set selected as normal profile");
         assign.set_sensitive(model.current_id.borrow().is_some());
-    } else if device.bypassed {
+    } else if displayed_bypassed {
         state.set_text(&match assigned_name {
             Some(name) => format!("Filters off · level matched to {name}"),
             None => "Not applied · filters unavailable".to_owned(),
@@ -2575,7 +2626,20 @@ fn update_device_controls(
         assign.set_sensitive(model.current_id.borrow().is_some());
     }
 
-    bypass.set_sensitive(has_ab_source && matches!(device.channels, 1 | 2));
+    bypass.set_sensitive(
+        pending_bypassed.is_none() && has_ab_source && matches!(device.channels, 1 | 2),
+    );
+}
+
+fn displayed_device_bypass(
+    device_key: &str,
+    service_bypassed: bool,
+    pending: Option<&PendingDeviceBypass>,
+) -> bool {
+    pending
+        .filter(|pending| pending.device_key == device_key)
+        .map(|pending| pending.bypassed)
+        .unwrap_or(service_bypassed)
 }
 
 fn engine_summary(status: &serde_json::Value) -> String {
@@ -3133,4 +3197,37 @@ fn show_startup_error(app: &adw::Application, message: &str) {
         .build();
     window.set_content(Some(&status));
     window.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PendingDeviceBypass, displayed_device_bypass};
+
+    #[test]
+    fn pending_filter_toggle_wins_over_stale_service_poll() {
+        let pending = PendingDeviceBypass {
+            device_key: "selected-output".into(),
+            bypassed: true,
+        };
+
+        assert!(displayed_device_bypass(
+            "selected-output",
+            false,
+            Some(&pending)
+        ));
+    }
+
+    #[test]
+    fn pending_filter_toggle_does_not_leak_to_another_output() {
+        let pending = PendingDeviceBypass {
+            device_key: "other-output".into(),
+            bypassed: true,
+        };
+
+        assert!(!displayed_device_bypass(
+            "selected-output",
+            false,
+            Some(&pending)
+        ));
+    }
 }
