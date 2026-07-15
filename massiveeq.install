@@ -2,7 +2,7 @@ post_install() {
   printf '%s\n' \
     'MassiveEQ is installed.' \
     'Launch MassiveEQ from the application menu, or enable its login service with:' \
-    '  systemctl --user enable --now massiveeq.service'
+    '  systemctl --user enable --now massiveeq.service massiveeq-tray.service'
 }
 
 post_upgrade() {
@@ -12,5 +12,5 @@ post_upgrade() {
 post_remove() {
   printf '%s\n' \
     'If the user service is still loaded, disable it with:' \
-    '  systemctl --user disable --now massiveeq.service'
+    '  systemctl --user disable --now massiveeq.service massiveeq-tray.service'
 }

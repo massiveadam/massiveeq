@@ -16,6 +16,7 @@ The current beta has been validated on:
 - Arch Linux x86_64 with the niri Wayland compositor
 - PipeWire 1.6.8, WirePlumber 0.5.15, GTK 4.22.4, and libadwaita 1.9.2
 - Apple AirPods over Bluetooth A2DP and a built-in analog stereo output
+- Noctalia/Quickshell StatusNotifier tray registration and live menu state
 - PipeWire hotplug/reconnect, simultaneous outputs, service restart/fail-open,
   live filter edits, bypass, and device assignment restoration
 - Automated DSP reference tests at 44.1, 48, 96, and 192 kHz
@@ -29,11 +30,13 @@ should therefore be treated as a public beta, not a production-stable release.
 - Squiglink, AutoEQ, and common Equalizer APO text profile import
 - Parametric EQ, per-ear filters, GraphicEQ, preamp, includes, and convolution
 - Automatic profile assignment using stable Bluetooth and ALSA identifiers
+- Unlimited saved profiles with per-output assignment or an explicit unassigned state
 - Multiple simultaneous output devices, bypass, headroom, and level analysis
 - Native 32-bit floating-point DSP with allocation-free live processing
 - Eight-millisecond click-safe chain changes without removing the audio endpoint
 - Rate-aware compilation, high-quality IR resampling, and reported latency
 - Wayland-native GTK4 interface and systemd user service
+- Optional StatusNotifier tray controls for Noctalia, Waybar, KDE Plasma, and other compatible bars
 
 ## Build
 
@@ -48,8 +51,12 @@ files under `packaging/` or build the included `PKGBUILD`.
 After a package install, open MassiveEQ once or enable the service directly:
 
 ```sh
-systemctl --user enable --now massiveeq.service
+systemctl --user enable --now massiveeq.service massiveeq-tray.service
 ```
+
+The tray companion shows the active profile for each output, switches or
+unassigns profiles, controls per-output/global bypass, and opens the full
+editor. It is a separate process, so stopping it never changes audio routing.
 
 Profiles live in `~/.local/share/massiveeq/profiles/`; assignments and manual
 trims live in `~/.config/massiveeq/state.json`. Unassigned and unsupported

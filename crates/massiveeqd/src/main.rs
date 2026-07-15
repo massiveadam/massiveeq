@@ -25,7 +25,11 @@ pub struct AppState {
 }
 
 pub async fn refresh_locked(state: &mut AppState, force_restart: bool) -> Result<()> {
-    let devices = device::discover(&state.library).await?;
+    let remembered_before = state.library.remembered_devices.clone();
+    let devices = device::discover(&mut state.library).await?;
+    if state.library.remembered_devices != remembered_before {
+        state.storage.save_library(&state.library)?;
+    }
     state
         .host
         .reconcile(&state.storage, &state.library, &devices, force_restart)

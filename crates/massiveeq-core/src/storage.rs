@@ -1,6 +1,6 @@
 use crate::{
-    ChannelSelection, Convolution, ProfileDocument, ProfileInfo, parse_file, parse_text,
-    serialize_profile,
+    ChannelSelection, Convolution, ProfileDocument, ProfileInfo, RememberedDevice, parse_file,
+    parse_text, serialize_profile,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -45,16 +45,19 @@ pub struct Library {
     #[serde(default)]
     pub bypassed_devices: HashSet<String>,
     #[serde(default)]
+    pub remembered_devices: HashMap<String, RememberedDevice>,
+    #[serde(default)]
     pub global_bypass: bool,
 }
 
 impl Default for Library {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             profiles: BTreeMap::new(),
             assignments: HashMap::new(),
             bypassed_devices: HashSet::new(),
+            remembered_devices: HashMap::new(),
             global_bypass: false,
         }
     }
@@ -94,7 +97,9 @@ impl Storage {
         if !self.state_path.exists() {
             return Ok(Library::default());
         }
-        Ok(serde_json::from_slice(&fs::read(&self.state_path)?)?)
+        let mut library: Library = serde_json::from_slice(&fs::read(&self.state_path)?)?;
+        library.schema_version = 2;
+        Ok(library)
     }
 
     pub fn save_library(&self, library: &Library) -> Result<(), StorageError> {
@@ -493,6 +498,22 @@ mod tests {
             .unwrap();
         assert!(updated.text.contains("1000"));
         assert_eq!(storage.load_library().unwrap().profiles.len(), 1);
+    }
+
+    #[test]
+    fn older_state_migrates_with_an_empty_remembered_device_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("state.json"),
+            r#"{"schema_version":1,"profiles":{},"assignments":{},"bypassed_devices":[],"global_bypass":false}"#,
+        )
+        .unwrap();
+        let storage = Storage::new(temp.path().join("data"), config).unwrap();
+        let library = storage.load_library().unwrap();
+        assert_eq!(library.schema_version, 2);
+        assert!(library.remembered_devices.is_empty());
     }
 
     #[test]

@@ -996,12 +996,27 @@ fn wire_actions(
             let Some(device) = model.devices.borrow().get(index).cloned() else {
                 return;
             };
-            let Some(profile) = model.current_id.borrow().clone() else {
+            let Some(selected_profile) = model.current_id.borrow().clone() else {
                 return;
             };
-            match model.client.assign(&device.key.as_storage_key(), &profile) {
+            let storage_key = device.key.as_storage_key();
+            let engine_has_error = model.client.status().ok().is_some_and(|status| {
+                status
+                    .pointer("/engine/errors")
+                    .and_then(|errors| errors.get(&storage_key))
+                    .is_some()
+            });
+            let unassigning =
+                !engine_has_error && device.assigned_profile.as_deref() == Some(&selected_profile);
+            let profile = if unassigning { "" } else { &selected_profile };
+            match model.client.assign(&storage_key, profile) {
                 Ok(()) => {
-                    status.set_text(&format!("Active on {}", device.description));
+                    let message = if unassigning {
+                        format!("{} is now unassigned", device.description)
+                    } else {
+                        format!("Active on {}", device.description)
+                    };
+                    status.set_text(&message);
                     if let Ok(devices) = model.client.devices() {
                         *model.devices.borrow_mut() = devices;
                     }
@@ -1236,16 +1251,6 @@ fn rebuild_filter_list(
     graph: &gtk::DrawingArea,
 ) {
     list.remove_all();
-    if profile.filters.is_empty() {
-        let empty = adw::StatusPage::builder()
-            .title("No parametric filters")
-            .description("Add a band or import an Equalizer APO profile")
-            .icon_name("audio-speakers-symbolic")
-            .build();
-        empty.set_vexpand(false);
-        empty.set_size_request(-1, 180);
-        list.insert(&empty, -1);
-    }
 
     let mut filter_button_group: Option<gtk::ToggleButton> = None;
     for (index, filter) in profile.filters.iter().enumerate() {
@@ -1657,19 +1662,19 @@ fn update_device_controls(
             None => "Not applied · currently bypassed".to_owned(),
         });
         assign.set_label(if selected_matches {
-            "Applied"
+            "Unassign from output"
         } else {
             "Apply selected profile"
         });
-        assign.set_sensitive(!selected_matches && model.current_id.borrow().is_some());
+        assign.set_sensitive(model.current_id.borrow().is_some());
     } else if let Some(name) = assigned_name {
         state.set_text(&format!("Active · {name}"));
         assign.set_label(if selected_matches {
-            "Applied"
+            "Unassign from output"
         } else {
             "Replace with selected"
         });
-        assign.set_sensitive(!selected_matches && model.current_id.borrow().is_some());
+        assign.set_sensitive(model.current_id.borrow().is_some());
     } else {
         state.set_text("Not applied · output is unchanged");
         assign.set_label("Apply selected profile");

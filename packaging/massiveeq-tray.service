@@ -1,0 +1,13 @@
+[Unit]
+Description=MassiveEQ status tray companion
+Documentation=https://github.com/massiveadam/massiveeq
+After=massiveeq.service graphical-session.target
+Wants=massiveeq.service
+
+[Service]
+ExecStart=/usr/bin/massiveeq-tray
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -184,6 +184,25 @@ pub struct DeviceInfo {
     pub bypassed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RememberedDevice {
+    pub key: DeviceKey,
+    pub node_name: String,
+    pub description: String,
+    pub channels: u32,
+}
+
+impl From<&DeviceInfo> for RememberedDevice {
+    fn from(device: &DeviceInfo) -> Self {
+        Self {
+            key: device.key.clone(),
+            node_name: device.node_name.clone(),
+            description: device.description.clone(),
+            channels: device.channels,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileInfo {
     pub id: String,
