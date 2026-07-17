@@ -191,7 +191,15 @@ fn build_ui(app: &adw::Application) {
     profile_popover.set_child(Some(&profile_popover_box));
 
     let profile_menu = gtk::MenuButton::new();
-    profile_menu.set_label("Choose profile");
+    let profile_menu_label = gtk::Label::new(Some("Choose profile"));
+    profile_menu_label.set_xalign(0.0);
+    profile_menu_label.set_hexpand(true);
+    profile_menu_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    profile_menu.set_child(Some(&profile_menu_label));
+    profile_menu.set_always_show_arrow(true);
+    profile_menu.set_margin_start(10);
+    profile_menu.set_margin_top(3);
+    profile_menu.set_margin_bottom(3);
     profile_menu.set_popover(Some(&profile_popover));
     profile_menu.add_css_class("profile-menu");
     header.pack_start(&profile_menu);
@@ -1137,7 +1145,7 @@ fn wire_actions(
             if model.loading.get() {
                 return;
             }
-            profile_menu.set_label(&name.text());
+            set_profile_menu_text(&profile_menu, &name.text());
             if let Some(source) = pending.borrow_mut().take() {
                 source.remove();
             }
@@ -1193,7 +1201,7 @@ fn wire_actions(
             if model.loading.get() {
                 return;
             }
-            profile_menu.set_label(&name.text());
+            set_profile_menu_text(&profile_menu, &name.text());
             if let Some(source) = pending.borrow_mut().take() {
                 source.remove();
             }
@@ -1826,6 +1834,17 @@ fn wire_actions(
     graph.add_controller(keyboard);
 }
 
+fn set_profile_menu_text(menu: &gtk::MenuButton, text: &str) {
+    if let Some(label) = menu
+        .child()
+        .and_then(|child| child.downcast::<gtk::Label>().ok())
+    {
+        label.set_text(text);
+    } else {
+        menu.set_label(text);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_profile(
     index: usize,
@@ -1845,7 +1864,7 @@ fn load_profile(
     model.loading.set(true);
     *model.current_id.borrow_mut() = Some(profile.id.clone());
     model.selected_filter.set(None);
-    profile_menu.set_label(&profile.name);
+    set_profile_menu_text(profile_menu, &profile.name);
     name.set_text(&profile.name);
     buffer.set_text(&profile.text);
     model.manual_trim.set(profile.manual_trim_db);

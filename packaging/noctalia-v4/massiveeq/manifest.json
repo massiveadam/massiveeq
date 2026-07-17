@@ -1,0 +1,26 @@
+{
+  "id": "massiveeq",
+  "name": "MassiveEQ",
+  "version": "1.0.0",
+  "minNoctaliaVersion": "4.7.0",
+  "author": "MassiveEQ contributors",
+  "license": "MIT",
+  "repository": "https://github.com/massiveadam/massiveeq",
+  "description": "Fast system-wide equalizer controls in the Noctalia bar.",
+  "tags": [
+    "Audio",
+    "System"
+  ],
+  "entryPoints": {
+    "main": "Main.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "dependencies": {
+    "plugins": []
+  },
+  "metadata": {
+    "defaultSettings": {},
+    "cpuIntensive": false
+  }
+}

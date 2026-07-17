@@ -1008,6 +1008,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "massiveeqctl"
+version = "0.3.0-beta.2"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "massiveeq-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "massiveeqd"
 version = "0.3.0-beta.2"
 dependencies = [

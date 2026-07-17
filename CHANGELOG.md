@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add `massiveeqctl` for versioned JSON status, live D-Bus change streaming,
+  and fast engine, profile, comparison, and per-output Filters controls.
+- Add an optional native Noctalia 4 bar widget with an anchored quick-controls
+  panel, without changing the generic StatusNotifier tray behavior.
+- Show the currently routed output in the Noctalia panel and provide compact,
+  live frequency, gain, and Q controls for its active parametric profile.
+
 ## 0.3.0-beta.2 — 2026-07-15
 
 Second public beta release focused on precise, responsive filter editing.

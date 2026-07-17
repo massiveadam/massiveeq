@@ -44,6 +44,7 @@ support contract.
 - Direct graph editing with click-to-add, dragging, and precise keyboard controls
 - Responsive per-output and per-band filter switches for fast A/B listening
 - Optional StatusNotifier tray controls for Noctalia, Waybar, KDE Plasma, and other compatible bars
+- Optional native Noctalia 4 quick-controls panel anchored to the bar
 
 ## Build
 
@@ -65,6 +66,39 @@ The tray companion shows the active profile for each output, switches or
 unassigns profiles, controls the per-output Filters switch and master engine,
 and opens the full editor. It is a separate process, so stopping it never
 changes audio routing.
+
+## Noctalia quick controls
+
+Noctalia 4.7.x can use the optional native MassiveEQ widget instead of
+the generic tray icon. It opens a themed, bar-anchored panel with the master
+Engine switch, the currently routed output, profile assignment, per-output
+Filters, active comparison candidates, and compact frequency, gain, and Q
+controls for the active parametric profile. Advanced profile editing remains
+in the full application.
+
+After installing the Arch package, copy the plugin into Noctalia's per-user
+plugin directory:
+
+```sh
+mkdir -p ~/.config/noctalia/plugins/massiveeq
+cp -a /usr/share/massiveeq/noctalia-v4/massiveeq/. ~/.config/noctalia/plugins/massiveeq/
+```
+
+Restart Noctalia, enable **MassiveEQ** under **Settings → Plugins**, and add its
+widget to the bar. Once it is working, avoid duplicate icons by disabling only
+the generic tray companion:
+
+```sh
+systemctl --user disable --now massiveeq-tray.service
+```
+
+The audio engine remains in `massiveeq.service` and is not stopped by this
+command. Source-tree installation and restoration instructions are in
+[`packaging/noctalia-v4/massiveeq/README.md`](packaging/noctalia-v4/massiveeq/README.md).
+
+The desktop-neutral `massiveeqctl` helper used by the widget is also available
+for scripts and other bars. Run `massiveeqctl status` for a versioned JSON
+snapshot or `massiveeqctl status --watch` for line-delimited live updates.
 
 Profiles live in `~/.local/share/massiveeq/profiles/`; assignments and manual
 trims live in `~/.config/massiveeq/state.json`. Unassigned and unsupported
