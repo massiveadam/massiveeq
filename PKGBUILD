@@ -59,5 +59,7 @@ package() {
   install -Dm644 packaging/org.massiveeq.MassiveEQ.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.massiveeq.MassiveEQ.svg"
   install -dm755 "$pkgdir/usr/share/massiveeq/noctalia-v4/massiveeq"
   cp -a packaging/noctalia-v4/massiveeq/. "$pkgdir/usr/share/massiveeq/noctalia-v4/massiveeq/"
+  install -dm755 "$pkgdir/usr/share/massiveeq/noctalia-v5/massiveeq"
+  cp -a packaging/noctalia-v5/massiveeq/. "$pkgdir/usr/share/massiveeq/noctalia-v5/massiveeq/"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

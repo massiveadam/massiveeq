@@ -44,7 +44,7 @@ support contract.
 - Direct graph editing with click-to-add, dragging, and precise keyboard controls
 - Responsive per-output and per-band filter switches for fast A/B listening
 - Optional StatusNotifier tray controls for Noctalia, Waybar, KDE Plasma, and other compatible bars
-- Optional native Noctalia 4 quick-controls panel anchored to the bar
+- Optional native Noctalia 4 and 5 quick-controls panels anchored to the bar
 
 ## Build
 
@@ -78,15 +78,31 @@ changes audio routing.
 
 ## Noctalia quick controls
 
-Noctalia 4.7.x can use the optional native MassiveEQ widget instead of
-the generic tray icon. It opens a themed, bar-anchored panel with the master
-Engine switch, the currently routed output, profile assignment, per-output
-Filters, active comparison candidates, and compact frequency, gain, and Q
-controls for the active parametric profile. Advanced profile editing remains
-in the full application.
+Noctalia 4.7.x and Noctalia 5 can use an optional native MassiveEQ widget
+instead of the generic tray icon. It opens a themed, bar-anchored panel with the
+master Engine switch, the currently routed output, profile assignment,
+per-output Filters, active comparison candidates, and compact frequency, gain,
+and Q controls for the active parametric profile. Advanced profile editing
+remains in the full application.
 
-After installing the Arch package, copy the plugin into Noctalia's per-user
-plugin directory:
+The two Noctalia generations have different plugin systems. After installing
+the Arch package, use the matching adapter.
+
+For Noctalia 5:
+
+```sh
+mkdir -p ~/.local/share/noctalia/plugins/massiveeq
+cp -a /usr/share/massiveeq/noctalia-v5/massiveeq/. ~/.local/share/noctalia/plugins/massiveeq/
+noctalia msg plugins enable massiveeq/massiveeq
+```
+
+Add **MassiveEQ** to the bar in Noctalia settings. The v5 panel uses native
+host placement, scaling, click-away dismissal, Escape handling, and monitor/bar
+orientation behavior. It displays one connected playback output at a time; if
+several are connected, the selector defaults to WirePlumber's current playback
+sink and keeps the others available without rendering duplicate cards.
+
+For Noctalia 4.7.x:
 
 ```sh
 mkdir -p ~/.config/noctalia/plugins/massiveeq
@@ -102,8 +118,9 @@ systemctl --user disable --now massiveeq-tray.service
 ```
 
 The audio engine remains in `massiveeq.service` and is not stopped by this
-command. Source-tree installation and restoration instructions are in
-[`packaging/noctalia-v4/massiveeq/README.md`](packaging/noctalia-v4/massiveeq/README.md).
+command. Source-tree installation and restoration instructions are in the
+[`Noctalia 5 adapter guide`](packaging/noctalia-v5/massiveeq/README.md) and
+[`Noctalia 4 adapter guide`](packaging/noctalia-v4/massiveeq/README.md).
 
 The desktop-neutral `massiveeqctl` helper used by the widget is also available
 for scripts and other bars. Run `massiveeqctl status` for a versioned JSON

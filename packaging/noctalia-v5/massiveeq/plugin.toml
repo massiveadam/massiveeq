@@ -1,0 +1,27 @@
+id = "massiveeq/massiveeq"
+name = "MassiveEQ"
+version = "1.0.0"
+plugin_api = 3
+author = "MassiveEQ contributors"
+license = "MIT"
+dependencies = ["massiveeqctl", "wpctl"]
+tags = ["audio", "equalizer", "pipewire"]
+icon = "wave-sine"
+description = "Anchored quick controls for the MassiveEQ system equalizer."
+
+[[service]]
+id = "status"
+entry = "service.luau"
+
+[[widget]]
+id = "quick-controls"
+entry = "widget.luau"
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 460
+height = 700
+placement = "attached"
+position = "auto"
+open_near_click = true
