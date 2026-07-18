@@ -10,6 +10,9 @@
   panel, without changing the generic StatusNotifier tray behavior.
 - Show the currently routed output in the Noctalia panel and provide compact,
   live frequency, gain, and Q controls for its active parametric profile.
+- Add matching Noctalia 4 and 5 widget states, single-output selection with a
+  connected-output picker, complete installation and troubleshooting
+  documentation, and a feature screenshot gallery.
 
 ## 0.3.0-beta.2 — 2026-07-15
 

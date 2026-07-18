@@ -21,15 +21,31 @@ Item {
   readonly property var allConnectedOutputs: (snapshot.outputs || []).filter(output => output.connected)
   readonly property string defaultSinkName: AudioService.sink?.name ?? ""
   readonly property string defaultSinkLabel: AudioService.sink?.nickname ?? AudioService.sink?.description ?? ""
-  readonly property var routedOutputs: allConnectedOutputs.filter(output => {
-                                                                    if (output.node_name === defaultSinkName)
-                                                                      return true;
-                                                                    if (!defaultSinkLabel)
-                                                                      return false;
-                                                                    return output.description === defaultSinkLabel
-                                                                      || defaultSinkLabel.endsWith(output.description);
-                                                                  })
-  readonly property var connectedOutputs: routedOutputs.length > 0 ? routedOutputs : allConnectedOutputs.slice(0, 1)
+  property string manuallySelectedOutputKey: ""
+  readonly property var selectedOutput: {
+    for (let output of allConnectedOutputs) {
+      if (manuallySelectedOutputKey && output.key === manuallySelectedOutputKey)
+        return output;
+    }
+    for (let output of allConnectedOutputs) {
+      if (defaultSinkName && output.node_name === defaultSinkName)
+        return output;
+    }
+    for (let output of allConnectedOutputs) {
+      if (defaultSinkLabel && (output.description === defaultSinkLabel || defaultSinkLabel.endsWith(output.description)))
+        return output;
+    }
+    for (let output of allConnectedOutputs) {
+      if (output.assigned_profile_id && !output.bypassed)
+        return output;
+    }
+    for (let output of allConnectedOutputs) {
+      if (output.assigned_profile_id)
+        return output;
+    }
+    return allConnectedOutputs[0] ?? null;
+  }
+  readonly property var connectedOutputs: selectedOutput ? [selectedOutput] : []
   readonly property int activeComparisonCount: connectedOutputs.filter(output => output.comparison?.enabled ?? false).length
   readonly property var geometryPlaceholder: panelContainer
   readonly property bool allowAttach: true
@@ -245,6 +261,14 @@ Item {
                       font.weight: Style.fontWeightSemiBold
                       elide: Text.ElideRight
                     }
+                  }
+
+                  OutputSelector {
+                    Layout.fillWidth: true
+                    visible: root.allConnectedOutputs.length > 1
+                    outputs: root.allConnectedOutputs
+                    currentKey: outputGroup.output.key
+                    onSelected: key => root.manuallySelectedOutputKey = key
                   }
 
                   ProfileSelector {

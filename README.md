@@ -118,9 +118,12 @@ systemctl --user disable --now massiveeq-tray.service
 ```
 
 The audio engine remains in `massiveeq.service` and is not stopped by this
-command. Source-tree installation and restoration instructions are in the
-[`Noctalia 5 adapter guide`](packaging/noctalia-v5/massiveeq/README.md) and
-[`Noctalia 4 adapter guide`](packaging/noctalia-v4/massiveeq/README.md).
+command. Installation, version selection, complete control behavior, updates,
+and troubleshooting are covered in the
+[`Noctalia widget guide`](docs/noctalia-widget.md), with concise adapter notes
+in the [`Noctalia 5 README`](packaging/noctalia-v5/massiveeq/README.md) and
+[`Noctalia 4 README`](packaging/noctalia-v4/massiveeq/README.md). See the
+[`screenshot gallery`](docs/screenshots.md) for the widget and full editor.
 
 The desktop-neutral `massiveeqctl` helper used by the widget is also available
 for scripts and other bars. Run `massiveeqctl status` for a versioned JSON

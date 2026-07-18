@@ -9,8 +9,9 @@ routed playback sink. Other detected sound devices remain available in the
 output selector instead of becoming duplicate cards.
 
 Noctalia 5 is currently beta software, so its plugin API can still change.
-This adapter targets plugin API 3, which is supported by current Noctalia 5
-builds.
+Current hosts accept plugin APIs 3–4. This adapter deliberately declares API 3
+so it works across early and current v5 builds without using API 4-only
+features.
 
 ## Install from the Arch package
 
@@ -46,3 +47,6 @@ rm -rf ~/.local/share/noctalia/plugins/massiveeq
 
 The full editor, daemon, profiles, audio routing, and generic tray companion
 are unaffected.
+
+The complete feature, compatibility, update, and troubleshooting reference is
+in [`docs/noctalia-widget.md`](../../../docs/noctalia-widget.md).

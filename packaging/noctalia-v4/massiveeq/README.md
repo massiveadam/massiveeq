@@ -1,7 +1,7 @@
 # MassiveEQ for Noctalia 4
 
 This optional plugin adds a native MassiveEQ bar widget and attached quick-controls panel. It
-requires MassiveEQ, `massiveeqctl`, and Noctalia 4.7.x. It does not replace or modify the
+requires MassiveEQ, `massiveeqctl`, and Noctalia 4.7.0–4.7.7. It does not replace or modify the
 MassiveEQ audio service.
 
 ## Install from an Arch package
@@ -31,4 +31,9 @@ systemctl --user enable --now massiveeq-tray.service
 
 Left-click the widget to open quick controls for the currently routed output. The active
 parametric profile includes compact frequency, gain, and Q fields; committing a value updates
-the live profile. Right-click opens the full MassiveEQ editor.
+the live profile. When several outputs are connected, the panel defaults to WirePlumber's
+current sink and keeps the others in a selector instead of rendering duplicate cards.
+Right-click opens the full MassiveEQ editor.
+
+The complete feature, compatibility, update, and troubleshooting reference is in
+[`docs/noctalia-widget.md`](../../../docs/noctalia-widget.md).

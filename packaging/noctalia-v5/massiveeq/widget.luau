@@ -29,9 +29,11 @@ local function render()
   if snapshot.state == "active" then
     barWidget.setGlyphColor("primary")
   elseif snapshot.state == "engine_off" then
+    barWidget.setGlyphColor("on_surface_variant")
+  elseif snapshot.state == "unavailable" then
     barWidget.setGlyphColor("error")
   else
-    barWidget.setGlyphColor("on_surface_variant")
+    barWidget.setGlyphColor("on_surface")
   end
 
   local detail = stateLabel()
