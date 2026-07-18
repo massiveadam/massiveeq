@@ -2,6 +2,7 @@
 name = "massiveeq-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -12,4 +13,3 @@ serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-

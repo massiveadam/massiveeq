@@ -12,6 +12,7 @@ resolver = "2"
 [workspace.package]
 version = "0.3.0-beta.2"
 edition = "2024"
+rust-version = "1.92"
 license = "MIT"
 authors = ["MassiveEQ contributors"]
 repository = "https://github.com/massiveadam/massiveeq"

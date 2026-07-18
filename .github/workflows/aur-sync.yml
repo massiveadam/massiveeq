@@ -1,0 +1,145 @@
+name: Sync AUR
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish detected packaging changes to the AUR
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: massiveeq-aur-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 10
+
+    steps:
+      - name: Install packaging tools
+        run: pacman -Syu --noconfirm --needed git openssh
+
+      - name: Select validated source
+        id: source
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == workflow_run ]]; then
+            printf 'ref=%s\n' "${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            printf 'ref=%s\n' "${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.ref }}
+          persist-credentials: false
+
+      - name: Create unprivileged packager
+        run: |
+          useradd --create-home packager
+          chown -R packager:packager "$GITHUB_WORKSPACE"
+
+      - name: Verify repository metadata
+        shell: bash
+        run: |
+          generated=$(mktemp)
+          chown packager:packager "$generated"
+          runuser -u packager -- bash -c \
+            'cd "$1" && makepkg --printsrcinfo > "$2"' \
+            _ "$GITHUB_WORKSPACE" "$generated"
+          diff -u "$GITHUB_WORKSPACE/.SRCINFO" "$generated"
+          rm -f "$generated"
+
+      - name: Check the live AUR package
+        id: check
+        shell: bash
+        run: |
+          set +e
+          runuser -u packager -- env HOME=/home/packager \
+            "$GITHUB_WORKSPACE/packaging/aur/sync.sh" --check
+          status=$?
+          set -e
+
+          case "$status" in
+            0) printf 'update=false\n' >> "$GITHUB_OUTPUT" ;;
+            10) printf 'update=true\n' >> "$GITHUB_OUTPUT" ;;
+            *) exit "$status" ;;
+          esac
+
+      - name: Configure AUR publishing key
+        if: >-
+          steps.check.outputs.update == 'true' &&
+          (github.event_name == 'workflow_run' || inputs.publish)
+        shell: bash
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$AUR_SSH_PRIVATE_KEY" ]]; then
+            printf 'AUR_SSH_PRIVATE_KEY is not configured. See packaging/aur/README.md.\n' >&2
+            exit 1
+          fi
+
+          install -d -m 700 -o packager -g packager /home/packager/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > /home/packager/.ssh/aur
+          chmod 600 /home/packager/.ssh/aur
+          chown packager:packager /home/packager/.ssh/aur
+
+          known_hosts=$(mktemp)
+          ssh-keyscan -t ed25519 aur.archlinux.org > "$known_hosts" 2>/dev/null
+          fingerprint=$(ssh-keygen -lf "$known_hosts" | awk '{print $2}' | sort -u)
+          expected='SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
+          if [[ "$fingerprint" != "$expected" ]]; then
+            printf 'AUR SSH host-key fingerprint did not match the published value.\n' >&2
+            exit 1
+          fi
+          install -m 600 -o packager -g packager "$known_hosts" \
+            /home/packager/.ssh/known_hosts
+
+          cat > /home/packager/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+          EOF
+          chmod 600 /home/packager/.ssh/config
+          chown packager:packager /home/packager/.ssh/config
+
+      - name: Publish packaging update
+        if: >-
+          steps.check.outputs.update == 'true' &&
+          (github.event_name == 'workflow_run' || inputs.publish)
+        env:
+          AUR_COMMIT_MESSAGE: Sync packaging from MassiveEQ ${{ steps.source.outputs.ref }}
+          AUR_GIT_EMAIL: massiveadam@users.noreply.github.com
+          AUR_GIT_NAME: massiveadam
+        run: |
+          runuser -u packager -- env \
+            HOME=/home/packager \
+            AUR_COMMIT_MESSAGE="$AUR_COMMIT_MESSAGE" \
+            AUR_GIT_EMAIL="$AUR_GIT_EMAIL" \
+            AUR_GIT_NAME="$AUR_GIT_NAME" \
+            "$GITHUB_WORKSPACE/packaging/aur/sync.sh" --publish
+
+      - name: Report dry run
+        if: >-
+          steps.check.outputs.update == 'true' &&
+          github.event_name == 'workflow_dispatch' && !inputs.publish
+        run: >-
+          printf 'Packaging changes were found. Run this workflow again with publish enabled
+          after reviewing the diff above.\n'

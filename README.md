@@ -56,6 +56,15 @@ cargo test --workspace
 Run `massiveeqd` first, then `massiveeq`. For a persistent session install the
 files under `packaging/` or build the included `PKGBUILD`.
 
+The rolling `massiveeq-git` AUR package follows new upstream commits whenever
+it is rebuilt. Maintainer automation for safely synchronizing packaging changes
+is documented in [`packaging/aur/README.md`](packaging/aur/README.md).
+
+The full editor checks once shortly after launch for a newer upstream revision.
+When one is available, a compact **Update** button appears in the header and
+offers to copy `yay -S massiveeq-git` or open the AUR package page. The app
+never runs an AUR helper or requests administrator privileges by itself.
+
 After a package install, open MassiveEQ once or enable the service directly:
 
 ```sh

@@ -1,5 +1,6 @@
 mod client;
 mod graph;
+mod update;
 
 use adw::prelude::*;
 use gtk4 as gtk;
@@ -231,6 +232,7 @@ fn build_ui(app: &adw::Application) {
     let global_bypass_label = gtk::Label::new(Some("ENGINE"));
     global_bypass_label.add_css_class("header-data");
     header.pack_end(&global_bypass_label);
+    update::add_update_button(&header, &window);
     toolbar.add_top_bar(&header);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -2868,6 +2870,23 @@ fn install_css() {
             font-size: 9px;
             font-weight: 700;
             opacity: 0.54;
+        }
+
+        .update-button {
+            background-color: rgba(230, 75, 47, 0.12);
+            border: 1px solid rgba(230, 75, 47, 0.62);
+            border-radius: 999px;
+            color: #ff8a72;
+            font-family: monospace;
+            font-size: 9px;
+            font-weight: 800;
+            padding: 5px 10px;
+        }
+
+        .update-button:hover {
+            background-color: rgba(230, 75, 47, 0.22);
+            border-color: #e64b2f;
+            color: #fff8f4;
         }
 
         .control-card,
