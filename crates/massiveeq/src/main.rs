@@ -1,5 +1,6 @@
 mod client;
 mod graph;
+mod update;
 
 use adw::prelude::*;
 use gtk4 as gtk;
@@ -191,7 +192,15 @@ fn build_ui(app: &adw::Application) {
     profile_popover.set_child(Some(&profile_popover_box));
 
     let profile_menu = gtk::MenuButton::new();
-    profile_menu.set_label("Choose profile");
+    let profile_menu_label = gtk::Label::new(Some("Choose profile"));
+    profile_menu_label.set_xalign(0.0);
+    profile_menu_label.set_hexpand(true);
+    profile_menu_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    profile_menu.set_child(Some(&profile_menu_label));
+    profile_menu.set_always_show_arrow(true);
+    profile_menu.set_margin_start(10);
+    profile_menu.set_margin_top(3);
+    profile_menu.set_margin_bottom(3);
     profile_menu.set_popover(Some(&profile_popover));
     profile_menu.add_css_class("profile-menu");
     header.pack_start(&profile_menu);
@@ -223,6 +232,7 @@ fn build_ui(app: &adw::Application) {
     let global_bypass_label = gtk::Label::new(Some("ENGINE"));
     global_bypass_label.add_css_class("header-data");
     header.pack_end(&global_bypass_label);
+    update::add_update_button(&header, &window);
     toolbar.add_top_bar(&header);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -1137,7 +1147,7 @@ fn wire_actions(
             if model.loading.get() {
                 return;
             }
-            profile_menu.set_label(&name.text());
+            set_profile_menu_text(&profile_menu, &name.text());
             if let Some(source) = pending.borrow_mut().take() {
                 source.remove();
             }
@@ -1193,7 +1203,7 @@ fn wire_actions(
             if model.loading.get() {
                 return;
             }
-            profile_menu.set_label(&name.text());
+            set_profile_menu_text(&profile_menu, &name.text());
             if let Some(source) = pending.borrow_mut().take() {
                 source.remove();
             }
@@ -1826,6 +1836,17 @@ fn wire_actions(
     graph.add_controller(keyboard);
 }
 
+fn set_profile_menu_text(menu: &gtk::MenuButton, text: &str) {
+    if let Some(label) = menu
+        .child()
+        .and_then(|child| child.downcast::<gtk::Label>().ok())
+    {
+        label.set_text(text);
+    } else {
+        menu.set_label(text);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_profile(
     index: usize,
@@ -1845,7 +1866,7 @@ fn load_profile(
     model.loading.set(true);
     *model.current_id.borrow_mut() = Some(profile.id.clone());
     model.selected_filter.set(None);
-    profile_menu.set_label(&profile.name);
+    set_profile_menu_text(profile_menu, &profile.name);
     name.set_text(&profile.name);
     buffer.set_text(&profile.text);
     model.manual_trim.set(profile.manual_trim_db);
@@ -2849,6 +2870,23 @@ fn install_css() {
             font-size: 9px;
             font-weight: 700;
             opacity: 0.54;
+        }
+
+        .update-button {
+            background-color: rgba(230, 75, 47, 0.12);
+            border: 1px solid rgba(230, 75, 47, 0.62);
+            border-radius: 999px;
+            color: #ff8a72;
+            font-family: monospace;
+            font-size: 9px;
+            font-weight: 800;
+            padding: 5px 10px;
+        }
+
+        .update-button:hover {
+            background-color: rgba(230, 75, 47, 0.22);
+            border-color: #e64b2f;
+            color: #fff8f4;
         }
 
         .control-card,
