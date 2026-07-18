@@ -13,6 +13,8 @@
 - Add matching Noctalia 4 and 5 widget states, single-output selection with a
   connected-output picker, complete installation and troubleshooting
   documentation, and a feature screenshot gallery.
+- Make the `yay -S massiveeq-git` AUR path prominent and document an equivalent
+  no-helper `makepkg -si` installation and update workflow.
 
 ## 0.3.0-beta.2 — 2026-07-15
 

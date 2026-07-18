@@ -4,6 +4,9 @@ MassiveEQ is a system-wide playback equalizer for Arch Linux audio sessions.
 It combines a GTK4/libadwaita profile editor with a user-level service that
 places PipeWire smart filters in front of assigned output devices.
 
+**Recommended installation:** `yay -S massiveeq-git` ·
+[View the AUR package](https://aur.archlinux.org/packages/massiveeq-git)
+
 > [!WARNING]
 > **Beta 2 software:** MassiveEQ is ready for testing, but its audio routing and
 > profile format may still change. Keep an easy way to select the original
@@ -77,30 +80,82 @@ support contract.
 
 More views are available in the [complete screenshot gallery](docs/screenshots.md).
 
-## Build
+## Install
+
+MassiveEQ targets fully updated Arch Linux x86_64 systems. Partial upgrades are
+not supported.
+
+### AUR with yay (recommended)
+
+The default installation path is the rolling `massiveeq-git` AUR package:
 
 ```sh
-cargo build --workspace
-cargo test --workspace
+yay -S massiveeq-git
 ```
 
-Run `massiveeqd` first, then `massiveeq`. For a persistent session install the
-files under `packaging/` or build the included `PKGBUILD`.
+The package resolves the required Arch libraries, builds the current upstream
+revision with Rust 1.92 or newer, runs the test suite, and installs the editor,
+audio service, tray companion, command-line helper, desktop entry, and both
+Noctalia adapters.
 
-The rolling `massiveeq-git` AUR package follows new upstream commits whenever
-it is rebuilt. Maintainer automation for safely synchronizing packaging changes
-is documented in [`packaging/aur/README.md`](packaging/aur/README.md).
-
-The full editor checks once shortly after launch for a newer upstream revision.
-When one is available, a compact **Update** button appears in the header and
-offers to copy `yay -S massiveeq-git` or open the AUR package page. The app
-never runs an AUR helper or requests administrator privileges by itself.
-
-After a package install, open MassiveEQ once or enable the service directly:
+After installation, launch **MassiveEQ** from the application menu once, or
+enable the audio service and generic tray companion directly:
 
 ```sh
 systemctl --user enable --now massiveeq.service massiveeq-tray.service
 ```
+
+### AUR without yay
+
+An AUR helper is optional. Install the standard Arch build tools, review the
+published `PKGBUILD`, and build the exact same package with `makepkg`:
+
+```sh
+sudo pacman -S --needed base-devel git
+git clone https://aur.archlinux.org/massiveeq-git.git
+cd massiveeq-git
+makepkg -si
+```
+
+### Updating
+
+Rebuild the rolling package whenever an update is available:
+
+```sh
+yay -S massiveeq-git
+```
+
+For a manual AUR checkout, run `git pull` in the `massiveeq-git` directory and
+then run `makepkg -si` again. Profiles, assignments, comparison banks, and
+active routing are stored outside the package and are retained across updates.
+
+The full editor checks once shortly after launch for a newer upstream revision.
+When one is available, a compact **Update** button appears in the header and
+offers to copy the recommended `yay -S massiveeq-git` command or open the AUR
+package page. The app never runs an AUR helper or requests administrator
+privileges by itself.
+
+## Build from source
+
+Direct source builds are intended for development. For a normal system
+installation, use either AUR method above so all desktop and service files are
+installed together.
+
+```sh
+sudo pacman -S --needed base-devel git clang rust gtk4 libadwaita \
+  pipewire libpipewire wireplumber libsndfile libsamplerate curl
+git clone https://github.com/massiveadam/massiveeq.git
+cd massiveeq
+cargo build --workspace --release --locked
+cargo test --workspace --release --locked
+```
+
+Run `target/release/massiveeqd` first, followed by
+`target/release/massiveeq`, when testing directly from the source tree.
+
+The rolling `massiveeq-git` AUR package follows new upstream commits whenever
+it is rebuilt. Maintainer automation for safely synchronizing packaging changes
+is documented in [`packaging/aur/README.md`](packaging/aur/README.md).
 
 The tray companion shows the active profile for each output, switches or
 unassigns profiles, controls the per-output Filters switch and master engine,
