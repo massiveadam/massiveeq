@@ -46,6 +46,37 @@ support contract.
 - Optional StatusNotifier tray controls for Noctalia, Waybar, KDE Plasma, and other compatible bars
 - Optional native Noctalia 4 and 5 quick-controls panels anchored to the bar
 
+## Screenshots
+
+<p align="center">
+  <a href="docs/screenshots/full-editor-overview.png">
+    <img src="docs/screenshots/full-editor-overview.png" alt="MassiveEQ full editor with the Noctalia quick-controls panel" width="100%">
+  </a>
+  <br>
+  <em>Full parametric editor and the optional Noctalia quick-controls panel</em>
+</p>
+
+<table>
+  <tr>
+    <td width="50%">
+      <a href="docs/screenshots/comparison-bank.png">
+        <img src="docs/screenshots/comparison-bank.png" alt="Level-matched profile comparison in MassiveEQ" width="100%">
+      </a>
+    </td>
+    <td width="50%">
+      <a href="docs/screenshots/convolution-editor.png">
+        <img src="docs/screenshots/convolution-editor.png" alt="MassiveEQ convolution impulse-response editor" width="100%">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><em>Level-matched profile comparison</em></td>
+    <td align="center"><em>Convolution impulse-response editor</em></td>
+  </tr>
+</table>
+
+More views are available in the [complete screenshot gallery](docs/screenshots.md).
+
 ## Build
 
 ```sh
