@@ -289,6 +289,7 @@ mod tests {
             connected: true,
             assigned_profile: None,
             bypassed: false,
+            is_default: false,
         };
         let config = build_filter_config(
             &profile,
@@ -319,6 +320,7 @@ mod tests {
             connected: true,
             assigned_profile: None,
             bypassed: false,
+            is_default: false,
         };
         let config = build_filter_config(
             &profile,

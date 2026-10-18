@@ -335,6 +335,7 @@ mod tests {
             connected,
             assigned_profile: assigned.map(str::to_owned),
             bypassed,
+            is_default: false,
         }
     }
 

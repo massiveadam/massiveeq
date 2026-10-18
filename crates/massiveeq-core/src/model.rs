@@ -182,6 +182,9 @@ pub struct DeviceInfo {
     pub connected: bool,
     pub assigned_profile: Option<String>,
     pub bypassed: bool,
+    /// PipeWire's current default output, i.e. where desktop audio plays.
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

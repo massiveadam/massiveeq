@@ -154,6 +154,7 @@ async fn native_self_test(node_name: &str, seconds: u64) -> Result<()> {
             connected: true,
             assigned_profile: None,
             bypassed: false,
+            is_default: false,
         },
         processor,
         settings.sample_rate,

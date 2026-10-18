@@ -33,6 +33,26 @@ struct Model {
     syncing_device: Cell<bool>,
     pending_device_bypass: RefCell<Option<PendingDeviceBypass>>,
     syncing_engine: Cell<bool>,
+    /// Engine switch is off, so no output is being filtered.
+    engine_off: Cell<bool>,
+    /// Debounced profile save; focus changes wait for it so edits land on the right profile.
+    pending_save: Rc<RefCell<Option<gtk::glib::SourceId>>>,
+    /// Output (storage key) the editor should jump to once no save is pending.
+    pending_focus: RefCell<Option<String>>,
+    /// Set while the device list is rebuilt so restoring the selection keeps profile focus.
+    restoring_device: Cell<bool>,
+    live: RefCell<Option<LiveIndicators>>,
+    profile_pills: RefCell<Vec<gtk::Label>>,
+}
+
+/// Widgets that show which profile is actually playing.
+#[derive(Clone)]
+struct LiveIndicators {
+    profile_pill: gtk::Label,
+    output_pill: gtk::Label,
+    profile_menu: gtk::MenuButton,
+    profile_list: gtk::ListBox,
+    device_drop: gtk::DropDown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +154,12 @@ fn build_ui(app: &adw::Application) {
         syncing_device: Cell::new(false),
         pending_device_bypass: RefCell::new(None),
         syncing_engine: Cell::new(false),
+        engine_off: Cell::new(false),
+        pending_save: Rc::new(RefCell::new(None)),
+        pending_focus: RefCell::new(None),
+        restoring_device: Cell::new(false),
+        live: RefCell::new(None),
+        profile_pills: RefCell::new(Vec::new()),
     });
 
     let window = adw::ApplicationWindow::builder()
@@ -219,6 +245,7 @@ fn build_ui(app: &adw::Application) {
             .and_then(|value| value.get("global_bypass").and_then(|value| value.as_bool()))
             .unwrap_or(false),
     );
+    model.engine_off.set(!global_bypass.is_active());
     global_bypass.set_tooltip_text(Some(
         "Master DSP engine. Off is true dry audio at 0 dB with no EQ or level correction.",
     ));
@@ -254,12 +281,21 @@ fn build_ui(app: &adw::Application) {
     controls_card.append(&route_rule);
     let identity_row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
     identity_row.set_hexpand(true);
+    // Equal columns keep the fields still while the live badges change length.
+    identity_row.set_homogeneous(true);
     let profile_column = gtk::Box::new(gtk::Orientation::Vertical, 5);
     profile_column.set_hexpand(true);
     let profile_name_label = gtk::Label::new(Some("PROFILE NAME"));
     profile_name_label.set_xalign(0.0);
+    profile_name_label.set_hexpand(true);
     profile_name_label.add_css_class("section-label");
-    profile_column.append(&profile_name_label);
+    let profile_pill = gtk::Label::new(None);
+    profile_pill.add_css_class("live-pill");
+    profile_pill.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let profile_name_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    profile_name_row.append(&profile_name_label);
+    profile_name_row.append(&profile_pill);
+    profile_column.append(&profile_name_row);
     let name_entry = gtk::Entry::builder()
         .placeholder_text("Profile name")
         .hexpand(true)
@@ -272,8 +308,14 @@ fn build_ui(app: &adw::Application) {
     device_column.set_hexpand(true);
     let device_heading = gtk::Label::new(Some("OUTPUT DEVICE"));
     device_heading.set_xalign(0.0);
+    device_heading.set_hexpand(true);
     device_heading.add_css_class("section-label");
-    device_column.append(&device_heading);
+    let output_pill = gtk::Label::new(None);
+    output_pill.add_css_class("live-pill");
+    let device_heading_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    device_heading_row.append(&device_heading);
+    device_heading_row.append(&output_pill);
+    device_column.append(&device_heading_row);
     let device_strings = gtk::StringList::new(
         &model
             .devices
@@ -746,6 +788,13 @@ fn build_ui(app: &adw::Application) {
     toolbar.set_content(Some(&page_scroll));
     window.set_content(Some(&toolbar));
 
+    *model.live.borrow_mut() = Some(LiveIndicators {
+        profile_pill,
+        output_pill,
+        profile_menu: profile_menu.clone(),
+        profile_list: profile_list.clone(),
+        device_drop: device_drop.clone(),
+    });
     repopulate_profiles(&profile_list, &model);
     wire_actions(
         &window,
@@ -786,8 +835,12 @@ fn build_ui(app: &adw::Application) {
         let engine = global_bypass.clone();
         let engine_readout = graph_hint.clone();
         let comparison_ui = comparison_ui.clone();
+        let profile_list = profile_list.clone();
         move || {
             if let Ok(devices) = model.client.devices() {
+                if let Some(index) = device_focus_target(&model.devices.borrow(), &devices) {
+                    *model.pending_focus.borrow_mut() = Some(devices[index].key.as_storage_key());
+                }
                 let (selected_key, old_identity) = {
                     let current = model.devices.borrow();
                     (
@@ -819,13 +872,16 @@ fn build_ui(app: &adw::Application) {
                             .iter()
                             .position(|device| device.key.as_storage_key() == key)
                     {
+                        model.restoring_device.set(true);
                         drop.set_selected(index as u32);
+                        model.restoring_device.set(false);
                     }
                 }
-                update_device_controls(&model, &drop, &state, &assign, &bypass);
                 if let Ok(comparisons) = model.client.comparisons() {
                     *model.comparisons.borrow_mut() = comparisons;
                 }
+                apply_pending_focus(&model, &drop, &profile_list);
+                update_device_controls(&model, &drop, &state, &assign, &bypass);
                 // The candidate rows are an unsaved draft while this popover
                 // is open. Rebuilding them on the health poll loses clicks
                 // and can destroy the widget currently handling input.
@@ -843,6 +899,9 @@ fn build_ui(app: &adw::Application) {
                 model.syncing_engine.set(true);
                 engine.set_active(!engine_off);
                 model.syncing_engine.set(false);
+                if model.engine_off.replace(engine_off) != engine_off {
+                    update_live_indicators(&model);
+                }
             } else {
                 engine_readout.set_text("AUDIO SERVICE UNAVAILABLE");
                 engine.set_sensitive(false);
@@ -850,7 +909,15 @@ fn build_ui(app: &adw::Application) {
             gtk::glib::ControlFlow::Continue
         }
     });
-    if let Some(row) = profile_list.row_at_index(0) {
+    // Open on the output desktop audio is using, with its profile in the editor.
+    let preferred = preferred_device_index(&model.devices.borrow());
+    if let Some(index) = preferred {
+        device_drop.set_selected(index as u32);
+    }
+    focus_device_profile(&model, device_drop.selected(), &profile_list);
+    if profile_list.selected_row().is_none()
+        && let Some(row) = profile_list.row_at_index(0)
+    {
         profile_list.select_row(Some(&row));
     }
     update_device_controls(
@@ -1130,7 +1197,7 @@ fn wire_actions(
         move |_, _| profile_popover.popdown()
     });
 
-    let pending_save: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let pending_save = model.pending_save.clone();
     buffer.connect_changed({
         let model = model.clone();
         let buffer = buffer.clone();
@@ -1463,7 +1530,14 @@ fn wire_actions(
         let assign = assign.clone();
         let bypass = device_bypass.clone();
         let comparison_ui = comparison_ui.clone();
+        let profile_list = profile_list.clone();
         move |drop| {
+            if !model.restoring_device.get()
+                && let Some(device) = model.devices.borrow().get(drop.selected() as usize)
+            {
+                *model.pending_focus.borrow_mut() = Some(device.key.as_storage_key());
+            }
+            apply_pending_focus(&model, drop, &profile_list);
             update_device_controls(&model, drop, &state, &assign, &bypass);
             refresh_comparison_ui(&model, drop, &comparison_ui);
         }
@@ -1626,6 +1700,9 @@ fn wire_actions(
                 model.syncing_engine.set(true);
                 switch.set_active(!switch.is_active());
                 model.syncing_engine.set(false);
+            } else {
+                model.engine_off.set(!switch.is_active());
+                update_live_indicators(&model);
             }
         }
     });
@@ -2696,6 +2773,7 @@ fn update_device_controls(
         state.set_text("No output connected");
         assign.set_sensitive(false);
         bypass.set_sensitive(false);
+        update_live_indicators(model);
         return;
     };
 
@@ -2785,6 +2863,252 @@ fn update_device_controls(
     bypass.set_sensitive(
         pending_bypassed.is_none() && has_ab_source && matches!(device.channels, 1 | 2),
     );
+    std::mem::drop(pending_bypass);
+    update_live_indicators(model);
+}
+
+/// The profile an output is actually playing: the active comparison
+/// candidate while a comparison runs, otherwise its assigned profile.
+fn effective_profile_id(
+    device: &DeviceInfo,
+    comparisons: &HashMap<String, ComparisonSet>,
+) -> Option<String> {
+    comparisons
+        .get(&device.key.as_storage_key())
+        .filter(|comparison| comparison.enabled)
+        .map(|comparison| comparison.active_profile_id.clone())
+        .filter(|id| id != COMPARISON_BYPASS_ID)
+        .or_else(|| device.assigned_profile.clone())
+}
+
+/// Whether an output's filters are running: a supported channel layout, not
+/// bypassed, and not on the bypass side of a comparison.
+fn output_is_filtering(
+    device: &DeviceInfo,
+    comparisons: &HashMap<String, ComparisonSet>,
+    bypassed: bool,
+) -> bool {
+    matches!(device.channels, 1 | 2)
+        && !bypassed
+        && comparisons
+            .get(&device.key.as_storage_key())
+            .filter(|comparison| comparison.enabled)
+            .is_none_or(|comparison| comparison.active_profile_id != COMPARISON_BYPASS_ID)
+}
+
+/// Output to show at startup: the system default, else the first connected
+/// output with a profile, else the first connected output.
+fn preferred_device_index(devices: &[DeviceInfo]) -> Option<usize> {
+    devices
+        .iter()
+        .position(|device| device.connected && device.is_default)
+        .or_else(|| {
+            devices
+                .iter()
+                .position(|device| device.connected && device.assigned_profile.is_some())
+        })
+        .or_else(|| devices.iter().position(|device| device.connected))
+}
+
+/// Output the editor should jump to after a device poll: a newly connected
+/// output (the default one if several arrive), or a new system default.
+fn device_focus_target(old: &[DeviceInfo], new: &[DeviceInfo]) -> Option<usize> {
+    let was_connected = |key: &str| {
+        old.iter()
+            .any(|device| device.connected && device.key.as_storage_key() == key)
+    };
+    let arrived = new
+        .iter()
+        .enumerate()
+        .filter(|(_, device)| device.connected && !was_connected(&device.key.as_storage_key()))
+        .collect::<Vec<_>>();
+    if let Some((index, _)) = arrived
+        .iter()
+        .find(|(_, device)| device.is_default)
+        .or(arrived.first())
+    {
+        return Some(*index);
+    }
+    let old_default = old
+        .iter()
+        .find(|device| device.connected && device.is_default)
+        .map(|device| device.key.as_storage_key());
+    new.iter().position(|device| {
+        device.connected
+            && device.is_default
+            && old_default.as_deref() != Some(device.key.as_storage_key().as_str())
+    })
+}
+
+/// Select the pending output and open the profile it plays. Waits while an
+/// edit is still being saved so the edit is not written to the wrong profile.
+fn apply_pending_focus(model: &Rc<Model>, drop: &gtk::DropDown, profile_list: &gtk::ListBox) {
+    if model.pending_save.borrow().is_some() {
+        return;
+    }
+    let Some(key) = model.pending_focus.borrow_mut().take() else {
+        return;
+    };
+    let index = model
+        .devices
+        .borrow()
+        .iter()
+        .position(|device| device.key.as_storage_key() == key);
+    let Some(index) = index else {
+        return;
+    };
+    if drop.selected() != index as u32 {
+        model.restoring_device.set(true);
+        drop.set_selected(index as u32);
+        model.restoring_device.set(false);
+    }
+    focus_device_profile(model, index as u32, profile_list);
+}
+
+fn focus_device_profile(model: &Rc<Model>, device_index: u32, profile_list: &gtk::ListBox) {
+    let target = model
+        .devices
+        .borrow()
+        .get(device_index as usize)
+        .and_then(|device| effective_profile_id(device, &model.comparisons.borrow()));
+    let Some(target) = target else {
+        return;
+    };
+    if model.current_id.borrow().as_deref() == Some(target.as_str()) {
+        return;
+    }
+    let position = model
+        .profiles
+        .borrow()
+        .iter()
+        .position(|profile| profile.id == target);
+    if let Some(row) = position.and_then(|position| profile_list.row_at_index(position as i32)) {
+        profile_list.select_row(Some(&row));
+    }
+}
+
+/// Mark where the edited profile is playing, the profiles in use in the bank,
+/// and whether the selected output is the system default.
+fn update_live_indicators(model: &Rc<Model>) {
+    let Some(live) = model.live.borrow().clone() else {
+        return;
+    };
+    let devices = model.devices.borrow();
+    let comparisons = model.comparisons.borrow();
+    let pending_bypass = model.pending_device_bypass.borrow();
+    let engine_off = model.engine_off.get();
+    // Connected outputs set to this profile, split by whether it is audible.
+    let users_of = |profile_id: &str| {
+        let mut playing = Vec::new();
+        let mut paused = Vec::new();
+        for device in devices.iter().filter(|device| {
+            device.connected
+                && effective_profile_id(device, &comparisons).as_deref() == Some(profile_id)
+        }) {
+            let bypassed = displayed_device_bypass(
+                &device.key.as_storage_key(),
+                device.bypassed,
+                pending_bypass.as_ref(),
+            );
+            if !engine_off && output_is_filtering(device, &comparisons, bypassed) {
+                playing.push(device.description.as_str());
+            } else {
+                paused.push(device.description.as_str());
+            }
+        }
+        (playing, paused)
+    };
+    let disconnected_owners_of = |profile_id: &str| {
+        devices
+            .iter()
+            .filter(|device| {
+                !device.connected && device.assigned_profile.as_deref() == Some(profile_id)
+            })
+            .map(|device| device.description.as_str())
+            .collect::<Vec<_>>()
+    };
+    let paused_reason = if engine_off {
+        "engine off"
+    } else {
+        "filters off"
+    };
+
+    let current = model.current_id.borrow().clone();
+    let (playing_on, paused_on) = current.as_deref().map(users_of).unwrap_or_default();
+    let pill = &live.profile_pill;
+    match (playing_on.as_slice(), paused_on.as_slice()) {
+        ([], []) => {
+            pill.set_text("NOT PLAYING");
+            pill.set_tooltip_text(Some("This profile is not active on any connected output"));
+            pill.remove_css_class("live");
+            live.profile_menu.remove_css_class("live");
+        }
+        ([], paused) => {
+            pill.set_text(&format!("PAUSED · {}", paused_reason.to_uppercase()));
+            pill.set_tooltip_text(Some(&format!(
+                "Set on {}, but not being applied ({paused_reason})",
+                paused.join(", ")
+            )));
+            pill.remove_css_class("live");
+            live.profile_menu.remove_css_class("live");
+        }
+        (outputs, _) => {
+            pill.set_text(&match outputs {
+                [only] => format!("● LIVE · {}", only.to_uppercase()),
+                _ => format!("● LIVE · {} OUTPUTS", outputs.len()),
+            });
+            pill.set_tooltip_text(Some(&format!("Playing on {}", outputs.join(", "))));
+            pill.add_css_class("live");
+            live.profile_menu.add_css_class("live");
+        }
+    }
+    pill.set_visible(current.is_some());
+
+    let selected = devices.get(live.device_drop.selected() as usize);
+    let output_pill = &live.output_pill;
+    match selected {
+        Some(device) if !device.connected => {
+            output_pill.set_text("DISCONNECTED");
+            output_pill.set_tooltip_text(Some("This output is remembered but not connected"));
+            output_pill.remove_css_class("live");
+            output_pill.set_visible(true);
+        }
+        Some(device) if device.is_default => {
+            output_pill.set_text("● SYSTEM OUTPUT");
+            output_pill.set_tooltip_text(Some("Desktop audio is currently playing here"));
+            output_pill.add_css_class("live");
+            output_pill.set_visible(true);
+        }
+        _ => output_pill.set_visible(false),
+    }
+
+    let profiles = model.profiles.borrow();
+    for (index, (profile, badge)) in profiles
+        .iter()
+        .zip(model.profile_pills.borrow().iter())
+        .enumerate()
+    {
+        let (outputs, paused) = users_of(&profile.id);
+        badge.set_visible(!outputs.is_empty());
+        if let Some(row) = live
+            .profile_list
+            .row_at_index(index as i32)
+            .and_downcast::<adw::ActionRow>()
+        {
+            let resting = disconnected_owners_of(&profile.id);
+            row.set_subtitle(&if !outputs.is_empty() {
+                format!("In use · {}", outputs.join(", "))
+            } else if !paused.is_empty() {
+                format!("Paused · {} ({paused_reason})", paused.join(", "))
+            } else if !resting.is_empty() {
+                format!("Assigned · {} (not connected)", resting.join(", "))
+            } else if profile.activatable {
+                "Ready".to_owned()
+            } else {
+                "Needs attention".to_owned()
+            });
+        }
+    }
 }
 
 fn displayed_device_bypass(
@@ -3033,6 +3357,29 @@ fn install_css() {
             font-size: 11px;
         }
 
+        .live-pill {
+            background-color: #242729;
+            border: 1px solid #303436;
+            border-radius: 999px;
+            color: #8e9293;
+            font-family: monospace;
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 0.6px;
+            padding: 1px 8px;
+        }
+
+        .live-pill.live {
+            background-color: alpha(#89ad73, 0.14);
+            border-color: alpha(#89ad73, 0.55);
+            color: #a9cf92;
+        }
+
+        .profile-menu.live > button {
+            border-color: alpha(#89ad73, 0.7);
+            box-shadow: inset 3px 0 0 #89ad73;
+        }
+
         entry,
         spinbutton,
         dropdown > button {
@@ -3240,6 +3587,12 @@ fn install_css() {
             background-color: #222527;
         }
 
+        /* The profile open in the editor. */
+        list.boxed-list > row:selected {
+            background-color: #2c3032;
+            box-shadow: inset 3px 0 0 #ecece8;
+        }
+
         scrollbar slider {
             background-color: #4a4e50;
             border-radius: 999px;
@@ -3342,18 +3695,27 @@ fn repopulate_profiles(list: &gtk::ListBox, model: &Rc<Model>) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
+    let mut badges = Vec::new();
     for profile in model.profiles.borrow().iter() {
-        list.append(
-            &adw::ActionRow::builder()
-                .title(&profile.name)
-                .subtitle(if profile.activatable {
-                    "Ready"
-                } else {
-                    "Needs attention"
-                })
-                .build(),
-        );
+        let row = adw::ActionRow::builder()
+            .title(&profile.name)
+            .subtitle(if profile.activatable {
+                "Ready"
+            } else {
+                "Needs attention"
+            })
+            .build();
+        let badge = gtk::Label::new(Some("● LIVE"));
+        badge.add_css_class("live-pill");
+        badge.add_css_class("live");
+        badge.set_valign(gtk::Align::Center);
+        badge.set_visible(false);
+        row.add_suffix(&badge);
+        list.append(&row);
+        badges.push(badge);
     }
+    *model.profile_pills.borrow_mut() = badges;
+    update_live_indicators(model);
 }
 
 fn show_startup_error(app: &adw::Application, message: &str) {
@@ -3375,9 +3737,134 @@ fn show_startup_error(app: &adw::Application, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelSelection, Filter, FilterKind, PendingDeviceBypass, ProfileDocument, can_add_filter,
-        displayed_device_bypass,
+        COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
+        HashMap, PendingDeviceBypass, ProfileDocument, can_add_filter, device_focus_target,
+        displayed_device_bypass, effective_profile_id, output_is_filtering, preferred_device_index,
     };
+    use massiveeq_core::DeviceKey;
+
+    fn output(id: &str, connected: bool, is_default: bool, profile: Option<&str>) -> DeviceInfo {
+        DeviceInfo {
+            key: DeviceKey {
+                backend: "alsa".into(),
+                stable_id: id.into(),
+                route: "playback".into(),
+            },
+            node_name: id.into(),
+            description: id.into(),
+            channels: 2,
+            connected,
+            assigned_profile: profile.map(str::to_owned),
+            bypassed: false,
+            is_default,
+        }
+    }
+
+    #[test]
+    fn startup_prefers_the_system_default_output() {
+        let devices = [
+            output("speakers", true, false, Some("flat")),
+            output("headphones", true, true, None),
+        ];
+        assert_eq!(preferred_device_index(&devices), Some(1));
+    }
+
+    #[test]
+    fn startup_falls_back_to_an_output_with_a_profile() {
+        let devices = [
+            output("hdmi", true, false, None),
+            output("speakers", true, false, Some("flat")),
+            output("old", false, false, Some("flat")),
+        ];
+        assert_eq!(preferred_device_index(&devices), Some(1));
+    }
+
+    #[test]
+    fn newly_connected_output_takes_focus() {
+        let old = [
+            output("speakers", true, true, None),
+            output("buds", false, false, None),
+        ];
+        let new = [
+            output("buds", true, false, None),
+            output("speakers", true, true, None),
+        ];
+        assert_eq!(device_focus_target(&old, &new), Some(0));
+    }
+
+    #[test]
+    fn default_output_change_takes_focus() {
+        let old = [
+            output("buds", true, false, None),
+            output("speakers", true, true, None),
+        ];
+        let new = [
+            output("buds", true, true, None),
+            output("speakers", true, false, None),
+        ];
+        assert_eq!(device_focus_target(&old, &new), Some(0));
+    }
+
+    #[test]
+    fn unchanged_outputs_keep_focus() {
+        let old = [
+            output("buds", true, true, None),
+            output("speakers", false, false, None),
+        ];
+        assert_eq!(device_focus_target(&old, &old.clone()), None);
+        let fewer = [output("buds", true, true, None)];
+        assert_eq!(device_focus_target(&old, &fewer), None);
+    }
+
+    #[test]
+    fn bypassed_or_surround_outputs_are_not_filtering() {
+        let device = output("buds", true, true, Some("flat"));
+        let mut comparisons = HashMap::new();
+        assert!(output_is_filtering(&device, &comparisons, false));
+        assert!(!output_is_filtering(&device, &comparisons, true));
+        let surround = DeviceInfo {
+            channels: 6,
+            ..device.clone()
+        };
+        assert!(!output_is_filtering(&surround, &comparisons, false));
+        comparisons.insert(
+            device.key.as_storage_key(),
+            ComparisonSet {
+                profile_ids: vec!["flat".into()],
+                active_profile_id: COMPARISON_BYPASS_ID.into(),
+                enabled: true,
+            },
+        );
+        assert!(!output_is_filtering(&device, &comparisons, false));
+    }
+
+    #[test]
+    fn active_comparison_candidate_is_the_playing_profile() {
+        let device = output("buds", true, true, Some("flat"));
+        let key = device.key.as_storage_key();
+        let mut comparisons = HashMap::new();
+        assert_eq!(
+            effective_profile_id(&device, &comparisons).as_deref(),
+            Some("flat")
+        );
+        comparisons.insert(
+            key.clone(),
+            ComparisonSet {
+                profile_ids: vec!["flat".into(), "warm".into()],
+                active_profile_id: "warm".into(),
+                enabled: true,
+            },
+        );
+        assert_eq!(
+            effective_profile_id(&device, &comparisons).as_deref(),
+            Some("warm")
+        );
+        comparisons.get_mut(&key).unwrap().active_profile_id = COMPARISON_BYPASS_ID.into();
+        assert_eq!(
+            effective_profile_id(&device, &comparisons).as_deref(),
+            Some("flat")
+        );
+    }
 
     #[test]
     fn pending_filter_toggle_wins_over_stale_service_poll() {

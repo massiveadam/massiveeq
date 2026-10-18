@@ -15,6 +15,12 @@
   documentation, and a feature screenshot gallery.
 - Make the `yay -S massiveeq-git` AUR path prominent and document an equivalent
   no-helper `makepkg -si` installation and update workflow.
+- Open the editor on the system's current output with its playing profile in
+  focus, and follow newly connected outputs (or a new system default) to
+  their assigned profile.
+- Mark what is actually playing: a LIVE badge beside the profile name and on
+  profile bank rows in use, a SYSTEM OUTPUT badge for the default output, and
+  "Assigned · … (not connected)" for profiles waiting on an absent output.
 
 ## 0.3.0-beta.2 — 2026-07-15
 
