@@ -35,7 +35,8 @@ support contract.
 
 - Squiglink, AutoEQ, and common Equalizer APO text profile import
 - Parametric EQ, per-ear filters, GraphicEQ, preamp, includes, and convolution
-- True-stereo (4-channel) and 7.1 virtual-surround (14-channel HeSuVi) BRIRs
+- Optional true-stereo (4-channel) and 7.1 virtual-surround (14-channel
+  HeSuVi) convolution for speaker and room simulation on headphones
 - Automatic profile assignment using stable Bluetooth and ALSA identifiers
 - Unlimited saved profiles with per-output assignment or an explicit unassigned state
 - Per-output comparison banks for 2–9 profiles plus level-matched dry playback
@@ -268,9 +269,13 @@ Convolution assets are decoded with libsndfile and resampled offline with
 libsamplerate's highest-quality sinc converter. The real-time callback performs
 no allocation, locking, file access, logging, process control, or D-Bus work.
 
-### Multichannel impulse responses
+### Advanced: multichannel impulse responses
 
-The layout of a convolution file follows from its channel count:
+MassiveEQ is a stereo equalizer first. EQ profiles and ordinary 1- or
+2-channel impulse responses never change an output's channel layout. Multichannel
+convolution is opt-in: it applies only when a profile loads a 4- or
+14-channel file. The layout of a convolution file follows from its channel
+count:
 
 | Channels | Layout | Input | How it is applied |
 | --- | --- | --- | --- |

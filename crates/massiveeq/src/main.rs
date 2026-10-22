@@ -2039,7 +2039,7 @@ fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
     } else {
         ui.file_name.set_text("No impulse response selected");
         ui.file_path.set_text(
-            "WAV, FLAC, AIFF, or OGG · up to 10 seconds · 1, 2, 4 (true stereo), or 14 channels (HeSuVi 7.1)",
+            "WAV, FLAC, AIFF, or OGG · up to 10 seconds · mono or stereo (true-stereo and 7.1 BRIRs also work)",
         );
         ui.channel.set_selected(0);
         ui.channel.set_sensitive(true);
