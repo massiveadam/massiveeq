@@ -325,6 +325,39 @@ impl Service {
         Self::changed(&emitter, "bypass").await.map_err(failed)
     }
 
+    /// Play (or retune) the tone finder's test tone on an output. Must be
+    /// called again within five seconds to keep it playing.
+    async fn play_tone(&self, device_key: &str, settings: &str) -> fdo::Result<()> {
+        let settings: crate::tone::ToneSettings = serde_json::from_str(settings)
+            .map_err(|error| fdo::Error::InvalidArgs(error.to_string()))?;
+        let mut state = self.state.lock().await;
+        if let Some(tone) = state.tone.as_mut()
+            && tone.device_key == device_key
+        {
+            tone.update(settings);
+            return Ok(());
+        }
+        if let Some(tone) = state.tone.take() {
+            tone.stop();
+        }
+        let device = state
+            .devices
+            .iter()
+            .find(|device| device.connected && device.key.as_storage_key() == device_key)
+            .cloned()
+            .ok_or_else(|| fdo::Error::Failed("that output is not connected".into()))?;
+        let rate = crate::device::graph_settings().await.sample_rate;
+        state.tone = Some(crate::tone::Tone::start(&device, rate, settings).map_err(failed)?);
+        Ok(())
+    }
+
+    async fn stop_tone(&self) -> fdo::Result<()> {
+        if let Some(tone) = self.state.lock().await.tone.take() {
+            tone.stop();
+        }
+        Ok(())
+    }
+
     async fn set_global_bypass(
         &self,
         bypassed: bool,

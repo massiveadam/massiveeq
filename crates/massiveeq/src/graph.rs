@@ -19,6 +19,13 @@ const FINE_FREQUENCY_OCTAVES: f64 = 1.0 / 48.0;
 const COARSE_FREQUENCY_OCTAVES: f64 = 1.0 / 6.0;
 const Q_STEP_FACTOR: f64 = 1.1;
 
+/// Things drawn on the graph besides the EQ response.
+#[derive(Debug, Default)]
+pub struct Overlay {
+    /// Frequency the tone finder is playing.
+    pub tone: Option<f64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NudgeDirection {
     Up,
@@ -31,6 +38,7 @@ pub fn response_graph(
     analysis: Rc<RefCell<Option<ProfileAnalysis>>>,
     document: Rc<RefCell<Option<ProfileDocument>>>,
     selected_filter: Rc<Cell<Option<usize>>>,
+    overlay: Rc<RefCell<Overlay>>,
 ) -> DrawingArea {
     let area = DrawingArea::builder()
         .height_request(410)
@@ -85,6 +93,9 @@ pub fn response_graph(
 
         if let Some(profile) = document.borrow().as_ref() {
             draw_filter_points(context, profile, selected_filter.get(), width, height);
+        }
+        if let Some(frequency) = overlay.borrow().tone {
+            draw_tone_marker(context, frequency, width, height);
         }
     });
     area
@@ -309,6 +320,35 @@ fn draw_channel_legend(cr: &cairo::Context, width: f64, stereo: bool) {
         cr.move_to(width - RIGHT - 22.0, 18.0);
         let _ = cr.show_text("R");
     }
+}
+
+fn draw_tone_marker(cr: &cairo::Context, frequency: f64, width: f64, height: f64) {
+    let x = x_for(frequency, width);
+    cr.set_source_rgba(0.54, 0.68, 0.45, 0.85);
+    cr.set_line_width(1.5);
+    cr.set_dash(&[4.0, 4.0], 0.0);
+    cr.move_to(x, TOP);
+    cr.line_to(x, height - BOTTOM);
+    let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+    cr.select_font_face(
+        "Monospace",
+        cairo::FontSlant::Normal,
+        cairo::FontWeight::Bold,
+    );
+    cr.set_font_size(10.0);
+    let label = if frequency >= 1000.0 {
+        format!("TONE {:.2} kHz", frequency / 1000.0)
+    } else {
+        format!("TONE {frequency:.0} Hz")
+    };
+    let text_width = cr
+        .text_extents(&label)
+        .map(|extents| extents.width())
+        .unwrap_or(60.0);
+    let left = (x + 6.0).min(width - RIGHT - text_width);
+    cr.move_to(left, TOP + 12.0);
+    let _ = cr.show_text(&label);
 }
 
 fn rounded_rectangle(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, radius: f64) {

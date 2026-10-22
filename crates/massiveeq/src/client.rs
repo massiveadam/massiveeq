@@ -102,6 +102,17 @@ impl Client {
             .call("SetDeviceBypass", &(device_key, bypassed))
             .context("bypass failed")
     }
+    /// Start or retune the test tone; repeat within five seconds to keep it playing.
+    pub fn play_tone(&self, device_key: &str, settings: &serde_json::Value) -> Result<()> {
+        self.proxy()?
+            .call("PlayTone", &(device_key, settings.to_string()))
+            .context("could not play the test tone")
+    }
+    pub fn stop_tone(&self) -> Result<()> {
+        self.proxy()?
+            .call("StopTone", &())
+            .context("could not stop the test tone")
+    }
     pub fn set_global_bypass(&self, bypassed: bool) -> Result<()> {
         self.proxy()?
             .call("SetGlobalBypass", &(bypassed))

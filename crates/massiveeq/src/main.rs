@@ -47,6 +47,7 @@ struct Model {
     /// The impulse response's own curve per ear (service analysis minus the
     /// EQ), so live previews while dragging include it.
     ir_curve: RefCell<Option<[Vec<ResponsePoint>; 2]>>,
+    overlay: Rc<RefCell<graph::Overlay>>,
     /// Last click, key press, or scroll anywhere in the window.
     last_input: Cell<Option<std::time::Instant>>,
     /// Set while the bank is rebuilt in place, so re-selecting the open profile
@@ -174,6 +175,7 @@ fn build_ui(app: &adw::Application) {
         live: RefCell::new(None),
         profile_pills: RefCell::new(Vec::new()),
         ir_curve: RefCell::new(None),
+        overlay: Rc::new(RefCell::new(graph::Overlay::default())),
         last_input: Cell::new(None),
         reordering_profiles: Cell::new(false),
     });
@@ -492,6 +494,7 @@ fn build_ui(app: &adw::Application) {
         model.analysis.clone(),
         model.document.clone(),
         model.selected_filter.clone(),
+        model.overlay.clone(),
     );
     graph.set_focusable(true);
     graph.set_focus_on_click(true);
@@ -657,6 +660,8 @@ fn build_ui(app: &adw::Application) {
         .build();
     text_scroll.add_css_class("code-editor");
     parametric_stack.add_named(&text_scroll, Some("text"));
+    let (tone_page, tone_ui) = build_tone_page();
+    parametric_stack.add_named(&tone_page, Some("tone"));
     view_stack.add_titled(&parametric_stack, Some("filters"), "Parametric");
     let switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     switcher.set_halign(gtk::Align::Center);
@@ -696,6 +701,18 @@ fn build_ui(app: &adw::Application) {
     visual_mode.set_active(true);
     let text_mode = gtk::ToggleButton::with_label("TEXT");
     text_mode.set_group(Some(&visual_mode));
+    let tone_mode = gtk::ToggleButton::with_label("TONE");
+    tone_mode.set_group(Some(&visual_mode));
+    tone_mode.set_tooltip_text(Some(
+        "Find peaks and dips on your own ears with a test tone",
+    ));
+    tone_mode.connect_clicked({
+        let stack = parametric_stack.clone();
+        move |button| {
+            button.set_active(true);
+            stack.set_visible_child_name("tone");
+        }
+    });
     visual_mode.connect_clicked({
         let stack = parametric_stack.clone();
         move |button| {
@@ -713,14 +730,16 @@ fn build_ui(app: &adw::Application) {
     parametric_stack.connect_visible_child_name_notify({
         let visual_mode = visual_mode.clone();
         let text_mode = text_mode.clone();
-        move |stack| {
-            let text = stack.visible_child_name().as_deref() == Some("text");
-            visual_mode.set_active(!text);
-            text_mode.set_active(text);
+        let tone_mode = tone_mode.clone();
+        move |stack| match stack.visible_child_name().as_deref() {
+            Some("text") => text_mode.set_active(true),
+            Some("tone") => tone_mode.set_active(true),
+            _ => visual_mode.set_active(true),
         }
     });
     editor_switcher.append(&visual_mode);
     editor_switcher.append(&text_mode);
+    editor_switcher.append(&tone_mode);
     let reset_filters_button = gtk::Button::with_label("RESET FILTERS");
     reset_filters_button.add_css_class("reset-filters");
     reset_filters_button.set_tooltip_text(Some(
@@ -859,6 +878,17 @@ fn build_ui(app: &adw::Application) {
         &global_bypass,
         &comparison_ui,
         &trim,
+    );
+    wire_tone(
+        &window,
+        &model,
+        &tone_ui,
+        &device_drop,
+        &filter_list,
+        &text_view,
+        &analysis_label,
+        &graph,
+        &status,
     );
     gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), {
         let model = model.clone();
@@ -1997,6 +2027,347 @@ fn load_profile(
         graph.queue_draw();
     }
     model.loading.set(false);
+}
+
+/// Controls of the tone finder page.
+struct ToneUi {
+    play: gtk::ToggleButton,
+    signal: gtk::DropDown,
+    band: gtk::DropDown,
+    ears: gtk::DropDown,
+    frequency: gtk::Scale,
+    frequency_label: gtk::Label,
+    level: gtk::Scale,
+    level_label: gtk::Label,
+    fixes: Vec<(gtk::Button, f64)>,
+}
+
+/// Slider position (0–1) to frequency, logarithmic over 20 Hz–20 kHz.
+fn tone_frequency(position: f64) -> f64 {
+    20.0 * 1000.0_f64.powf(position.clamp(0.0, 1.0))
+}
+
+fn tone_position(frequency: f64) -> f64 {
+    (frequency / 20.0).log(1000.0).clamp(0.0, 1.0)
+}
+
+fn build_tone_page() -> (gtk::Box, Rc<ToneUi>) {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    page.set_valign(gtk::Align::Start);
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    card.add_css_class("convolution-card");
+    let heading = gtk::Label::new(Some("TONE FINDER"));
+    heading.set_xalign(0.0);
+    heading.add_css_class("section-label");
+    card.append(&heading);
+    let note = gtk::Label::new(Some(
+        "Play a tone through this output's current EQ and sweep it to find peaks and dips on \
+         your own ears, then fix them with one click. Start quiet: the level is capped at \
+         −12 dBFS.",
+    ));
+    note.set_xalign(0.0);
+    note.set_wrap(true);
+    note.add_css_class("level-code");
+    card.append(&note);
+
+    let options = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let play = gtk::ToggleButton::with_label("PLAY TONE");
+    play.add_css_class("suggested-action");
+    let dropdown = |items: &[&str], selected: u32| {
+        let dropdown = gtk::DropDown::new(Some(gtk::StringList::new(items)), gtk::Expression::NONE);
+        dropdown.set_selected(selected);
+        dropdown.set_hexpand(true);
+        dropdown
+    };
+    let signal = dropdown(&["SINE", "PINK NOISE"], 0);
+    let band = dropdown(&["FULL RANGE", "1 OCTAVE", "1/3 OCTAVE"], 2);
+    band.set_sensitive(false);
+    band.set_tooltip_text(Some("Noise band centered on the frequency"));
+    let ears = dropdown(&["LEFT", "BOTH", "RIGHT"], 1);
+    options.append(&play);
+    options.append(&signal);
+    options.append(&band);
+    options.append(&ears);
+    card.append(&options);
+
+    let slider_row = |name: &str, scale: &gtk::Scale, value: &gtk::Label| {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let label = gtk::Label::new(Some(name));
+        label.add_css_class("section-label");
+        label.set_width_chars(10);
+        label.set_xalign(0.0);
+        scale.set_hexpand(true);
+        scale.set_draw_value(false);
+        value.add_css_class("level-code");
+        value.set_width_chars(10);
+        value.set_xalign(1.0);
+        row.append(&label);
+        row.append(scale);
+        row.append(value);
+        row
+    };
+    let frequency = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.001);
+    frequency.set_value(tone_position(1_000.0));
+    frequency.set_increments(1.0 / 120.0, 1.0 / 30.0);
+    let frequency_label = gtk::Label::new(Some("1.00 kHz"));
+    card.append(&slider_row("FREQUENCY", &frequency, &frequency_label));
+    let level = gtk::Scale::with_range(gtk::Orientation::Horizontal, -60.0, -12.0, 1.0);
+    level.set_value(-36.0);
+    let level_label = gtk::Label::new(Some("−36 dBFS"));
+    card.append(&slider_row("LEVEL", &level, &level_label));
+
+    let fixes_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let fixes_label = gtk::Label::new(Some("FIX HERE"));
+    fixes_label.add_css_class("section-label");
+    fixes_label.set_width_chars(10);
+    fixes_label.set_xalign(0.0);
+    fixes_row.append(&fixes_label);
+    let mut fixes = Vec::new();
+    for (text, delta) in [
+        ("CUT 3 dB", -3.0),
+        ("CUT 1 dB", -1.0),
+        ("BOOST 1 dB", 1.0),
+        ("BOOST 3 dB", 3.0),
+    ] {
+        let button = gtk::Button::with_label(text);
+        button.set_hexpand(true);
+        button.set_tooltip_text(Some(
+            "Add a peak filter at the tone's frequency for the selected ears, or adjust the one already there",
+        ));
+        fixes_row.append(&button);
+        fixes.push((button, delta));
+    }
+    card.append(&fixes_row);
+    page.append(&card);
+    let ui = Rc::new(ToneUi {
+        play,
+        signal,
+        band,
+        ears,
+        frequency,
+        frequency_label,
+        level,
+        level_label,
+        fixes,
+    });
+    (page, ui)
+}
+
+fn tone_settings(ui: &ToneUi) -> serde_json::Value {
+    serde_json::json!({
+        "signal": if ui.signal.selected() == 1 { "pink" } else { "sine" },
+        "band": match ui.band.selected() { 0 => "full", 1 => "octave", _ => "third" },
+        "ears": match ui.ears.selected() { 0 => "left", 2 => "right", _ => "both" },
+        "frequency": tone_frequency(ui.frequency.value()),
+        "level_db": ui.level.value(),
+    })
+}
+
+/// Send the tone's settings (which also keeps it alive), or stop it.
+fn push_tone(model: &Model, ui: &ToneUi, device_drop: &gtk::DropDown, status: &gtk::Label) {
+    let frequency = tone_frequency(ui.frequency.value());
+    ui.frequency_label
+        .set_text(&format_band_frequency(frequency));
+    ui.level_label
+        .set_text(&format!("{:.0} dBFS", ui.level.value()).replace('-', "−"));
+    ui.band.set_sensitive(ui.signal.selected() == 1);
+    if !ui.play.is_active() {
+        model.overlay.borrow_mut().tone = None;
+        return;
+    }
+    model.overlay.borrow_mut().tone = Some(frequency);
+    let key = model
+        .devices
+        .borrow()
+        .get(device_drop.selected() as usize)
+        .filter(|device| device.connected)
+        .map(|device| device.key.as_storage_key());
+    let Some(key) = key else {
+        status.set_text("Connect an output to play a tone");
+        ui.play.set_active(false);
+        return;
+    };
+    if let Err(error) = model.client.play_tone(&key, &tone_settings(ui)) {
+        status.set_text(&error.to_string());
+        ui.play.set_active(false);
+    }
+}
+
+/// Q of the fix filter: as wide as what the listener was hearing.
+fn tone_fix_q(ui: &ToneUi) -> f64 {
+    match (ui.signal.selected(), ui.band.selected()) {
+        (1, 0) | (1, 1) => std::f64::consts::SQRT_2,
+        _ => 4.318,
+    }
+}
+
+/// Add `delta_db` at `frequency` for `channels`: adjust a peak filter already
+/// within a twelfth of an octave there, or add one. Returns the filter index.
+fn apply_tone_fix(
+    document: &mut ProfileDocument,
+    frequency: f64,
+    q: f64,
+    channels: ChannelSelection,
+    delta_db: f64,
+) -> Option<usize> {
+    let existing = document.filters.iter().position(|filter| {
+        filter.kind == FilterKind::Peaking
+            && filter.channels == channels
+            && (filter.frequency / frequency).log2().abs() <= 1.0 / 12.0
+    });
+    if let Some(index) = existing {
+        let filter = &mut document.filters[index];
+        filter.gain_db = (filter.gain_db + delta_db).clamp(-20.0, 20.0);
+        filter.enabled = true;
+        return Some(index);
+    }
+    if !can_add_filter(document, channels) {
+        return None;
+    }
+    document.graphic_eqs.clear();
+    document.filters.push(Filter {
+        enabled: true,
+        kind: FilterKind::Peaking,
+        frequency: (frequency * 100.0).round() / 100.0,
+        gain_db: delta_db,
+        q,
+        channels,
+    });
+    Some(document.filters.len() - 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_tone(
+    window: &adw::ApplicationWindow,
+    model: &Rc<Model>,
+    ui: &Rc<ToneUi>,
+    device_drop: &gtk::DropDown,
+    filter_list: &gtk::FlowBox,
+    text_view: &gtk::TextView,
+    analysis_label: &gtk::Label,
+    graph: &gtk::DrawingArea,
+    status: &gtk::Label,
+) {
+    let push = Rc::new({
+        let model = model.clone();
+        let ui = ui.clone();
+        let device_drop = device_drop.clone();
+        let status = status.clone();
+        let graph = graph.clone();
+        move || {
+            push_tone(&model, &ui, &device_drop, &status);
+            graph.queue_draw();
+        }
+    });
+    ui.play.connect_toggled({
+        let model = model.clone();
+        let push = push.clone();
+        move |play| {
+            play.set_label(if play.is_active() {
+                "STOP"
+            } else {
+                "PLAY TONE"
+            });
+            if !play.is_active() {
+                let _ = model.client.stop_tone();
+            }
+            push();
+        }
+    });
+    for dropdown in [&ui.signal, &ui.band, &ui.ears] {
+        let push = push.clone();
+        dropdown.connect_selected_notify(move |_| push());
+    }
+    for scale in [&ui.frequency, &ui.level] {
+        let push = push.clone();
+        scale.connect_value_changed(move |_| push());
+    }
+    {
+        let push = push.clone();
+        device_drop.connect_selected_notify(move |_| push());
+    }
+    // Renew the tone while it plays; the service stops it five seconds after
+    // the last renewal, so a crashed editor cannot leave a tone running.
+    gtk::glib::timeout_add_seconds_local(2, {
+        let ui = ui.clone();
+        let push = push.clone();
+        move || {
+            if ui.play.is_active() {
+                push();
+            }
+            gtk::glib::ControlFlow::Continue
+        }
+    });
+    // Leaving the page or closing the window stops the tone.
+    ui.play
+        .parent()
+        .and_then(|row| row.parent())
+        .and_then(|card| card.parent())
+        .inspect(|page| {
+            let play = ui.play.clone();
+            page.connect_unmap(move |_| play.set_active(false));
+        });
+    window.connect_close_request({
+        let model = model.clone();
+        move |_| {
+            let _ = model.client.stop_tone();
+            gtk::glib::Propagation::Proceed
+        }
+    });
+
+    let buffer = text_view.buffer();
+    for (button, delta) in &ui.fixes {
+        let delta = *delta;
+        button.connect_clicked({
+            let model = model.clone();
+            let ui = ui.clone();
+            let buffer = buffer.clone();
+            let filter_list = filter_list.clone();
+            let analysis_label = analysis_label.clone();
+            let graph = graph.clone();
+            let status = status.clone();
+            move |_| {
+                let frequency = tone_frequency(ui.frequency.value());
+                let channels = match ui.ears.selected() {
+                    0 => ChannelSelection::Left,
+                    2 => ChannelSelection::Right,
+                    _ => ChannelSelection::All,
+                };
+                let changed = {
+                    let mut document = model.document.borrow_mut();
+                    let Some(document) = document.as_mut() else {
+                        return;
+                    };
+                    apply_tone_fix(document, frequency, tone_fix_q(&ui), channels, delta).map(
+                        |index| {
+                            (
+                                index,
+                                serialize_profile(document),
+                                document.clone(),
+                                preview_analysis(&model, document),
+                            )
+                        },
+                    )
+                };
+                let Some((index, text, snapshot, preview)) = changed else {
+                    status.set_text("This profile already has 64 bands on one channel");
+                    return;
+                };
+                model.selected_filter.set(Some(index));
+                buffer.set_text(&text);
+                rebuild_filter_list(&filter_list, &snapshot, &model, &buffer, &graph);
+                set_analysis_label(&analysis_label, &preview);
+                *model.analysis.borrow_mut() = Some(preview);
+                graph.queue_draw();
+                status.set_text(&format!(
+                    "{} {:.0} dB at {}",
+                    if delta < 0.0 { "Cut" } else { "Boosted" },
+                    delta.abs(),
+                    format_band_frequency(frequency)
+                ));
+            }
+        });
+    }
 }
 
 fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
@@ -4015,8 +4386,8 @@ fn show_startup_error(app: &adw::Application, message: &str) {
 mod tests {
     use super::{
         ChannelSelection, DeviceInfo, Filter, FilterKind, PendingDeviceBypass, ProfileDocument,
-        SourceRate, can_add_filter, device_focus_target, displayed_device_bypass, engine_tooltip,
-        preferred_device_index, source_rate,
+        SourceRate, apply_tone_fix, can_add_filter, device_focus_target, displayed_device_bypass,
+        engine_tooltip, preferred_device_index, source_rate, tone_frequency, tone_position,
     };
     use massiveeq_core::DeviceKey;
 
@@ -4035,6 +4406,32 @@ mod tests {
             bypassed: false,
             is_default,
         }
+    }
+
+    #[test]
+    fn tone_fix_adjusts_a_nearby_filter_or_adds_one() {
+        let mut document = ProfileDocument::empty("tone");
+        assert_eq!(
+            apply_tone_fix(&mut document, 3_000.0, 4.318, ChannelSelection::All, -3.0),
+            Some(0)
+        );
+        // A twentieth of an octave away is the same filter; it deepens.
+        assert_eq!(
+            apply_tone_fix(&mut document, 3_105.0, 4.318, ChannelSelection::All, -1.0),
+            Some(0)
+        );
+        assert_eq!(document.filters.len(), 1);
+        assert_eq!(document.filters[0].gain_db, -4.0);
+        // The other ear, or a different frequency, gets its own filter.
+        assert_eq!(
+            apply_tone_fix(&mut document, 3_000.0, 4.318, ChannelSelection::Left, 1.0),
+            Some(1)
+        );
+        assert_eq!(
+            apply_tone_fix(&mut document, 6_000.0, 4.318, ChannelSelection::All, 1.0),
+            Some(2)
+        );
+        assert!((tone_frequency(tone_position(440.0)) - 440.0).abs() < 1e-9);
     }
 
     #[test]
