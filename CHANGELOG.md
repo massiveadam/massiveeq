@@ -47,6 +47,9 @@
 
 ### Fixed
 
+- Apply the narrow (under 720 px) layout. It never took effect because the
+  wider route breakpoint, added later, always won; narrow windows were
+  clipped on the right instead of reflowing.
 - Mark the Convolution tab, not Parametric, when the editor opens on a
   convolution profile.
 - Play 4-channel impulse responses as true stereo. They previously played only

@@ -43,7 +43,6 @@ struct Model {
     /// Set while the device list is rebuilt so restoring the selection keeps profile focus.
     restoring_device: Cell<bool>,
     live: RefCell<Option<LiveIndicators>>,
-    profile_pills: RefCell<Vec<gtk::Label>>,
     /// The impulse response's own curve per ear (service analysis minus the
     /// EQ), so live previews while dragging include it.
     ir_curve: RefCell<Option<[Vec<ResponsePoint>; 2]>>,
@@ -58,9 +57,8 @@ struct Model {
 /// Widgets that show which profile is actually playing.
 #[derive(Clone)]
 struct LiveIndicators {
-    profile_pill: gtk::Label,
-    output_pill: gtk::Label,
-    profile_menu: gtk::MenuButton,
+    profile_status: gtk::Label,
+    output_status: gtk::Label,
     profile_list: gtk::ListBox,
     device_drop: gtk::DropDown,
     /// Open menus hold off focus changes from newly connected outputs.
@@ -173,7 +171,6 @@ fn build_ui(app: &adw::Application) {
         pending_focus: RefCell::new(None),
         restoring_device: Cell::new(false),
         live: RefCell::new(None),
-        profile_pills: RefCell::new(Vec::new()),
         ir_curve: RefCell::new(None),
         overlay: Rc::new(RefCell::new(graph::Overlay::default())),
         last_input: Cell::new(None),
@@ -299,7 +296,7 @@ fn build_ui(app: &adw::Application) {
     controls_card.append(&route_rule);
     let identity_row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
     identity_row.set_hexpand(true);
-    // Equal columns keep the fields still while the live badges change length.
+    // Equal columns keep the fields still while the status text changes.
     identity_row.set_homogeneous(true);
     let profile_column = gtk::Box::new(gtk::Orientation::Vertical, 5);
     profile_column.set_hexpand(true);
@@ -307,12 +304,13 @@ fn build_ui(app: &adw::Application) {
     profile_name_label.set_xalign(0.0);
     profile_name_label.set_hexpand(true);
     profile_name_label.add_css_class("section-label");
-    let profile_pill = gtk::Label::new(None);
-    profile_pill.add_css_class("live-pill");
-    profile_pill.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let profile_status = gtk::Label::new(None);
+    profile_status.add_css_class("route-status");
+    profile_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    profile_status.set_xalign(1.0);
     let profile_name_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     profile_name_row.append(&profile_name_label);
-    profile_name_row.append(&profile_pill);
+    profile_name_row.append(&profile_status);
     profile_column.append(&profile_name_row);
     let name_entry = gtk::Entry::builder()
         .placeholder_text("Profile name")
@@ -328,11 +326,13 @@ fn build_ui(app: &adw::Application) {
     device_heading.set_xalign(0.0);
     device_heading.set_hexpand(true);
     device_heading.add_css_class("section-label");
-    let output_pill = gtk::Label::new(None);
-    output_pill.add_css_class("live-pill");
+    let output_status = gtk::Label::new(None);
+    output_status.add_css_class("route-status");
+    output_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    output_status.set_xalign(1.0);
     let device_heading_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     device_heading_row.append(&device_heading);
-    device_heading_row.append(&output_pill);
+    device_heading_row.append(&output_status);
     device_column.append(&device_heading_row);
     let device_strings = gtk::StringList::new(
         &model
@@ -576,6 +576,18 @@ fn build_ui(app: &adw::Application) {
         "orientation",
         Some(&gtk::Orientation::Horizontal.to_value()),
     );
+    // Only one breakpoint applies at a time (the last matching one), so the
+    // narrow layout repeats the route changes.
+    narrow_filters.add_setter(
+        &controls_card,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    narrow_filters.add_setter(
+        &route_rule,
+        "orientation",
+        Some(&gtk::Orientation::Horizontal.to_value()),
+    );
     narrow_filters.add_setter(
         &identity_row,
         "orientation",
@@ -757,8 +769,8 @@ fn build_ui(app: &adw::Application) {
         "orientation",
         Some(&gtk::Orientation::Vertical.to_value()),
     );
-    window.add_breakpoint(narrow_filters);
     window.add_breakpoint(narrow_route);
+    window.add_breakpoint(narrow_filters);
     let add_filter_button = gtk::Button::with_label("＋  ADD PARAMETRIC BAND");
     add_filter_button.add_css_class("band-add");
     add_filter_button.set_hexpand(true);
@@ -825,9 +837,8 @@ fn build_ui(app: &adw::Application) {
     window.set_content(Some(&toolbar));
 
     *model.live.borrow_mut() = Some(LiveIndicators {
-        profile_pill,
-        output_pill,
-        profile_menu: profile_menu.clone(),
+        profile_status,
+        output_status,
         profile_list: profile_list.clone(),
         device_drop: device_drop.clone(),
         menus: vec![profile_menu.clone(), comparison_ui.menu.clone()],
@@ -2060,8 +2071,7 @@ fn build_curves_menu() -> Rc<CurvesUi> {
     content.set_margin_start(8);
     content.set_margin_end(8);
     let note = gtk::Label::new(Some(
-        "Text or CSV: frequency, dB per line (AutoEQ, Squiglink, REW).\nA target with \
-         frequency, low, high is shown as a range.",
+        "Frequency and dB per line, as AutoEQ, Squiglink,\nand REW export. Three columns make a range.",
     ));
     note.set_xalign(0.0);
     note.add_css_class("level-code");
@@ -2165,16 +2175,68 @@ fn wire_curves(
     }
 }
 
+/// A row of linked toggle buttons choosing one option.
+struct Segmented {
+    root: gtk::Box,
+    buttons: Vec<gtk::ToggleButton>,
+}
+
+impl Segmented {
+    fn new(options: &[&str], selected: usize) -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        root.add_css_class("linked");
+        root.add_css_class("segmented");
+        let buttons = options
+            .iter()
+            .map(|option| gtk::ToggleButton::with_label(option))
+            .collect::<Vec<_>>();
+        for button in &buttons {
+            if let Some(first) = buttons.first().filter(|first| *first != button) {
+                button.set_group(Some(first));
+            }
+            root.append(button);
+        }
+        buttons[selected].set_active(true);
+        Self { root, buttons }
+    }
+
+    fn selected(&self) -> u32 {
+        self.buttons
+            .iter()
+            .position(gtk::ToggleButton::is_active)
+            .unwrap_or_default() as u32
+    }
+
+    fn set_sensitive(&self, sensitive: bool) {
+        self.root.set_sensitive(sensitive);
+    }
+
+    fn connect_changed(&self, callback: impl Fn() + 'static) {
+        let callback = Rc::new(callback);
+        for button in &self.buttons {
+            let callback = callback.clone();
+            // Each change toggles two buttons; act once, on the one turning on.
+            button.connect_toggled(move |button| {
+                if button.is_active() {
+                    callback();
+                }
+            });
+        }
+    }
+}
+
 /// Controls of the tone finder page.
 struct ToneUi {
+    page: gtk::Box,
     play: gtk::ToggleButton,
-    signal: gtk::DropDown,
-    band: gtk::DropDown,
-    ears: gtk::DropDown,
+    signal: Segmented,
+    band: Segmented,
+    ears: Segmented,
     frequency: gtk::Scale,
     frequency_label: gtk::Label,
     level: gtk::Scale,
     level_label: gtk::Label,
+    fix_caption: gtk::Label,
     fixes: Vec<(gtk::Button, f64)>,
 }
 
@@ -2190,92 +2252,93 @@ fn tone_position(frequency: f64) -> f64 {
 fn build_tone_page() -> (gtk::Box, Rc<ToneUi>) {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     page.set_valign(gtk::Align::Start);
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 14);
     card.add_css_class("convolution-card");
-    let heading = gtk::Label::new(Some("TONE FINDER"));
-    heading.set_xalign(0.0);
-    heading.add_css_class("section-label");
-    card.append(&heading);
-    let note = gtk::Label::new(Some(
-        "Play a tone through this output's current EQ and sweep it to find peaks and dips on \
-         your own ears, then fix them with one click. Start quiet: the level is capped at \
-         −12 dBFS.",
-    ));
-    note.set_xalign(0.0);
-    note.set_wrap(true);
-    note.add_css_class("level-code");
-    card.append(&note);
 
-    let options = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let play = gtk::ToggleButton::with_label("PLAY TONE");
-    play.add_css_class("suggested-action");
-    let dropdown = |items: &[&str], selected: u32| {
-        let dropdown = gtk::DropDown::new(Some(gtk::StringList::new(items)), gtk::Expression::NONE);
-        dropdown.set_selected(selected);
-        dropdown.set_hexpand(true);
-        dropdown
+    // Transport and readouts: a round play control and two large values.
+    let top = adw::WrapBox::new();
+    top.set_child_spacing(10);
+    top.set_line_spacing(10);
+    let play = gtk::ToggleButton::new();
+    play.set_icon_name("media-playback-start-symbolic");
+    play.add_css_class("tone-play");
+    play.set_valign(gtk::Align::Center);
+    play.set_tooltip_text(Some("Play a test tone through this output's EQ"));
+    play.update_property(&[gtk::accessible::Property::Label("Play tone")]);
+    top.append(&play);
+    let readout = |value: &str, caption: &str| {
+        let tile = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        tile.add_css_class("tone-readout");
+        let value = gtk::Label::new(Some(value));
+        value.set_xalign(0.0);
+        value.add_css_class("tone-value");
+        let caption = gtk::Label::new(Some(caption));
+        caption.set_xalign(0.0);
+        caption.add_css_class("section-label");
+        tile.append(&value);
+        tile.append(&caption);
+        (tile, value)
     };
-    let signal = dropdown(&["SINE", "PINK NOISE"], 0);
-    let band = dropdown(&["FULL RANGE", "1 OCTAVE", "1/3 OCTAVE"], 2);
-    band.set_sensitive(false);
-    band.set_tooltip_text(Some("Noise band centered on the frequency"));
-    let ears = dropdown(&["LEFT", "BOTH", "RIGHT"], 1);
-    options.append(&play);
-    options.append(&signal);
-    options.append(&band);
-    options.append(&ears);
-    card.append(&options);
+    let (frequency_tile, frequency_label) = readout("1.00 kHz", "FREQUENCY");
+    let (level_tile, level_label) = readout("−36 dBFS", "LEVEL");
+    top.append(&frequency_tile);
+    top.append(&level_tile);
+    card.append(&top);
 
-    let slider_row = |name: &str, scale: &gtk::Scale, value: &gtk::Label| {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let label = gtk::Label::new(Some(name));
-        label.add_css_class("section-label");
-        label.set_width_chars(10);
-        label.set_xalign(0.0);
+    let signal = Segmented::new(&["SINE", "PINK NOISE"], 0);
+    let band = Segmented::new(&["FULL", "OCTAVE", "⅓ OCTAVE"], 2);
+    band.set_sensitive(false);
+    let ears = Segmented::new(&["LEFT", "BOTH", "RIGHT"], 1);
+    let choices = adw::WrapBox::new();
+    choices.set_child_spacing(10);
+    choices.set_line_spacing(8);
+    for segmented in [&signal, &band, &ears] {
+        choices.append(&segmented.root);
+    }
+    card.append(&choices);
+
+    let slider = |range: (f64, f64, f64), value: f64| {
+        let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, range.0, range.1, range.2);
+        scale.set_value(value);
         scale.set_hexpand(true);
         scale.set_draw_value(false);
-        value.add_css_class("level-code");
-        value.set_width_chars(10);
-        value.set_xalign(1.0);
-        row.append(&label);
-        row.append(scale);
-        row.append(value);
-        row
+        scale
     };
-    let frequency = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.001);
-    frequency.set_value(tone_position(1_000.0));
+    let frequency = slider((0.0, 1.0, 0.001), tone_position(1_000.0));
     frequency.set_increments(1.0 / 120.0, 1.0 / 30.0);
-    let frequency_label = gtk::Label::new(Some("1.00 kHz"));
-    card.append(&slider_row("FREQUENCY", &frequency, &frequency_label));
-    let level = gtk::Scale::with_range(gtk::Orientation::Horizontal, -60.0, -12.0, 1.0);
-    level.set_value(-36.0);
-    let level_label = gtk::Label::new(Some("−36 dBFS"));
-    card.append(&slider_row("LEVEL", &level, &level_label));
+    frequency.update_property(&[gtk::accessible::Property::Label("Tone frequency")]);
+    let level = slider((-60.0, -12.0, 1.0), -36.0);
+    level.update_property(&[gtk::accessible::Property::Label("Tone level")]);
+    card.append(&frequency);
+    card.append(&level);
 
-    let fixes_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let fixes_label = gtk::Label::new(Some("FIX HERE"));
-    fixes_label.add_css_class("section-label");
-    fixes_label.set_width_chars(10);
-    fixes_label.set_xalign(0.0);
-    fixes_row.append(&fixes_label);
+    // One-click corrections at the tone's frequency.
+    let fix_caption = gtk::Label::new(Some("ADJUST 1.00 kHz"));
+    fix_caption.set_xalign(0.0);
+    fix_caption.add_css_class("section-label");
+    card.append(&fix_caption);
+    let fix_row = adw::WrapBox::new();
+    fix_row.set_child_spacing(8);
+    fix_row.set_line_spacing(8);
     let mut fixes = Vec::new();
     for (text, delta) in [
-        ("CUT 3 dB", -3.0),
-        ("CUT 1 dB", -1.0),
-        ("BOOST 1 dB", 1.0),
-        ("BOOST 3 dB", 3.0),
+        ("−3 dB", -3.0),
+        ("−1 dB", -1.0),
+        ("+1 dB", 1.0),
+        ("+3 dB", 3.0),
     ] {
         let button = gtk::Button::with_label(text);
-        button.set_hexpand(true);
+        button.add_css_class("tone-fix");
         button.set_tooltip_text(Some(
-            "Add a peak filter at the tone's frequency for the selected ears, or adjust the one already there",
+            "Add a peak filter here for the selected ears, or adjust the one already here",
         ));
-        fixes_row.append(&button);
+        fix_row.append(&button);
         fixes.push((button, delta));
     }
-    card.append(&fixes_row);
+    card.append(&fix_row);
     page.append(&card);
     let ui = Rc::new(ToneUi {
+        page: page.clone(),
         play,
         signal,
         band,
@@ -2284,6 +2347,7 @@ fn build_tone_page() -> (gtk::Box, Rc<ToneUi>) {
         frequency_label,
         level,
         level_label,
+        fix_caption,
         fixes,
     });
     (page, ui)
@@ -2304,6 +2368,8 @@ fn push_tone(model: &Model, ui: &ToneUi, device_drop: &gtk::DropDown, status: &g
     let frequency = tone_frequency(ui.frequency.value());
     ui.frequency_label
         .set_text(&format_band_frequency(frequency));
+    ui.fix_caption
+        .set_text(&format!("ADJUST {}", format_band_frequency(frequency)));
     ui.level_label
         .set_text(&format!("{:.0} dBFS", ui.level.value()).replace('-', "−"));
     ui.band.set_sensitive(ui.signal.selected() == 1);
@@ -2399,10 +2465,10 @@ fn wire_tone(
         let model = model.clone();
         let push = push.clone();
         move |play| {
-            play.set_label(if play.is_active() {
-                "STOP"
+            play.set_icon_name(if play.is_active() {
+                "media-playback-stop-symbolic"
             } else {
-                "PLAY TONE"
+                "media-playback-start-symbolic"
             });
             if !play.is_active() {
                 let _ = model.client.stop_tone();
@@ -2410,9 +2476,9 @@ fn wire_tone(
             push();
         }
     });
-    for dropdown in [&ui.signal, &ui.band, &ui.ears] {
+    for segmented in [&ui.signal, &ui.band, &ui.ears] {
         let push = push.clone();
-        dropdown.connect_selected_notify(move |_| push());
+        segmented.connect_changed(move || push());
     }
     for scale in [&ui.frequency, &ui.level] {
         let push = push.clone();
@@ -2435,14 +2501,10 @@ fn wire_tone(
         }
     });
     // Leaving the page or closing the window stops the tone.
-    ui.play
-        .parent()
-        .and_then(|row| row.parent())
-        .and_then(|card| card.parent())
-        .inspect(|page| {
-            let play = ui.play.clone();
-            page.connect_unmap(move |_| play.set_active(false));
-        });
+    {
+        let play = ui.play.clone();
+        ui.page.connect_unmap(move |_| play.set_active(false));
+    }
     window.connect_close_request({
         let model = model.clone();
         move |_| {
@@ -2533,7 +2595,6 @@ fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
         ui.channel
             .set_tooltip_text(matrix.then_some("This impulse response feeds both ears"));
         ui.remove.set_sensitive(true);
-        ui.convolution_mode.set_label("CONVOLUTION ●");
     } else {
         ui.file_name.set_text("No impulse response selected");
         ui.file_path.set_text(
@@ -2543,7 +2604,6 @@ fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
         ui.channel.set_sensitive(true);
         ui.channel.set_tooltip_text(None);
         ui.remove.set_sensitive(false);
-        ui.convolution_mode.set_label("CONVOLUTION");
     }
     ui.syncing.set(false);
 }
@@ -3613,73 +3673,63 @@ fn update_live_indicators(model: &Rc<Model>) {
 
     let current = model.current_id.borrow().clone();
     let (playing_on, paused_on) = current.as_deref().map(users_of).unwrap_or_default();
-    let pill = &live.profile_pill;
-    match (playing_on.as_slice(), paused_on.as_slice()) {
-        ([], []) => {
-            pill.set_text("NOT PLAYING");
-            pill.set_tooltip_text(Some("This profile is not active on any connected output"));
-            pill.remove_css_class("live");
-            live.profile_menu.remove_css_class("live");
-        }
-        ([], paused) => {
-            pill.set_text(&format!("PAUSED · {}", paused_reason.to_uppercase()));
-            pill.set_tooltip_text(Some(&format!(
-                "Set on {}, but not being applied ({paused_reason})",
-                paused.join(", ")
-            )));
-            pill.remove_css_class("live");
-            live.profile_menu.remove_css_class("live");
-        }
-        (outputs, _) => {
-            pill.set_text(&match outputs {
-                [only] => format!("● LIVE · {}", only.to_uppercase()),
-                _ => format!("● LIVE · {} OUTPUTS", outputs.len()),
-            });
-            pill.set_tooltip_text(Some(&format!("Playing on {}", outputs.join(", "))));
-            pill.add_css_class("live");
-            live.profile_menu.add_css_class("live");
-        }
+    let status = &live.profile_status;
+    let (text, playing) = match (playing_on.as_slice(), paused_on.as_slice()) {
+        ([], []) => ("NOT PLAYING".to_owned(), false),
+        ([], _) => (paused_reason.to_uppercase(), false),
+        ([only], _) => (format!("PLAYING ON {}", only.to_uppercase()), true),
+        (outputs, _) => (format!("PLAYING ON {} OUTPUTS", outputs.len()), true),
+    };
+    status.set_text(&text);
+    status.set_tooltip_text(Some(&match (playing_on.as_slice(), paused_on.as_slice()) {
+        ([], []) => "This profile is not set on any connected output".to_owned(),
+        ([], paused) => format!(
+            "Set on {}, but not being applied: {paused_reason}",
+            paused.join(", ")
+        ),
+        (outputs, _) => format!("Playing on {}", outputs.join(", ")),
+    }));
+    if playing {
+        status.add_css_class("playing");
+    } else {
+        status.remove_css_class("playing");
     }
-    pill.set_visible(current.is_some());
+    status.set_visible(current.is_some());
 
     let selected = devices.get(live.device_drop.selected() as usize);
-    let output_pill = &live.output_pill;
+    let output_status = &live.output_status;
     match selected {
         Some(device) if !device.connected => {
-            output_pill.set_text("DISCONNECTED");
-            output_pill.set_tooltip_text(Some("This output is remembered but not connected"));
-            output_pill.remove_css_class("live");
-            output_pill.set_visible(true);
+            output_status.set_text("NOT CONNECTED");
+            output_status.set_visible(true);
         }
         Some(device) if device.is_default => {
-            output_pill.set_text("● SYSTEM OUTPUT");
-            output_pill.set_tooltip_text(Some("Desktop audio is currently playing here"));
-            output_pill.add_css_class("live");
-            output_pill.set_visible(true);
+            output_status.set_text("SYSTEM OUTPUT");
+            output_status.set_visible(true);
         }
-        _ => output_pill.set_visible(false),
+        _ => output_status.set_visible(false),
     }
 
     let profiles = model.profiles.borrow();
-    for (index, (profile, badge)) in profiles
-        .iter()
-        .zip(model.profile_pills.borrow().iter())
-        .enumerate()
-    {
+    for (index, profile) in profiles.iter().enumerate() {
         let (outputs, paused) = users_of(&profile.id);
-        badge.set_visible(!outputs.is_empty());
         if let Some(row) = live
             .profile_list
             .row_at_index(index as i32)
             .and_downcast::<adw::ActionRow>()
         {
+            if outputs.is_empty() {
+                row.remove_css_class("playing");
+            } else {
+                row.add_css_class("playing");
+            }
             let resting = disconnected_owners_of(&profile.id);
             row.set_subtitle(&if !outputs.is_empty() {
-                format!("In use · {}", outputs.join(", "))
+                format!("Playing on {}", outputs.join(", "))
             } else if !paused.is_empty() {
-                format!("Paused · {} ({paused_reason})", paused.join(", "))
+                format!("{} · {paused_reason}", paused.join(", "))
             } else if !resting.is_empty() {
-                format!("Assigned · {} (not connected)", resting.join(", "))
+                format!("{} · not connected", resting.join(", "))
             } else if profile.activatable {
                 "Ready".to_owned()
             } else {
@@ -3929,7 +3979,7 @@ fn install_css() {
             border-radius: 999px;
             font-family: monospace;
             font-weight: 700;
-            min-width: 150px;
+            min-width: 120px;
             padding: 7px 16px;
         }
 
@@ -4032,32 +4082,22 @@ fn install_css() {
         }
 
         .device-state {
-            color: #89ad73;
+            color: #929798;
             font-family: monospace;
             font-size: 11px;
         }
 
-        .live-pill {
-            background-color: #242729;
-            border: 1px solid #303436;
-            border-radius: 999px;
-            color: #8e9293;
+        /* Where the open profile plays, beside its field label. */
+        .route-status {
+            color: #7d8283;
             font-family: monospace;
             font-size: 9px;
             font-weight: 700;
             letter-spacing: 0.6px;
-            padding: 1px 8px;
         }
 
-        .live-pill.live {
-            background-color: alpha(#89ad73, 0.14);
-            border-color: alpha(#89ad73, 0.55);
-            color: #a9cf92;
-        }
-
-        .profile-menu.live > button {
-            border-color: alpha(#89ad73, 0.7);
-            box-shadow: inset 3px 0 0 #89ad73;
+        .route-status.playing {
+            color: #ff7358;
         }
 
         entry,
@@ -4144,6 +4184,64 @@ fn install_css() {
             border-radius: 22px;
             padding: 18px;
             box-shadow: 0 10px 22px rgba(0, 0, 0, 0.18);
+        }
+
+        .tone-play {
+            min-width: 64px;
+            min-height: 64px;
+            border-radius: 999px;
+            background-color: #242729;
+            border: 1px solid #34383a;
+            padding: 0;
+        }
+
+        .tone-play:checked {
+            background-color: #e64b2f;
+            border-color: #ef5a3e;
+            color: #fff8f4;
+        }
+
+        .tone-readout {
+            background-color: #202325;
+            border-radius: 18px;
+            min-width: 150px;
+            padding: 10px 16px;
+        }
+
+        .tone-value {
+            font-family: monospace;
+            font-size: 22px;
+            font-weight: 600;
+        }
+
+        .segmented button {
+            background-color: #202325;
+            border: 1px solid #2d3031;
+            color: #9a9e9f;
+            font-family: monospace;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 6px 12px;
+        }
+
+        .segmented button:checked {
+            background-color: #33373a;
+            border-color: #3d4244;
+            color: #f1f1ec;
+        }
+
+        .tone-fix {
+            background-color: #202325;
+            border: 1px solid #2d3031;
+            border-radius: 14px;
+            font-family: monospace;
+            font-weight: 700;
+            min-width: 76px;
+            padding: 10px 14px;
+        }
+
+        .tone-fix:hover {
+            border-color: #e64b2f;
         }
 
         .convolution-name {
@@ -4269,8 +4367,12 @@ fn install_css() {
 
         /* The profile open in the editor. */
         list.boxed-list > row:selected {
-            background-color: #2c3032;
-            box-shadow: inset 3px 0 0 #ecece8;
+            background-color: #2d3133;
+        }
+
+        list.boxed-list > row.playing .subtitle {
+            color: #ff7358;
+            opacity: 1;
         }
 
         scrollbar slider {
@@ -4479,7 +4581,6 @@ fn repopulate_profiles(list: &gtk::ListBox, model: &Rc<Model>) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
-    let mut badges = Vec::new();
     for profile in model.profiles.borrow().iter() {
         let row = adw::ActionRow::builder()
             .title(&profile.name)
@@ -4489,16 +4590,8 @@ fn repopulate_profiles(list: &gtk::ListBox, model: &Rc<Model>) {
                 "Needs attention"
             })
             .build();
-        let badge = gtk::Label::new(Some("● LIVE"));
-        badge.add_css_class("live-pill");
-        badge.add_css_class("live");
-        badge.set_valign(gtk::Align::Center);
-        badge.set_visible(false);
-        row.add_suffix(&badge);
         list.append(&row);
-        badges.push(badge);
     }
-    *model.profile_pills.borrow_mut() = badges;
     update_live_indicators(model);
 }
 

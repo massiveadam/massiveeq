@@ -456,11 +456,11 @@ fn draw_curves(
                 cr.line_to(x_for(*frequency, width), y_for(low - offset, height));
             }
             cr.close_path();
-            cr.set_source_rgba(0.89, 0.66, 0.31, 0.16);
+            cr.set_source_rgba(0.80, 0.78, 0.72, 0.10);
             let _ = cr.fill();
         }
         cr.set_dash(&[6.0, 4.0], 0.0);
-        stroke(&center, (0.89, 0.66, 0.31, 0.75), 1.4);
+        stroke(&center, (0.80, 0.78, 0.72, 0.6), 1.3);
         cr.set_dash(&[], 0.0);
     }
 
@@ -469,7 +469,7 @@ fn draw_curves(
         stroke(&raw, (0.62, 0.64, 0.64, 0.55), 1.3);
         if let Some(analysis) = analysis {
             let ears = if responses_match(&analysis.left.response, &analysis.right.response) {
-                vec![(&analysis.left.response, (0.54, 0.68, 0.45, 0.95))]
+                vec![(&analysis.left.response, (1.0, 0.45, 0.35, 0.95))]
             } else {
                 vec![
                     (&analysis.left.response, (0.45, 0.72, 0.86, 0.95)),
@@ -504,16 +504,16 @@ fn draw_curves(
     };
     if overlay.measurement.is_some() {
         key("MEASURED", (0.62, 0.64, 0.64));
-        key("WITH EQ", (0.54, 0.68, 0.45));
+        key("WITH EQ", (1.0, 0.45, 0.35));
     }
     if overlay.target.is_some() {
-        key("TARGET", (0.89, 0.66, 0.31));
+        key("TARGET", (0.80, 0.78, 0.72));
     }
 }
 
 fn draw_tone_marker(cr: &cairo::Context, frequency: f64, width: f64, height: f64) {
     let x = x_for(frequency, width);
-    cr.set_source_rgba(0.54, 0.68, 0.45, 0.85);
+    cr.set_source_rgba(0.90, 0.29, 0.18, 0.9);
     cr.set_line_width(1.5);
     cr.set_dash(&[4.0, 4.0], 0.0);
     cr.move_to(x, TOP);
