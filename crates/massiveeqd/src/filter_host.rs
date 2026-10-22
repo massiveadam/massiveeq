@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use massiveeq_core::{COMPARISON_BYPASS_ID, ComparisonSet, DeviceInfo, Library, Storage};
 use massiveeq_dsp::{
     CompileOptions, CompiledProfile, ProfileProcessor, attenuate_for_comparison,
-    compile_bypass_with_gain, compile_profile, perceived_output_level_db,
+    compile_bypass_with_gain, compile_profile, perceived_output_level_db, widen_input,
 };
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
@@ -23,6 +23,10 @@ struct ActiveFilter {
     sample_rate: u32,
     quantum: u32,
     latency_frames: u32,
+    /// Channels the sink takes in; more than the device's for a surround sink.
+    input_channels: u32,
+    /// The sink is a visible 7.1 output that may be the system default.
+    surround: bool,
 }
 
 impl FilterHost {
@@ -75,6 +79,18 @@ impl FilterHost {
             .collect::<Vec<_>>();
         for key in stale {
             if let Some(active) = self.filters.remove(&key) {
+                if active.surround
+                    && let Some(device) = devices
+                        .iter()
+                        .find(|device| device.connected && device.key.as_storage_key() == key)
+                {
+                    // Hand the system output back before the 7.1 sink disappears.
+                    let _ = restore_physical_default_if_needed(
+                        &active.filter.node_name,
+                        &device.node_name,
+                    )
+                    .await;
+                }
                 active.filter.stop();
             }
             self.errors.remove(&key);
@@ -116,10 +132,13 @@ impl FilterHost {
                 }
             };
 
+            let input_channels = compiled.input_channels;
+            let surround = input_channels > device.channels;
             if let Some(active) = self.filters.get_mut(&key)
                 && active.sample_rate == settings.sample_rate
                 && active.quantum == settings.quantum
                 && active.latency_frames == latency_frames
+                && active.input_channels == input_channels
             {
                 match active.filter.update(processor) {
                     Ok(()) => {
@@ -135,6 +154,9 @@ impl FilterHost {
 
             // Rate, capacity and reported latency are PipeWire node properties.
             // Start the verified replacement before retiring the old endpoint.
+            // Normalizing below resets every MassiveEQ node to unity. A 7.1
+            // sink's volume belongs to the user, so keep and restore those.
+            let surround_volumes = node_volumes(self.surround_node_names()).await;
             let replacement = match NativeFilter::spawn(
                 device.clone(),
                 processor,
@@ -149,6 +171,13 @@ impl FilterHost {
                 }
             };
             if let Some(old) = self.filters.remove(&key) {
+                if old.surround && !surround {
+                    let _ = restore_physical_default_if_needed(
+                        &old.filter.node_name,
+                        &device.node_name,
+                    )
+                    .await;
+                }
                 old.filter.stop();
             }
             self.filters.insert(
@@ -159,17 +188,41 @@ impl FilterHost {
                     sample_rate: settings.sample_rate,
                     quantum: settings.quantum,
                     latency_frames,
+                    input_channels,
+                    surround,
                 },
             );
             self.errors.remove(&key);
             let _ = normalize_virtual_nodes().await;
-            let _ = restore_physical_default_if_needed(
-                self.filters[&key].filter.node_name.as_str(),
-                &device.node_name,
-            )
-            .await;
+            for (name, volume) in &surround_volumes {
+                if self
+                    .filters
+                    .values()
+                    .any(|active| active.surround && &active.filter.node_name == name)
+                {
+                    let _ = set_node_volume(name, volume).await;
+                }
+            }
+            let node_name = self.filters[&key].filter.node_name.clone();
+            if surround {
+                // Apps choose their channel layout from the system output, so
+                // the 7.1 sink takes over while its device is the system output.
+                if device.is_default {
+                    let _ = make_default(&node_name).await;
+                }
+            } else {
+                let _ = restore_physical_default_if_needed(&node_name, &device.node_name).await;
+            }
         }
         Ok(())
+    }
+
+    fn surround_node_names(&self) -> Vec<String> {
+        self.filters
+            .values()
+            .filter(|active| active.surround)
+            .map(|active| active.filter.node_name.clone())
+            .collect()
     }
 
     pub fn active_count(&self) -> usize {
@@ -290,7 +343,7 @@ fn compile_runtime_profile(
         // Filters Off retains the active profile's clipping-safe perceived
         // level and reported endpoint latency. This makes it a comparison of
         // filters rather than a comparison of loudness or route stability.
-        compile_level_matched_bypass(&active, perceived_output_level_db(&active).min(0.0))
+        compile_level_matched_bypass(&active, perceived_output_level_db(&active).min(0.0))?
     } else {
         active
     };
@@ -372,13 +425,19 @@ fn compile_comparison_profile(
         .map(|(_, _, perceived)| *perceived)
         .fold(0.0_f64, f64::min)
         .min(0.0);
+    // Every candidate runs on the same sink, as wide as the widest candidate.
+    let sink_channels = candidates
+        .iter()
+        .map(|(_, compiled, _)| compiled.input_channels)
+        .max()
+        .unwrap_or(device.channels);
     let selected_id = if bypassed {
         COMPARISON_BYPASS_ID
     } else {
         comparison.active_profile_id.as_str()
     };
     let mut selected = if selected_id == COMPARISON_BYPASS_ID {
-        compile_level_matched_bypass(&candidates[0].1, target_level)
+        compile_level_matched_bypass(&candidates[0].1, target_level)?
     } else {
         let (_, mut compiled, perceived) = candidates
             .into_iter()
@@ -387,6 +446,7 @@ fn compile_comparison_profile(
         attenuate_for_comparison(&mut compiled, target_level - perceived)?;
         compiled
     };
+    widen_input(&mut selected, sink_channels)?;
     selected.latency_frames = latency;
     signature.push_str(&format!(
         "|active={selected_id}|bypassed={bypassed}|target={target_level:.9}|{}|{}|{}",
@@ -395,15 +455,18 @@ fn compile_comparison_profile(
     Ok((selected, stable_hash(&signature)))
 }
 
-fn compile_level_matched_bypass(active: &CompiledProfile, gain_db: f64) -> CompiledProfile {
+/// Dry audio at `gain_db`, taking the same input channels as `active` so that
+/// switching filters off never rebuilds the sink. A surround sink is downmixed.
+fn compile_level_matched_bypass(active: &CompiledProfile, gain_db: f64) -> Result<CompiledProfile> {
     let mut dry = compile_bypass_with_gain(
         active.sample_rate,
         active.quantum,
         active.output_channels,
         gain_db,
     );
+    widen_input(&mut dry, active.input_channels)?;
     dry.latency_frames = active.latency_frames;
-    dry
+    Ok(dry)
 }
 
 pub(crate) fn validate_comparison_set(
@@ -483,6 +546,99 @@ async fn restore_physical_default_if_needed(
         .await
         .context("failed to restore the physical default audio output")?;
     anyhow::ensure!(result.success(), "failed to restore physical output");
+    Ok(())
+}
+
+/// A node's volume and mute state as `wpctl get-volume` reports them.
+#[derive(Debug, Clone, PartialEq)]
+struct NodeVolume {
+    volume: String,
+    muted: bool,
+}
+
+fn parse_node_volume(text: &str) -> Option<NodeVolume> {
+    let volume = text
+        .trim()
+        .strip_prefix("Volume:")?
+        .split_whitespace()
+        .next()?;
+    volume.parse::<f64>().ok()?;
+    Some(NodeVolume {
+        volume: volume.to_owned(),
+        muted: text.contains("[MUTED]"),
+    })
+}
+
+async fn node_id(node_name: &str) -> Option<u32> {
+    let output = Command::new("wpctl")
+        .args(["status", "--name"])
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| node_id_from_status_line(line, node_name))
+}
+
+async fn node_volumes(names: Vec<String>) -> Vec<(String, NodeVolume)> {
+    let mut volumes = Vec::new();
+    for name in names {
+        if let Some(volume) = node_volume(&name).await {
+            volumes.push((name, volume));
+        }
+    }
+    volumes
+}
+
+async fn node_volume(node_name: &str) -> Option<NodeVolume> {
+    let id = node_id(node_name).await?;
+    let output = Command::new("wpctl")
+        .args(["get-volume", &id.to_string()])
+        .output()
+        .await
+        .ok()?;
+    parse_node_volume(&String::from_utf8_lossy(&output.stdout))
+}
+
+async fn set_node_volume(node_name: &str, volume: &NodeVolume) -> Result<()> {
+    let id = node_id(node_name)
+        .await
+        .context("the MassiveEQ sink is not listed")?
+        .to_string();
+    for args in [
+        ["set-volume", id.as_str(), volume.volume.as_str()],
+        [
+            "set-mute",
+            id.as_str(),
+            if volume.muted { "1" } else { "0" },
+        ],
+    ] {
+        Command::new("wpctl")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .context("failed to restore the MassiveEQ sink volume")?;
+    }
+    Ok(())
+}
+
+/// Make a MassiveEQ sink the system output.
+async fn make_default(node_name: &str) -> Result<()> {
+    let id = node_id(node_name)
+        .await
+        .context("the MassiveEQ sink is not listed yet")?;
+    let result = Command::new("wpctl")
+        .args(["set-default", &id.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("failed to select the MassiveEQ sink")?;
+    anyhow::ensure!(result.success(), "failed to select the MassiveEQ sink");
     Ok(())
 }
 
@@ -646,13 +802,39 @@ mod tests {
         }
         active.latency_frames = 145;
 
-        let dry = compile_level_matched_bypass(&active, -2.0);
+        let dry = compile_level_matched_bypass(&active, -2.0).unwrap();
         assert_eq!(dry.latency_frames, 145);
         assert!(
             dry.channels
                 .iter()
                 .all(|channel| { channel.biquads.is_empty() && channel.convolutions.is_empty() })
         );
+    }
+
+    #[test]
+    fn parses_wpctl_volume() {
+        assert_eq!(
+            super::parse_node_volume("Volume: 0.42 [MUTED]\n"),
+            Some(super::NodeVolume {
+                volume: "0.42".into(),
+                muted: true
+            })
+        );
+        assert_eq!(
+            super::parse_node_volume("Volume: 1.00").map(|volume| volume.muted),
+            Some(false)
+        );
+        assert_eq!(super::parse_node_volume("Error"), None);
+    }
+
+    #[test]
+    fn filters_off_on_a_surround_profile_keeps_the_71_sink() {
+        let mut active = compile_bypass_with_gain(48_000, 128, 2, -2.0);
+        active.input_channels = 8;
+        let dry = compile_level_matched_bypass(&active, -2.0).unwrap();
+        assert_eq!(dry.input_channels, 8);
+        assert!(dry.downmix.is_some());
+        assert!(dry.routes.is_empty());
     }
 
     #[test]

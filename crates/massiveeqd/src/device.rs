@@ -89,7 +89,10 @@ pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
         let channels = integer(props, "audio.channels")
             .unwrap_or_else(|| channel_count(string(props, "audio.position")))
             as u32;
-        let is_default = default_sink.as_deref() == Some(node_name.as_str());
+        // A surround MassiveEQ sink stands in for its device as the system output.
+        let is_default = default_sink.as_deref().is_some_and(|default| {
+            default == node_name || default == crate::native_filter::node_name_for(&storage_key)
+        });
         devices.push(DeviceInfo {
             key,
             node_name,

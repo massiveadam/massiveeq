@@ -7,8 +7,9 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use massiveeq_core::{
     COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
-    MAX_COMPARISON_PROFILES, MAX_FILTERS_PER_CHANNEL, ProfileAnalysis, ProfileDocument,
-    ProfileInfo, analyze_profile_preview, parse_text, serialize_profile, sort_profiles,
+    ImpulseLayout, MAX_COMPARISON_PROFILES, MAX_FILTERS_PER_CHANNEL, ProfileAnalysis,
+    ProfileDocument, ProfileInfo, analyze_profile_preview, parse_text, serialize_profile,
+    sort_profiles,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -79,6 +80,10 @@ struct ConvolutionUi {
     add_filter: gtk::Button,
     reset_filters: gtk::Button,
     syncing: Rc<Cell<bool>>,
+    /// Layout of the open profile's impulse response, as reported by the service.
+    layout: Rc<Cell<Option<ImpulseLayout>>>,
+    parametric_mode: gtk::ToggleButton,
+    convolution_mode: gtk::ToggleButton,
 }
 
 struct ComparisonUi {
@@ -746,6 +751,9 @@ fn build_ui(app: &adw::Application) {
         add_filter: add_filter_button.clone(),
         reset_filters: reset_filters_button.clone(),
         syncing: Rc::new(Cell::new(false)),
+        layout: Rc::new(Cell::new(None)),
+        parametric_mode: parametric_mode.clone(),
+        convolution_mode: convolution_mode.clone(),
     };
     view_stack.connect_visible_child_name_notify({
         let add_filter = add_filter_button.clone();
@@ -1118,6 +1126,7 @@ fn wire_actions(
                             *existing = profile.clone();
                         }
                         let document = parse_text(&profile.name, &profile.text);
+                        ui.layout.set(profile.impulse_layout);
                         model.loading.set(true);
                         buffer.set_text(&profile.text);
                         model.loading.set(false);
@@ -1987,6 +1996,7 @@ fn load_profile(
     let document = parse_text(&profile.name, &profile.text);
     *model.document.borrow_mut() = Some(document.clone());
     rebuild_filter_list(filter_list, &document, model, buffer, graph);
+    convolution_ui.layout.set(profile.impulse_layout);
     update_convolution_ui(convolution_ui, &document);
     if let Ok(analysis) = model.client.analyze(&profile.id) {
         set_analysis_label(analysis_label, &analysis);
@@ -2005,22 +2015,38 @@ fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
             .and_then(|value| value.to_str())
             .unwrap_or("Impulse response");
         ui.file_name.set_text(file_name);
-        ui.file_path
-            .set_text(&convolution.path.display().to_string());
+        let layout = ui.layout.get();
+        ui.file_path.set_text(&match layout {
+            Some(layout) if layout.is_matrix() => {
+                format!("{} · {}", convolution.path.display(), layout.label())
+            }
+            _ => convolution.path.display().to_string(),
+        });
         ui.channel.set_selected(match convolution.channels {
             ChannelSelection::All => 0,
             ChannelSelection::Left => 1,
             ChannelSelection::Right => 2,
         });
+        // A multichannel IR already says which input reaches which ear.
+        let matrix = layout.is_some_and(ImpulseLayout::is_matrix);
+        ui.channel.set_sensitive(!matrix);
+        ui.channel
+            .set_tooltip_text(matrix.then_some("This impulse response feeds both ears"));
         ui.remove.set_sensitive(true);
         ui.stack.set_visible_child_name("convolution");
+        // The stack's own notification can be missed before the window maps.
+        ui.convolution_mode.set_active(true);
     } else {
         ui.file_name.set_text("No impulse response selected");
-        ui.file_path
-            .set_text("WAV, FLAC, AIFF, or OGG · up to 10 seconds");
+        ui.file_path.set_text(
+            "WAV, FLAC, AIFF, or OGG · up to 10 seconds · 1, 2, 4 (true stereo), or 14 channels (HeSuVi 7.1)",
+        );
         ui.channel.set_selected(0);
+        ui.channel.set_sensitive(true);
+        ui.channel.set_tooltip_text(None);
         ui.remove.set_sensitive(false);
         ui.stack.set_visible_child_name("filters");
+        ui.parametric_mode.set_active(true);
     }
     let parametric = profile.convolutions.is_empty();
     ui.add_filter.set_visible(parametric);
@@ -2883,7 +2909,16 @@ fn update_device_controls(
         });
         assign.set_sensitive(model.current_id.borrow().is_some());
     } else if let Some(name) = assigned_name {
-        state.set_text(&format!("Active · {name}"));
+        let surround = device.assigned_profile.as_ref().is_some_and(|id| {
+            model.profiles.borrow().iter().any(|profile| {
+                &profile.id == id && profile.impulse_layout == Some(ImpulseLayout::Surround71)
+            })
+        });
+        state.set_text(&if surround {
+            format!("Active · {name} · 7.1 surround")
+        } else {
+            format!("Active · {name}")
+        });
         assign.set_label(if selected_matches {
             "Unassign from output"
         } else {

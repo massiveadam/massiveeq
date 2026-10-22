@@ -35,6 +35,7 @@ support contract.
 
 - Squiglink, AutoEQ, and common Equalizer APO text profile import
 - Parametric EQ, per-ear filters, GraphicEQ, preamp, includes, and convolution
+- True-stereo (4-channel) and 7.1 virtual-surround (14-channel HeSuVi) BRIRs
 - Automatic profile assignment using stable Bluetooth and ALSA identifiers
 - Unlimited saved profiles with per-output assignment or an explicit unassigned state
 - Per-output comparison banks for 2–9 profiles plus level-matched dry playback
@@ -266,6 +267,35 @@ minimum-phase GraphicEQ FIR design, and a two-stage partitioned convolver.
 Convolution assets are decoded with libsndfile and resampled offline with
 libsamplerate's highest-quality sinc converter. The real-time callback performs
 no allocation, locking, file access, logging, process control, or D-Bus work.
+
+### Multichannel impulse responses
+
+The layout of a convolution file follows from its channel count:
+
+| Channels | Layout | Input | How it is applied |
+| --- | --- | --- | --- |
+| 1 | Mono | Output's own | The same IR on every output channel |
+| 2 | Per ear | Output's own | Channel 1 on the left ear, channel 2 on the right |
+| 4 | True stereo | Stereo | L→L, L→R, R→L, R→R, summed per ear |
+| 14 | HeSuVi 7.1 | 7.1 | Each speaker reaches both ears through its own pair |
+
+Fourteen-channel files use [HeSuVi](https://sourceforge.net/projects/hesuvi/)'s
+channel order (`FL-L FL-R SL-L SL-R RL-L RL-R FC-L FR-R FR-L SR-R SR-L RR-R
+RR-L FC-R`), the same mapping as PipeWire's `sink-virtual-surround-7.1-hesuvi`.
+LFE is heard through the center pair. Multichannel files always feed both ears,
+must be the profile's only convolution, and need a stereo output.
+
+A 7.1 profile turns its output's MassiveEQ sink into a visible 7.1 device,
+**MassiveEQ 7.1 — *output name***, because games and players only send
+surround audio to an output that advertises it. While the physical output is
+the system output, the 7.1 sink becomes the system output in its place; when
+the profile is unassigned, the physical output is restored. Stereo programme
+is upmixed by PipeWire as for any 7.1 sink. Turning **Filters** off keeps the
+7.1 sink and plays a standard downmix (center and surrounds at −3 dB, LFE
+dropped). Level matching and headroom for these files use the paths stereo
+programme takes; full-scale content on every surround channel at once can
+still exceed them. Matrix routes use uniformly partitioned convolution sized
+to the PipeWire quantum, which keeps per-callback cost steady.
 
 Profiles use either parametric/GraphicEQ processing or convolution. A profile
 that mixes those modes, references a missing IR, exceeds the device Nyquist

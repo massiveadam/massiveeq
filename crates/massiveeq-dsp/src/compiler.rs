@@ -2,7 +2,7 @@ use crate::{
     BiquadCoefficients, CompiledAnalysis, ConvolutionKernel, analysis::analyze_compiled,
     convolution::load_ir, design_graphic_eq,
 };
-use massiveeq_core::{Channel, ChannelSelection, ProfileDocument};
+use massiveeq_core::{Channel, ChannelSelection, ProfileDocument, validate_impulse};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -40,6 +40,12 @@ pub enum CompileError {
     PerEarOnMono,
     #[error("unsupported output channel count {0}; MassiveEQ supports mono and stereo")]
     UnsupportedChannels(u32),
+    #[error("{0}")]
+    Layout(String),
+    #[error("multichannel impulse responses need a stereo output")]
+    MatrixNeedsStereoOutput,
+    #[error("cannot feed a {profile}-channel profile from a {sink}-channel input")]
+    UnsupportedInputWidth { profile: u32, sink: u32 },
     #[error("invalid sample rate {0}")]
     InvalidSampleRate(u32),
     #[error("invalid PipeWire quantum {0}")]
@@ -68,11 +74,28 @@ pub struct CompiledChannel {
     pub convolutions: Vec<ConvolutionKernel>,
 }
 
+/// One input channel convolved into one output channel of a matrix IR.
+#[derive(Debug, Clone)]
+pub struct MatrixRoute {
+    pub input: usize,
+    pub output: usize,
+    pub kernel: ConvolutionKernel,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledProfile {
     pub sample_rate: u32,
     pub quantum: u32,
+    /// Channels the virtual sink takes in; wider than the output for surround.
+    pub input_channels: u32,
     pub output_channels: u32,
+    /// Gains folding the sink's channels into the profile's own inputs,
+    /// indexed `[profile input][sink channel]`, when the sink is wider.
+    pub downmix: Option<Vec<Vec<f32>>>,
+    /// Matrix convolution from inputs to outputs. Empty means each input
+    /// feeds the output channel of the same index.
+    pub routes: Vec<MatrixRoute>,
+    /// Per-output gain and filters, applied after any matrix convolution.
     pub channels: Vec<CompiledChannel>,
     pub analysis: CompiledAnalysis,
     pub latency_frames: u32,
@@ -98,7 +121,10 @@ pub fn compile_bypass_with_gain(
     CompiledProfile {
         sample_rate,
         quantum,
+        input_channels: output_channels,
         output_channels,
+        downmix: None,
+        routes: Vec::new(),
         channels: (0..output_channels)
             .map(|_| CompiledChannel {
                 gain_linear: db_to_linear(gain_db) as f32,
@@ -179,6 +205,24 @@ pub fn compile_profile(
     } else {
         options.profile_dir.clone()
     };
+    let mut impulses = Vec::with_capacity(profile.convolutions.len());
+    for convolution in &profile.convolutions {
+        let ir = load_ir(
+            &resolve_asset(&profile_root, &convolution.path)?,
+            options.sample_rate,
+        )?;
+        let layout = validate_impulse(
+            ir.channels.len(),
+            convolution.channels,
+            profile.convolutions.len(),
+        )
+        .map_err(CompileError::Layout)?;
+        impulses.push((convolution, ir, layout));
+    }
+    let matrix = impulses.iter().find(|(_, _, layout)| layout.is_matrix());
+    if matrix.is_some() && options.output_channels != 2 {
+        return Err(CompileError::MatrixNeedsStereoOutput);
+    }
     let channel_ids: &[Channel] = if options.output_channels == 1 {
         &[Channel::Left]
     } else {
@@ -223,29 +267,14 @@ pub fn compile_profile(
                 latency_frames: options.quantum + design.latency_frames,
             });
         }
-        for convolution in profile
-            .convolutions
-            .iter()
-            .filter(|item| item.channels.contains(channel))
-        {
-            let path = resolve_asset(&profile_root, &convolution.path)?;
-            let ir = load_ir(&path, options.sample_rate)?;
+        for (convolution, ir, _) in impulses.iter().filter(|(convolution, _, layout)| {
+            !layout.is_matrix() && convolution.channels.contains(channel)
+        }) {
             let ir_channel = match convolution.channels {
                 ChannelSelection::All => output_index % ir.channels.len(),
                 ChannelSelection::Left | ChannelSelection::Right => 0,
             };
-            let impulse = ir.channels[ir_channel].clone();
-            let inherent_latency = impulse
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
-                .map(|(index, _)| index as u32)
-                .unwrap_or_default();
-            convolutions.push(ConvolutionKernel {
-                sample_rate: options.sample_rate,
-                impulse,
-                latency_frames: options.quantum + inherent_latency,
-            });
+            convolutions.push(kernel(ir.channels[ir_channel].clone(), options));
         }
         source_preamps.push(profile.preamp_for(channel));
         channels.push(CompiledChannel {
@@ -256,8 +285,26 @@ pub fn compile_profile(
         });
     }
 
+    let routes = matrix
+        .map(|(_, ir, layout)| {
+            layout
+                .routes()
+                .iter()
+                .map(|route| MatrixRoute {
+                    input: route.input,
+                    output: route.output,
+                    kernel: kernel(ir.channels[route.ir_channel].clone(), options),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let input_channels = matrix
+        .and_then(|(_, _, layout)| layout.input_channels())
+        .unwrap_or(options.output_channels);
+
     let analysis = analyze_compiled(
         &channels,
+        &routes,
         &source_preamps,
         options.sample_rate,
         options.manual_trim_db,
@@ -265,25 +312,80 @@ pub fn compile_profile(
     for (channel, source_preamp) in channels.iter_mut().zip(source_preamps) {
         channel.gain_linear = db_to_linear(source_preamp + analysis.effective_gain_db) as f32;
     }
-    let latency_frames = channels
-        .iter()
-        .map(|channel| {
-            channel
-                .convolutions
-                .iter()
-                .map(|kernel| kernel.latency_frames)
-                .sum::<u32>()
-        })
-        .max()
-        .unwrap_or_default();
+    let latency_frames = if routes.is_empty() {
+        channels
+            .iter()
+            .map(|channel| {
+                channel
+                    .convolutions
+                    .iter()
+                    .map(|kernel| kernel.latency_frames)
+                    .sum::<u32>()
+            })
+            .max()
+            .unwrap_or_default()
+    } else {
+        // Report when the front speakers reach their own ears; side and rear
+        // paths arrive later by design.
+        routes
+            .iter()
+            .filter(|route| route.input == route.output)
+            .map(|route| route.kernel.latency_frames)
+            .max()
+            .unwrap_or_default()
+    };
     Ok(CompiledProfile {
         sample_rate: options.sample_rate,
         quantum: options.quantum,
+        input_channels,
         output_channels: options.output_channels,
+        downmix: None,
+        routes,
         channels,
         analysis,
         latency_frames,
     })
+}
+
+/// Gains folding 7.1 (FL FR FC LFE RL RR SL SR) into stereo, `[output][input]`:
+/// center and surrounds at -3 dB, LFE dropped, as PipeWire's own downmix does.
+fn surround_71_to_stereo() -> Vec<Vec<f32>> {
+    let half = std::f32::consts::FRAC_1_SQRT_2;
+    vec![
+        vec![1.0, 0.0, half, 0.0, half, 0.0, half, 0.0],
+        vec![0.0, 1.0, half, 0.0, 0.0, half, 0.0, half],
+    ]
+}
+
+/// Let a profile run on a sink with more input channels than it uses, by
+/// downmixing the sink's channels first. Surround sinks fold into stereo.
+pub fn widen_input(profile: &mut CompiledProfile, sink_channels: u32) -> Result<(), CompileError> {
+    if sink_channels == profile.input_channels {
+        return Ok(());
+    }
+    if profile.downmix.is_none() && profile.input_channels == 2 && sink_channels == 8 {
+        profile.downmix = Some(surround_71_to_stereo());
+        profile.input_channels = sink_channels;
+        return Ok(());
+    }
+    Err(CompileError::UnsupportedInputWidth {
+        profile: profile.input_channels,
+        sink: sink_channels,
+    })
+}
+
+fn kernel(impulse: Vec<f32>, options: &CompileOptions) -> ConvolutionKernel {
+    let inherent_latency = impulse
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
+        .map(|(index, _)| index as u32)
+        .unwrap_or_default();
+    ConvolutionKernel {
+        sample_rate: options.sample_rate,
+        impulse,
+        latency_frames: options.quantum + inherent_latency,
+    }
 }
 
 fn resolve_asset(profile_root: &Path, requested: &Path) -> Result<PathBuf, CompileError> {
@@ -445,6 +547,159 @@ mod tests {
             compile_profile(&profile, &CompileOptions::stereo(48_000, 128, temp.path())).unwrap();
         assert!(compiled.analysis.final_peak_db <= -0.999);
         assert!(compiled.analysis.match_gain_db < -11.9);
+    }
+
+    /// A multichannel IR whose channel `c` is a single tap of `gain(c)` at
+    /// sample `c`, so the output reveals which IR channel each path used.
+    fn tagged_ir(channels: usize, gain: impl Fn(usize) -> f32) -> Vec<f32> {
+        let frames = channels + 1;
+        let mut samples = vec![0.0; frames * channels];
+        for channel in 0..channels {
+            samples[channel * channels + channel] = gain(channel);
+        }
+        samples
+    }
+
+    fn impulse_response(compiled: &CompiledProfile, input: usize) -> Vec<Vec<f32>> {
+        let mut processor = crate::ProfileProcessor::new(compiled).unwrap();
+        let frames = compiled.quantum as usize;
+        let mut inputs = vec![vec![0.0_f32; frames]; compiled.input_channels as usize];
+        inputs[input][0] = 1.0;
+        let mut outputs = vec![vec![0.0_f32; frames]; compiled.output_channels as usize];
+        // Run long enough for the two-stage convolver's tail to come out.
+        let mut collected = vec![Vec::new(); outputs.len()];
+        for block in 0..8 {
+            if block == 1 {
+                inputs[input][0] = 0.0;
+            }
+            processor.process(&inputs, &mut outputs, frames).unwrap();
+            for (all, output) in collected.iter_mut().zip(&outputs) {
+                all.extend_from_slice(output);
+            }
+        }
+        collected
+    }
+
+    /// The single tap in a response, as (sample, value).
+    fn tap(response: &[f32]) -> Option<(usize, f32)> {
+        let taps = response
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.abs() > 1e-4)
+            .collect::<Vec<_>>();
+        assert!(taps.len() <= 1, "expected one tap, got {taps:?}");
+        taps.first().map(|(index, value)| (*index, **value))
+    }
+
+    #[test]
+    fn true_stereo_ir_crossfeeds_each_input_to_both_ears() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("assets")).unwrap();
+        let gain = |channel: usize| 0.1 * (channel + 1) as f32;
+        write_float_wav(
+            &temp.path().join("assets/room.wav"),
+            48_000,
+            4,
+            &tagged_ir(4, gain),
+        );
+        let profile = parse_text("test", "Convolution: assets/room.wav");
+        let compiled =
+            compile_profile(&profile, &CompileOptions::stereo(48_000, 64, temp.path())).unwrap();
+        assert_eq!(compiled.input_channels, 2);
+        assert_eq!(compiled.routes.len(), 4);
+        let scale = compiled.channels[0].gain_linear;
+        // L→L, L→R, R→L, R→R are IR channels 0, 1, 2, 3.
+        for (input, output, ir_channel) in [(0, 0, 0), (0, 1, 1), (1, 0, 2), (1, 1, 3)] {
+            let (at, value) = tap(&impulse_response(&compiled, input)[output]).unwrap();
+            assert_eq!(at, ir_channel, "input {input} output {output}");
+            assert!((value - gain(ir_channel) * scale).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn hesuvi_ir_folds_71_into_two_ears_in_hesuvi_order() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("assets")).unwrap();
+        write_float_wav(
+            &temp.path().join("assets/hesuvi.wav"),
+            48_000,
+            14,
+            &tagged_ir(14, |_| 0.5),
+        );
+        let profile = parse_text("test", "Convolution: assets/hesuvi.wav");
+        let compiled =
+            compile_profile(&profile, &CompileOptions::stereo(48_000, 64, temp.path())).unwrap();
+        assert_eq!(compiled.input_channels, 8);
+        // Inputs FL FR FC LFE RL RR SL SR -> (left ear, right ear) HeSuVi channels.
+        let expected = [
+            (0, 1),
+            (8, 7),
+            (6, 13),
+            (6, 13),
+            (4, 5),
+            (12, 11),
+            (2, 3),
+            (10, 9),
+        ];
+        for (input, (left, right)) in expected.into_iter().enumerate() {
+            let response = impulse_response(&compiled, input);
+            assert_eq!(tap(&response[0]).unwrap().0, left, "input {input} left ear");
+            assert_eq!(
+                tap(&response[1]).unwrap().0,
+                right,
+                "input {input} right ear"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_ir_needs_stereo_output_and_matches_stereo_loudness() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("assets")).unwrap();
+        // Identity true-stereo IR: each input straight to its own ear.
+        write_float_wav(
+            &temp.path().join("assets/identity.wav"),
+            48_000,
+            4,
+            &[1.0, 0.0, 0.0, 1.0],
+        );
+        let profile = parse_text("test", "Convolution: assets/identity.wav");
+        let compiled =
+            compile_profile(&profile, &CompileOptions::stereo(48_000, 64, temp.path())).unwrap();
+        assert!(compiled.analysis.match_gain_db.abs() < 0.01);
+        assert!((compiled.analysis.final_peak_db + 1.0).abs() < 0.01);
+        assert!(compiled.analysis.channels.iter().all(|channel| {
+            channel
+                .response
+                .iter()
+                .all(|point| point.gain_db.abs() < 0.01)
+        }));
+
+        let mut mono = CompileOptions::stereo(48_000, 64, temp.path());
+        mono.output_channels = 1;
+        assert!(matches!(
+            compile_profile(&profile, &mono),
+            Err(CompileError::MatrixNeedsStereoOutput)
+        ));
+    }
+
+    #[test]
+    fn stereo_profile_on_a_surround_sink_hears_a_downmix() {
+        let mut compiled = compile_bypass(48_000, 64, 2);
+        widen_input(&mut compiled, 8).unwrap();
+        assert_eq!(compiled.input_channels, 8);
+        // Side left reaches only the left ear, at -3 dB.
+        let response = impulse_response(&compiled, 6);
+        let (_, left) = tap(&response[0]).unwrap();
+        assert!((left - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        assert!(tap(&response[1]).is_none());
+        // LFE is dropped, as in PipeWire's downmix.
+        assert!(
+            impulse_response(&compiled, 3)
+                .iter()
+                .all(|ear| tap(ear).is_none())
+        );
+        assert!(widen_input(&mut compile_bypass(48_000, 64, 1), 8).is_err());
     }
 
     #[test]

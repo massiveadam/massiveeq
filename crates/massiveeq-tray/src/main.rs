@@ -674,6 +674,7 @@ mod tests {
                     manual_trim_db: 0.0,
                     activatable: true,
                     diagnostics: Vec::new(),
+                    impulse_layout: None,
                 }],
                 devices,
                 ..Default::default()

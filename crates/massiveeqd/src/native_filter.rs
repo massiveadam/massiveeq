@@ -51,7 +51,7 @@ impl NativeFilter {
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(NativeStats::default());
         let safe_name = stable_hash(&device.key.as_storage_key());
-        let node_name = format!("massiveeq.{safe_name:x}");
+        let node_name = node_name_for(&device.key.as_storage_key());
         let thread_stop = stop.clone();
         let thread_stats = stats.clone();
         let thread_node_name = node_name.clone();
@@ -150,6 +150,10 @@ fn run_filter_pair(
         let context = pw::context::ContextRc::new(&mainloop, None)?;
         let core = context.connect_rc(None)?;
         let channels = device.channels as usize;
+        let input_channels = initial.input_channels();
+        // A surround sink is a real, selectable output: apps only send 7.1 to
+        // an output that advertises it, and the physical device is stereo.
+        let surround = input_channels > channels;
         let link_group = format!(
             "massiveeq-link-{:x}",
             stable_hash(&device.key.as_storage_key())
@@ -158,7 +162,8 @@ fn run_filter_pair(
             "massiveeq-group-{:x}",
             stable_hash(&device.key.as_storage_key())
         );
-        let position = if channels == 1 { "MONO" } else { "FL,FR" };
+        let position = positions(channels).join(",");
+        let input_position = positions(input_channels).join(",");
         // A zero-latency suggestion lets low-latency device drivers pull the
         // complete graph at their minimum quantum. That is useful for live
         // monitoring, but leaves needlessly little scheduling margin for a
@@ -168,11 +173,17 @@ fn run_filter_pair(
         let latency = format!("{scheduling_latency_frames}/{sample_rate}");
         let rate = format!("1/{sample_rate}");
         let channel_count = channels.to_string();
+        let input_channel_count = input_channels.to_string();
+        let description = if surround {
+            format!("MassiveEQ 7.1 — {}", device.description)
+        } else {
+            format!("MassiveEQ — {}", device.description)
+        };
         let target = format!(r#"{{ "node.name": "{}" }}"#, device.node_name);
 
         let capture_props = properties! {
             *pw::keys::NODE_NAME => node_name,
-            *pw::keys::NODE_DESCRIPTION => format!("MassiveEQ — {}", device.description),
+            *pw::keys::NODE_DESCRIPTION => description,
             *pw::keys::MEDIA_CLASS => "Audio/Sink",
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Playback",
@@ -182,15 +193,16 @@ fn run_filter_pair(
             *pw::keys::NODE_GROUP => node_group.clone(),
             *pw::keys::NODE_RATE => rate.clone(),
             *pw::keys::NODE_LATENCY => latency.clone(),
-            *pw::keys::AUDIO_CHANNELS => channel_count.clone(),
-            "audio.position" => position,
+            *pw::keys::AUDIO_CHANNELS => input_channel_count,
+            "audio.position" => input_position,
             "filter.smart" => "true",
             "filter.smart.name" => link_group.clone(),
-            "filter.smart.targetable" => "false",
+            "filter.smart.targetable" => if surround { "true" } else { "false" },
             "filter.smart.target" => target,
-            "node.hidden" => "true",
+            "node.hidden" => if surround { "false" } else { "true" },
             "node.stream.restore-props" => "false",
-            "channelmix.lock-volumes" => "true",
+            // The 7.1 sink is the system output, so its volume is the user's.
+            "channelmix.lock-volumes" => if surround { "false" } else { "true" },
             "resample.disable" => "true",
         };
         let playback_props = properties! {
@@ -208,7 +220,7 @@ fn run_filter_pair(
             *pw::keys::NODE_RATE => rate,
             *pw::keys::NODE_LATENCY => latency,
             *pw::keys::AUDIO_CHANNELS => channel_count,
-            "audio.position" => position,
+            "audio.position" => position.as_str(),
             "node.stream.restore-props" => "false",
             "node.hidden" => "true",
             "channelmix.lock-volumes" => "true",
@@ -217,7 +229,7 @@ fn run_filter_pair(
 
         let capture = pw::stream::StreamBox::new(&core, "MassiveEQ input", capture_props)?;
         let playback = pw::stream::StreamBox::new(&core, "MassiveEQ output", playback_props)?;
-        let engine = AudioEngine::new(initial, updates, retired, channels, sample_rate);
+        let engine = AudioEngine::new(initial, updates, retired, sample_rate);
         let capture_stats = stats.clone();
         let _capture_listener = capture
             .add_local_listener_with_user_data(engine)
@@ -336,7 +348,7 @@ fn run_filter_pair(
             })
             .register()?;
 
-        let capture_format = audio_format(sample_rate, channels as u32)?;
+        let capture_format = audio_format(sample_rate, input_channels as u32)?;
         let playback_format = audio_format(sample_rate, channels as u32)?;
         let mut capture_params =
             [Pod::from_bytes(&capture_format).context("invalid capture format")?];
@@ -391,11 +403,19 @@ fn audio_format(sample_rate: u32, channels: u32) -> Result<Vec<u8>> {
     info.set_rate(sample_rate);
     info.set_channels(channels);
     let mut position = [0; spa::param::audio::MAX_CHANNELS];
-    if channels == 1 {
-        position[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO;
-    } else {
-        position[0] = spa::sys::SPA_AUDIO_CHANNEL_FL;
-        position[1] = spa::sys::SPA_AUDIO_CHANNEL_FR;
+    for (slot, name) in position.iter_mut().zip(positions(channels as usize)) {
+        *slot = match *name {
+            "MONO" => spa::sys::SPA_AUDIO_CHANNEL_MONO,
+            "FL" => spa::sys::SPA_AUDIO_CHANNEL_FL,
+            "FR" => spa::sys::SPA_AUDIO_CHANNEL_FR,
+            "FC" => spa::sys::SPA_AUDIO_CHANNEL_FC,
+            "LFE" => spa::sys::SPA_AUDIO_CHANNEL_LFE,
+            "RL" => spa::sys::SPA_AUDIO_CHANNEL_RL,
+            "RR" => spa::sys::SPA_AUDIO_CHANNEL_RR,
+            "SL" => spa::sys::SPA_AUDIO_CHANNEL_SL,
+            "SR" => spa::sys::SPA_AUDIO_CHANNEL_SR,
+            _ => spa::sys::SPA_AUDIO_CHANNEL_UNKNOWN,
+        };
     }
     info.set_position(position);
     Ok(spa::pod::serialize::PodSerializer::serialize(
@@ -408,6 +428,20 @@ fn audio_format(sample_rate: u32, channels: u32) -> Result<Vec<u8>> {
     )?
     .0
     .into_inner())
+}
+
+/// Speaker positions for a channel count MassiveEQ runs at.
+fn positions(channels: usize) -> &'static [&'static str] {
+    match channels {
+        1 => &["MONO"],
+        8 => &massiveeq_core::SURROUND_71_POSITIONS,
+        _ => &["FL", "FR"],
+    }
+}
+
+/// PipeWire node name of the MassiveEQ sink in front of an output.
+pub fn node_name_for(device_key: &str) -> String {
+    format!("massiveeq.{:x}", stable_hash(device_key))
 }
 
 fn stable_hash(value: &str) -> u64 {

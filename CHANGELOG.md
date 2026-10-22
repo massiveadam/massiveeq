@@ -30,6 +30,18 @@
   when the open profile is renamed.
 - Name the profile playing on the system output in the tray title, list the
   system output first, and mark each output's playing profile in the menu.
+- Support true-stereo (4-channel) and 7.1 virtual-surround (14-channel HeSuVi)
+  impulse responses. A 7.1 profile exposes a selectable "MassiveEQ 7.1" sink
+  that takes over as the system output for its device; Filters off keeps the
+  sink and plays a standard downmix. The convolution page shows the detected
+  layout.
+
+### Fixed
+
+- Mark the Convolution tab, not Parametric, when the editor opens on a
+  convolution profile.
+- Play 4-channel impulse responses as true stereo. They previously played only
+  their L→L and L→R channels, as the left and right ears.
 
 ## 0.3.0-beta.2 — 2026-07-15
 
