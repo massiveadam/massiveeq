@@ -7,7 +7,7 @@ arch=('x86_64')
 url='https://github.com/massiveadam/massiveeq'
 license=('MIT')
 depends=('pipewire>=1:1.4' 'libpipewire' 'wireplumber>=0.5' 'gtk4>=4.18' 'libadwaita>=1.8' 'glib2' 'cairo' 'libsndfile' 'libsamplerate' 'curl' 'glibc' 'libgcc' 'hicolor-icon-theme')
-makedepends=('rust>=1:1.92' 'clang' 'git')
+makedepends=('cargo' 'clang' 'git')
 provides=('massiveeq')
 conflicts=('massiveeq')
 options=('!debug')

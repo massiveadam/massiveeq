@@ -6,7 +6,7 @@ pkgbase = massiveeq-git
 	install = massiveeq.install
 	arch = x86_64
 	license = MIT
-	makedepends = rust>=1:1.92
+	makedepends = cargo
 	makedepends = clang
 	makedepends = git
 	depends = pipewire>=1:1.4
