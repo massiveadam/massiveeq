@@ -49,25 +49,67 @@ impl MassiveEqTray {
         let _ = self.actions.send(action);
     }
 
-    fn state_label(&self) -> &'static str {
+    fn profile_name(&self, id: &str) -> &str {
+        self.snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .map_or("Missing profile", |profile| profile.name.as_str())
+    }
+
+    /// The connected output desktop audio plays through.
+    fn system_output(&self) -> Option<&DeviceInfo> {
+        self.snapshot
+            .devices
+            .iter()
+            .find(|device| device.connected && device.is_default)
+    }
+
+    /// Profile audible on `device`, or `None` while its EQ is not running.
+    fn playing_on(&self, device: &DeviceInfo) -> Option<&str> {
+        if self.snapshot.global_bypass {
+            return None;
+        }
+        device
+            .playing_profile_id(&self.snapshot.comparisons)
+            .map(|id| self.profile_name(id))
+    }
+
+    /// What is playing on the system output, for the title and menu header.
+    fn state_label(&self) -> String {
         if !self.snapshot.online {
-            "Unavailable"
+            "Unavailable".into()
         } else if self.snapshot.global_bypass {
-            "Engine off"
-        } else if self.snapshot.devices.iter().any(|device| {
-            let key = device.key.as_storage_key();
-            device.connected
-                && !device.bypassed
-                && (device.assigned_profile.is_some()
-                    || self
-                        .snapshot
-                        .comparisons
-                        .get(&key)
-                        .is_some_and(|comparison| comparison.enabled))
-        }) {
-            "Active"
+            "Engine off".into()
+        } else if let Some(profile) = self
+            .system_output()
+            .and_then(|device| self.playing_on(device))
+        {
+            profile.to_owned()
+        } else if self
+            .snapshot
+            .devices
+            .iter()
+            .any(|device| self.playing_on(device).is_some())
+        {
+            "Active".into()
         } else {
-            "Idle"
+            "Idle".into()
+        }
+    }
+
+    /// Output name with the profile playing on it, as shown in the menu.
+    fn device_label(&self, device: &DeviceInfo) -> String {
+        if !device.connected {
+            return format!("{} (disconnected)", device.description);
+        }
+        let mut label = device.description.clone();
+        if device.is_default {
+            label.push_str(" (system output)");
+        }
+        match self.playing_on(device) {
+            Some(profile) => format!("{label} — ▶ {profile}"),
+            None => label,
         }
     }
 
@@ -195,11 +237,7 @@ impl MassiveEqTray {
             .into(),
         );
         SubMenu {
-            label: if device.connected {
-                device.description.clone()
-            } else {
-                format!("{} (disconnected)", device.description)
-            },
+            label: self.device_label(device),
             icon_name: "audio-headphones-symbolic".into(),
             submenu,
             ..Default::default()
@@ -280,13 +318,14 @@ impl ksni::Tray for MassiveEqTray {
                                 .map_or("Unassigned", |profile| profile.name.as_str())
                                 .to_owned()
                         });
+                    let marker = if device.is_default { "▶ " } else { "" };
                     if device.bypassed {
                         format!(
-                            "{} — Filters off · level matched to {profile}",
+                            "{marker}{} — Filters off · level matched to {profile}",
                             device.description
                         )
                     } else {
-                        format!("{} — {profile}", device.description)
+                        format!("{marker}{} — {profile}", device.description)
                     }
                 })
                 .collect::<Vec<_>>();
@@ -336,12 +375,10 @@ impl ksni::Tray for MassiveEqTray {
                     .into(),
                 );
             } else {
-                menu.extend(
-                    self.snapshot
-                        .devices
-                        .iter()
-                        .map(|device| self.device_menu(device)),
-                );
+                // System output first, then the other connected outputs.
+                let mut devices = self.snapshot.devices.iter().collect::<Vec<_>>();
+                devices.sort_by_key(|device| (!device.is_default, !device.connected));
+                menu.extend(devices.into_iter().map(|device| self.device_menu(device)));
             }
             menu.push(MenuItem::Separator);
             menu.push(
@@ -606,5 +643,65 @@ mod tests {
             actions,
         };
         assert_eq!(tray.state_label(), "Unavailable");
+    }
+
+    fn output(id: &str, is_default: bool, profile: Option<&str>) -> DeviceInfo {
+        DeviceInfo {
+            key: massiveeq_core::DeviceKey {
+                backend: "alsa".into(),
+                stable_id: id.into(),
+                route: "playback".into(),
+            },
+            node_name: id.into(),
+            description: id.into(),
+            channels: 2,
+            connected: true,
+            assigned_profile: profile.map(str::to_owned),
+            bypassed: false,
+            is_default,
+        }
+    }
+
+    fn tray_with(devices: Vec<DeviceInfo>) -> MassiveEqTray {
+        let (actions, _) = mpsc::unbounded_channel();
+        MassiveEqTray {
+            snapshot: Snapshot {
+                online: true,
+                profiles: vec![ProfileInfo {
+                    id: "harman".into(),
+                    name: "Harman".into(),
+                    text: String::new(),
+                    manual_trim_db: 0.0,
+                    activatable: true,
+                    diagnostics: Vec::new(),
+                }],
+                devices,
+                ..Default::default()
+            },
+            actions,
+        }
+    }
+
+    #[test]
+    fn title_names_the_profile_on_the_system_output() {
+        let mut tray = tray_with(vec![
+            output("Speakers", false, None),
+            output("Buds", true, Some("harman")),
+        ]);
+        assert_eq!(tray.state_label(), "Harman");
+        assert_eq!(
+            tray.device_label(&tray.snapshot.devices[1]),
+            "Buds (system output) — ▶ Harman"
+        );
+        assert_eq!(tray.device_label(&tray.snapshot.devices[0]), "Speakers");
+
+        tray.snapshot.devices[1].bypassed = true;
+        assert_eq!(tray.state_label(), "Idle");
+        assert_eq!(
+            tray.device_label(&tray.snapshot.devices[1]),
+            "Buds (system output)"
+        );
+        tray.snapshot.global_bypass = true;
+        assert_eq!(tray.state_label(), "Engine off");
     }
 }

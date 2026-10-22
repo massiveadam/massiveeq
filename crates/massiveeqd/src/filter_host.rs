@@ -560,6 +560,7 @@ mod tests {
             connected: true,
             assigned_profile: Some(profile.id.clone()),
             bypassed: false,
+            is_default: false,
         };
         library
             .assignments
@@ -607,6 +608,7 @@ mod tests {
             connected: true,
             assigned_profile: Some(profile.id.clone()),
             bypassed: true,
+            is_default: false,
         };
         library
             .assignments
@@ -691,6 +693,7 @@ mod tests {
             connected: true,
             assigned_profile: None,
             bypassed: false,
+            is_default: false,
         };
         let ids = vec![
             COMPARISON_BYPASS_ID.to_owned(),

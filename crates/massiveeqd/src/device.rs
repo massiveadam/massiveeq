@@ -40,6 +40,7 @@ pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
     }
     let objects: Vec<Value> =
         serde_json::from_slice(&output.stdout).context("invalid pw-dump JSON")?;
+    let default_sink = default_sink_name(&objects);
     let mut devices = Vec::new();
     for object in objects {
         if object.get("type").and_then(Value::as_str) != Some("PipeWire:Interface:Node") {
@@ -88,6 +89,7 @@ pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
         let channels = integer(props, "audio.channels")
             .unwrap_or_else(|| channel_count(string(props, "audio.position")))
             as u32;
+        let is_default = default_sink.as_deref() == Some(node_name.as_str());
         devices.push(DeviceInfo {
             key,
             node_name,
@@ -99,6 +101,7 @@ pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
             connected: true,
             assigned_profile: library.assignments.get(&storage_key).cloned(),
             bypassed: library.bypassed_devices.contains(&storage_key),
+            is_default,
         });
     }
     let connected_keys = devices
@@ -135,6 +138,7 @@ pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
                 connected: false,
                 assigned_profile: library.assignments.get(storage_key).cloned(),
                 bypassed: library.bypassed_devices.contains(storage_key),
+                is_default: false,
             }),
     );
     devices.sort_by(|a, b| {
@@ -143,6 +147,25 @@ pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
             .then_with(|| a.description.cmp(&b.description))
     });
     Ok(devices)
+}
+
+/// Node name of `default.audio.sink` from the `default` metadata object in a pw-dump.
+fn default_sink_name(objects: &[Value]) -> Option<String> {
+    objects
+        .iter()
+        .filter(|object| {
+            object.get("type").and_then(Value::as_str) == Some("PipeWire:Interface:Metadata")
+                && object
+                    .pointer("/props/metadata.name")
+                    .and_then(Value::as_str)
+                    == Some("default")
+        })
+        .filter_map(|object| object.get("metadata").and_then(Value::as_array))
+        .flatten()
+        .find(|entry| entry.get("key").and_then(Value::as_str) == Some("default.audio.sink"))
+        .and_then(|entry| entry.pointer("/value/name"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn remembered_from_storage_key(storage_key: &str) -> Option<RememberedDevice> {
@@ -215,6 +238,27 @@ mod tests {
         let text = "update: id:0 key:'clock.rate' value:'96000' type:''\nupdate: id:0 key:'clock.max-quantum' value:'4096' type:''";
         assert_eq!(metadata_number(text, "clock.rate"), Some(96_000));
         assert_eq!(metadata_number(text, "clock.max-quantum"), Some(4_096));
+    }
+
+    #[test]
+    fn finds_default_sink_in_pw_dump() {
+        let objects: Vec<Value> = serde_json::from_str(
+            r#"[
+              {"type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "settings"},
+               "metadata": [{"key": "clock.rate", "value": 48000}]},
+              {"type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
+               "metadata": [
+                 {"key": "default.configured.audio.sink", "value": {"name": "old"}},
+                 {"key": "default.audio.sink", "value": {"name": "bluez_output.AA_BB.1"}}
+               ]}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            default_sink_name(&objects).as_deref(),
+            Some("bluez_output.AA_BB.1")
+        );
+        assert_eq!(default_sink_name(&objects[..1]), None);
     }
 
     #[test]

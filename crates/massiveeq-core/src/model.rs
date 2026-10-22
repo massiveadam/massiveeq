@@ -1,5 +1,6 @@
+use crate::storage::{COMPARISON_BYPASS_ID, ComparisonSet};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 pub const MAX_FILTERS_PER_CHANNEL: usize = 64;
 pub const MAX_GRAPHIC_POINTS: usize = 4096;
@@ -182,6 +183,57 @@ pub struct DeviceInfo {
     pub connected: bool,
     pub assigned_profile: Option<String>,
     pub bypassed: bool,
+    /// PipeWire's current default output, i.e. where desktop audio plays.
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+impl DeviceInfo {
+    /// The profile this output plays: the active comparison candidate while a
+    /// comparison runs, otherwise its assigned profile.
+    pub fn effective_profile_id<'a>(
+        &'a self,
+        comparisons: &'a HashMap<String, ComparisonSet>,
+    ) -> Option<&'a str> {
+        comparisons
+            .get(&self.key.as_storage_key())
+            .filter(|comparison| comparison.enabled)
+            .map(|comparison| comparison.active_profile_id.as_str())
+            .filter(|id| *id != COMPARISON_BYPASS_ID)
+            .or(self.assigned_profile.as_deref())
+    }
+
+    /// Whether this output's filters are running: a supported channel layout,
+    /// not `bypassed`, and not on the bypass side of a comparison. Takes the
+    /// bypass state separately so callers can pass a not-yet-confirmed toggle.
+    pub fn is_filtering(
+        &self,
+        comparisons: &HashMap<String, ComparisonSet>,
+        bypassed: bool,
+    ) -> bool {
+        matches!(self.channels, 1 | 2)
+            && !bypassed
+            && comparisons
+                .get(&self.key.as_storage_key())
+                .filter(|comparison| comparison.enabled)
+                .is_none_or(|comparison| comparison.active_profile_id != COMPARISON_BYPASS_ID)
+    }
+
+    /// Profile that is audible on this output right now, if any.
+    pub fn playing_profile_id<'a>(
+        &'a self,
+        comparisons: &'a HashMap<String, ComparisonSet>,
+    ) -> Option<&'a str> {
+        (self.connected && self.is_filtering(comparisons, self.bypassed))
+            .then(|| self.effective_profile_id(comparisons))
+            .flatten()
+    }
+
+    /// The physical output, ignoring its route: a Bluetooth headset that
+    /// switches between call and music profiles is still the same device.
+    pub fn same_hardware(&self, other: &DeviceInfo) -> bool {
+        self.key.backend == other.key.backend && self.key.stable_id == other.key.stable_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,4 +263,111 @@ pub struct ProfileInfo {
     pub manual_trim_db: f64,
     pub activatable: bool,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Profile bank order: by name, case-insensitively, then by id for equal names.
+pub fn sort_profiles(profiles: &mut [ProfileInfo]) {
+    profiles.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(channels: u32, profile: Option<&str>) -> DeviceInfo {
+        DeviceInfo {
+            key: DeviceKey {
+                backend: "bluez5".into(),
+                stable_id: "AA:BB".into(),
+                route: "a2dp-sink".into(),
+            },
+            node_name: "buds".into(),
+            description: "Buds".into(),
+            channels,
+            connected: true,
+            assigned_profile: profile.map(str::to_owned),
+            bypassed: false,
+            is_default: true,
+        }
+    }
+
+    fn comparing(device: &DeviceInfo, active: &str) -> HashMap<String, ComparisonSet> {
+        HashMap::from([(
+            device.key.as_storage_key(),
+            ComparisonSet {
+                profile_ids: vec!["flat".into(), "warm".into(), COMPARISON_BYPASS_ID.into()],
+                active_profile_id: active.into(),
+                enabled: true,
+            },
+        )])
+    }
+
+    #[test]
+    fn active_comparison_candidate_is_the_effective_profile() {
+        let device = output(2, Some("flat"));
+        assert_eq!(device.effective_profile_id(&HashMap::new()), Some("flat"));
+        assert_eq!(
+            device.effective_profile_id(&comparing(&device, "warm")),
+            Some("warm")
+        );
+        // The bypass slot plays nothing, but the output still belongs to its profile.
+        let bypass = comparing(&device, COMPARISON_BYPASS_ID);
+        assert_eq!(device.effective_profile_id(&bypass), Some("flat"));
+        assert_eq!(device.playing_profile_id(&bypass), None);
+    }
+
+    #[test]
+    fn bypassed_disconnected_or_surround_outputs_play_nothing() {
+        let none = HashMap::new();
+        let device = output(2, Some("flat"));
+        assert_eq!(device.playing_profile_id(&none), Some("flat"));
+        assert!(!device.is_filtering(&none, true));
+        let bypassed = DeviceInfo {
+            bypassed: true,
+            ..device.clone()
+        };
+        assert_eq!(bypassed.playing_profile_id(&none), None);
+        let gone = DeviceInfo {
+            connected: false,
+            ..device.clone()
+        };
+        assert_eq!(gone.playing_profile_id(&none), None);
+        assert_eq!(output(6, Some("flat")).playing_profile_id(&none), None);
+    }
+
+    #[test]
+    fn bluetooth_route_changes_are_the_same_hardware() {
+        let music = output(2, None);
+        let mut call = music.clone();
+        call.key.route = "headset-head-unit".into();
+        assert!(music.same_hardware(&call));
+        call.key.stable_id = "CC:DD".into();
+        assert!(!music.same_hardware(&call));
+    }
+
+    #[test]
+    fn profiles_sort_by_name_ignoring_case() {
+        let profile = |id: &str, name: &str| ProfileInfo {
+            id: id.into(),
+            name: name.into(),
+            text: String::new(),
+            manual_trim_db: 0.0,
+            activatable: true,
+            diagnostics: Vec::new(),
+        };
+        let mut profiles = vec![
+            profile("1", "studio"),
+            profile("2", "AirPods"),
+            profile("3", "Harman"),
+            profile("0", "airpods"),
+        ];
+        sort_profiles(&mut profiles);
+        let ids = profiles.iter().map(|p| p.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, ["0", "2", "3", "1"]);
+    }
 }
