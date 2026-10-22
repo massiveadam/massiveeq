@@ -140,11 +140,13 @@ impl Storage {
     }
 
     pub fn list_profiles(&self, library: &Library) -> Result<Vec<ProfileInfo>, StorageError> {
-        library
+        let mut profiles = library
             .profiles
             .values()
             .map(|record| self.get_profile(record))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::sort_profiles(&mut profiles);
+        Ok(profiles)
     }
 
     pub fn get_profile(&self, record: &ProfileRecord) -> Result<ProfileInfo, StorageError> {

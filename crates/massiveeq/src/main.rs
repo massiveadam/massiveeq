@@ -8,7 +8,7 @@ use libadwaita as adw;
 use massiveeq_core::{
     COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
     MAX_COMPARISON_PROFILES, MAX_FILTERS_PER_CHANNEL, ProfileAnalysis, ProfileDocument,
-    ProfileInfo, analyze_profile_preview, parse_text, serialize_profile,
+    ProfileInfo, analyze_profile_preview, parse_text, serialize_profile, sort_profiles,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -43,6 +43,11 @@ struct Model {
     restoring_device: Cell<bool>,
     live: RefCell<Option<LiveIndicators>>,
     profile_pills: RefCell<Vec<gtk::Label>>,
+    /// Last click, key press, or scroll anywhere in the window.
+    last_input: Cell<Option<std::time::Instant>>,
+    /// Set while the bank is rebuilt in place, so re-selecting the open profile
+    /// does not reload it into the editor.
+    reordering_profiles: Cell<bool>,
 }
 
 /// Widgets that show which profile is actually playing.
@@ -53,6 +58,8 @@ struct LiveIndicators {
     profile_menu: gtk::MenuButton,
     profile_list: gtk::ListBox,
     device_drop: gtk::DropDown,
+    /// Open menus hold off focus changes from newly connected outputs.
+    menus: Vec<gtk::MenuButton>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +167,8 @@ fn build_ui(app: &adw::Application) {
         restoring_device: Cell::new(false),
         live: RefCell::new(None),
         profile_pills: RefCell::new(Vec::new()),
+        last_input: Cell::new(None),
+        reordering_profiles: Cell::new(false),
     });
 
     let window = adw::ApplicationWindow::builder()
@@ -794,7 +803,27 @@ fn build_ui(app: &adw::Application) {
         profile_menu: profile_menu.clone(),
         profile_list: profile_list.clone(),
         device_drop: device_drop.clone(),
+        menus: vec![profile_menu.clone(), comparison_ui.menu.clone()],
     });
+    // Seen in the capture phase, before any widget can consume the event.
+    let input_watch = gtk::EventControllerLegacy::new();
+    input_watch.set_propagation_phase(gtk::PropagationPhase::Capture);
+    input_watch.connect_event({
+        let model = model.clone();
+        move |_, event| {
+            if matches!(
+                event.event_type(),
+                gtk::gdk::EventType::ButtonPress
+                    | gtk::gdk::EventType::KeyPress
+                    | gtk::gdk::EventType::Scroll
+                    | gtk::gdk::EventType::TouchBegin
+            ) {
+                model.last_input.set(Some(std::time::Instant::now()));
+            }
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(input_watch);
     repopulate_profiles(&profile_list, &model);
     wire_actions(
         &window,
@@ -880,7 +909,7 @@ fn build_ui(app: &adw::Application) {
                 if let Ok(comparisons) = model.client.comparisons() {
                     *model.comparisons.borrow_mut() = comparisons;
                 }
-                apply_pending_focus(&model, &drop, &profile_list);
+                apply_pending_focus(&model, &drop, &profile_list, true);
                 update_device_controls(&model, &drop, &state, &assign, &bypass);
                 // The candidate rows are an unsaved draft while this popover
                 // is open. Rebuilding them on the health poll loses clicks
@@ -1187,7 +1216,11 @@ fn wire_actions(
             update_device_controls(&model, &device_drop, &device_state, &assign, &device_bypass);
         }
     };
+    let reordering = model.clone();
     profile_list.connect_row_selected(move |_, row| {
+        if reordering.reordering_profiles.get() {
+            return;
+        }
         if let Some(row) = row {
             reload(row.index() as usize);
         }
@@ -1537,7 +1570,10 @@ fn wire_actions(
             {
                 *model.pending_focus.borrow_mut() = Some(device.key.as_storage_key());
             }
-            apply_pending_focus(&model, drop, &profile_list);
+            // A restore comes from the poll or a focus change, which handle focus themselves.
+            if !model.restoring_device.get() {
+                apply_pending_focus(&model, drop, &profile_list, false);
+            }
             update_device_controls(&model, drop, &state, &assign, &bypass);
             refresh_comparison_ui(&model, drop, &comparison_ui);
         }
@@ -2867,35 +2903,6 @@ fn update_device_controls(
     update_live_indicators(model);
 }
 
-/// The profile an output is actually playing: the active comparison
-/// candidate while a comparison runs, otherwise its assigned profile.
-fn effective_profile_id(
-    device: &DeviceInfo,
-    comparisons: &HashMap<String, ComparisonSet>,
-) -> Option<String> {
-    comparisons
-        .get(&device.key.as_storage_key())
-        .filter(|comparison| comparison.enabled)
-        .map(|comparison| comparison.active_profile_id.clone())
-        .filter(|id| id != COMPARISON_BYPASS_ID)
-        .or_else(|| device.assigned_profile.clone())
-}
-
-/// Whether an output's filters are running: a supported channel layout, not
-/// bypassed, and not on the bypass side of a comparison.
-fn output_is_filtering(
-    device: &DeviceInfo,
-    comparisons: &HashMap<String, ComparisonSet>,
-    bypassed: bool,
-) -> bool {
-    matches!(device.channels, 1 | 2)
-        && !bypassed
-        && comparisons
-            .get(&device.key.as_storage_key())
-            .filter(|comparison| comparison.enabled)
-            .is_none_or(|comparison| comparison.active_profile_id != COMPARISON_BYPASS_ID)
-}
-
 /// Output to show at startup: the system default, else the first connected
 /// output with a profile, else the first connected output.
 fn preferred_device_index(devices: &[DeviceInfo]) -> Option<usize> {
@@ -2912,15 +2919,17 @@ fn preferred_device_index(devices: &[DeviceInfo]) -> Option<usize> {
 
 /// Output the editor should jump to after a device poll: a newly connected
 /// output (the default one if several arrive), or a new system default.
+/// Outputs are compared as hardware, so a Bluetooth headset switching between
+/// its call and music routes does not count as a new arrival.
 fn device_focus_target(old: &[DeviceInfo], new: &[DeviceInfo]) -> Option<usize> {
-    let was_connected = |key: &str| {
+    let was_connected = |device: &DeviceInfo| {
         old.iter()
-            .any(|device| device.connected && device.key.as_storage_key() == key)
+            .any(|previous| previous.connected && previous.same_hardware(device))
     };
     let arrived = new
         .iter()
         .enumerate()
-        .filter(|(_, device)| device.connected && !was_connected(&device.key.as_storage_key()))
+        .filter(|(_, device)| device.connected && !was_connected(device))
         .collect::<Vec<_>>();
     if let Some((index, _)) = arrived
         .iter()
@@ -2931,19 +2940,41 @@ fn device_focus_target(old: &[DeviceInfo], new: &[DeviceInfo]) -> Option<usize> 
     }
     let old_default = old
         .iter()
-        .find(|device| device.connected && device.is_default)
-        .map(|device| device.key.as_storage_key());
+        .find(|device| device.connected && device.is_default);
     new.iter().position(|device| {
         device.connected
             && device.is_default
-            && old_default.as_deref() != Some(device.key.as_storage_key().as_str())
+            && !old_default.is_some_and(|previous| previous.same_hardware(device))
     })
 }
 
-/// Select the pending output and open the profile it plays. Waits while an
-/// edit is still being saved so the edit is not written to the wrong profile.
-fn apply_pending_focus(model: &Rc<Model>, drop: &gtk::DropDown, profile_list: &gtk::ListBox) {
-    if model.pending_save.borrow().is_some() {
+/// How long the editor waits after the last click, key press, or scroll before
+/// a newly connected output may take it over.
+const FOCUS_IDLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The user is in the middle of something the editor should not pull away from.
+fn user_is_busy(model: &Model) -> bool {
+    model
+        .last_input
+        .get()
+        .is_some_and(|input| input.elapsed() < FOCUS_IDLE)
+        || model
+            .live
+            .borrow()
+            .as_ref()
+            .is_some_and(|live| live.menus.iter().any(gtk::MenuButton::is_active))
+}
+
+/// Select the pending output and open the profile it plays. Always waits for
+/// a pending save so an edit is not written to the wrong profile; focus that
+/// comes from a device change also waits until the user is idle.
+fn apply_pending_focus(
+    model: &Rc<Model>,
+    drop: &gtk::DropDown,
+    profile_list: &gtk::ListBox,
+    wait_for_idle: bool,
+) {
+    if model.pending_save.borrow().is_some() || (wait_for_idle && user_is_busy(model)) {
         return;
     }
     let Some(key) = model.pending_focus.borrow_mut().take() else {
@@ -2970,7 +3001,11 @@ fn focus_device_profile(model: &Rc<Model>, device_index: u32, profile_list: &gtk
         .devices
         .borrow()
         .get(device_index as usize)
-        .and_then(|device| effective_profile_id(device, &model.comparisons.borrow()));
+        .and_then(|device| {
+            device
+                .effective_profile_id(&model.comparisons.borrow())
+                .map(str::to_owned)
+        });
     let Some(target) = target else {
         return;
     };
@@ -3002,15 +3037,14 @@ fn update_live_indicators(model: &Rc<Model>) {
         let mut playing = Vec::new();
         let mut paused = Vec::new();
         for device in devices.iter().filter(|device| {
-            device.connected
-                && effective_profile_id(device, &comparisons).as_deref() == Some(profile_id)
+            device.connected && device.effective_profile_id(&comparisons) == Some(profile_id)
         }) {
             let bypassed = displayed_device_bypass(
                 &device.key.as_storage_key(),
                 device.bypassed,
                 pending_bypass.as_ref(),
             );
-            if !engine_off && output_is_filtering(device, &comparisons, bypassed) {
+            if !engine_off && device.is_filtering(&comparisons, bypassed) {
                 playing.push(device.description.as_str());
             } else {
                 paused.push(device.description.as_str());
@@ -3641,13 +3675,15 @@ fn save_current(
     }
     match model.client.put(&id, name, text, model.manual_trim.get()) {
         Ok(profile) => {
-            if let Some(existing) = model
+            let renamed = model
                 .profiles
                 .borrow_mut()
                 .iter_mut()
                 .find(|item| item.id == id)
-            {
-                *existing = profile;
+                .map(|existing| std::mem::replace(existing, profile).name != existing.name)
+                .unwrap_or(false);
+            if renamed {
+                resort_profiles(model);
             }
             *model.document.borrow_mut() = Some(parsed);
             status.set_text("Saved and applied");
@@ -3691,6 +3727,32 @@ fn refresh_profiles(model: &Rc<Model>, list: &gtk::ListBox) {
         repopulate_profiles(list, model);
     }
 }
+/// Re-sort the bank after a rename, keeping the open profile selected
+/// without reloading it into the editor.
+fn resort_profiles(model: &Rc<Model>) {
+    let Some(list) = model
+        .live
+        .borrow()
+        .as_ref()
+        .map(|live| live.profile_list.clone())
+    else {
+        return;
+    };
+    sort_profiles(&mut model.profiles.borrow_mut());
+    let current = model.current_id.borrow().clone();
+    let position = model
+        .profiles
+        .borrow()
+        .iter()
+        .position(|profile| Some(&profile.id) == current.as_ref());
+    model.reordering_profiles.set(true);
+    repopulate_profiles(&list, model);
+    if let Some(row) = position.and_then(|position| list.row_at_index(position as i32)) {
+        list.select_row(Some(&row));
+    }
+    model.reordering_profiles.set(false);
+}
+
 fn repopulate_profiles(list: &gtk::ListBox, model: &Rc<Model>) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
@@ -3737,9 +3799,8 @@ fn show_startup_error(app: &adw::Application, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
-        HashMap, PendingDeviceBypass, ProfileDocument, can_add_filter, device_focus_target,
-        displayed_device_bypass, effective_profile_id, output_is_filtering, preferred_device_index,
+        ChannelSelection, DeviceInfo, Filter, FilterKind, PendingDeviceBypass, ProfileDocument,
+        can_add_filter, device_focus_target, displayed_device_bypass, preferred_device_index,
     };
     use massiveeq_core::DeviceKey;
 
@@ -3817,53 +3878,29 @@ mod tests {
     }
 
     #[test]
-    fn bypassed_or_surround_outputs_are_not_filtering() {
-        let device = output("buds", true, true, Some("flat"));
-        let mut comparisons = HashMap::new();
-        assert!(output_is_filtering(&device, &comparisons, false));
-        assert!(!output_is_filtering(&device, &comparisons, true));
-        let surround = DeviceInfo {
-            channels: 6,
-            ..device.clone()
+    fn bluetooth_route_change_is_not_a_new_arrival() {
+        let route = |device: &DeviceInfo, route: &str| {
+            let mut device = device.clone();
+            device.key.route = route.into();
+            device
         };
-        assert!(!output_is_filtering(&surround, &comparisons, false));
-        comparisons.insert(
-            device.key.as_storage_key(),
-            ComparisonSet {
-                profile_ids: vec!["flat".into()],
-                active_profile_id: COMPARISON_BYPASS_ID.into(),
-                enabled: true,
-            },
-        );
-        assert!(!output_is_filtering(&device, &comparisons, false));
-    }
-
-    #[test]
-    fn active_comparison_candidate_is_the_playing_profile() {
-        let device = output("buds", true, true, Some("flat"));
-        let key = device.key.as_storage_key();
-        let mut comparisons = HashMap::new();
-        assert_eq!(
-            effective_profile_id(&device, &comparisons).as_deref(),
-            Some("flat")
-        );
-        comparisons.insert(
-            key.clone(),
-            ComparisonSet {
-                profile_ids: vec!["flat".into(), "warm".into()],
-                active_profile_id: "warm".into(),
-                enabled: true,
-            },
-        );
-        assert_eq!(
-            effective_profile_id(&device, &comparisons).as_deref(),
-            Some("warm")
-        );
-        comparisons.get_mut(&key).unwrap().active_profile_id = COMPARISON_BYPASS_ID.into();
-        assert_eq!(
-            effective_profile_id(&device, &comparisons).as_deref(),
-            Some("flat")
-        );
+        let speakers = output("speakers", true, true, None);
+        let buds = output("buds", true, false, None);
+        // The headset connected on its call route; focus already moved to it.
+        let old = [route(&buds, "headset-head-unit"), speakers.clone()];
+        // It switches to music and the call route is remembered, disconnected.
+        let mut call = route(&buds, "headset-head-unit");
+        call.connected = false;
+        let new = [route(&buds, "a2dp-sink"), speakers.clone(), call];
+        assert_eq!(device_focus_target(&old, &new), None);
+        // A new system default on the same headset does not take focus again.
+        let mut old_default = old.clone();
+        old_default[0].is_default = true;
+        old_default[1].is_default = false;
+        let mut new_default = new.clone();
+        new_default[0].is_default = true;
+        new_default[1].is_default = false;
+        assert_eq!(device_focus_target(&old_default, &new_default), None);
     }
 
     #[test]

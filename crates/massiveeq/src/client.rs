@@ -40,7 +40,10 @@ impl Client {
     }
 
     pub fn profiles(&self) -> Result<Vec<ProfileInfo>> {
-        self.call_json("ListProfiles", &())
+        // The service sorts too; sorting here keeps an older service in order.
+        let mut profiles: Vec<ProfileInfo> = self.call_json("ListProfiles", &())?;
+        massiveeq_core::sort_profiles(&mut profiles);
+        Ok(profiles)
     }
     pub fn devices(&self) -> Result<Vec<DeviceInfo>> {
         self.call_json("ListDevices", &())
