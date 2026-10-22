@@ -359,7 +359,7 @@ impl Service {
 
     async fn status(&self) -> fdo::Result<String> {
         let state = self.state.lock().await;
-        Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass, "comparisons": state.library.comparison_sets, "engine": state.host.status_json() }).to_string())
+        Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass, "comparisons": state.library.comparison_sets, "engine": state.host.status_json(), "graph": state.graph }).to_string())
     }
 
     #[zbus(signal)]

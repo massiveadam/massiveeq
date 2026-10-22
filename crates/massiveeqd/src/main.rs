@@ -21,12 +21,14 @@ pub struct AppState {
     storage: Storage,
     library: Library,
     devices: Vec<DeviceInfo>,
+    graph: device::GraphInfo,
     host: FilterHost,
 }
 
 pub async fn refresh_locked(state: &mut AppState, force_restart: bool) -> Result<()> {
     let remembered_before = state.library.remembered_devices.clone();
-    let devices = device::discover(&mut state.library).await?;
+    let (devices, graph) = device::discover(&mut state.library).await?;
+    state.graph = graph;
     if state.library.remembered_devices != remembered_before {
         state.storage.save_library(&state.library)?;
     }
@@ -83,6 +85,7 @@ async fn main() -> Result<()> {
         storage,
         library,
         devices: Vec::new(),
+        graph: device::GraphInfo::default(),
         host,
     }));
     // Own the control name before creating any PipeWire filters. A second

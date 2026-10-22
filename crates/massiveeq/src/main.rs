@@ -485,9 +485,7 @@ fn build_ui(app: &adw::Application) {
     graph_header.append(&graph_title);
     let graph_hint = gtk::Label::new(Some(&engine_summary(&engine_status)));
     graph_hint.add_css_class("level-code");
-    graph_hint.set_tooltip_text(Some(
-        "Click empty graph space to add a band, drag points to edit, or use arrows on the selected point",
-    ));
+    graph_hint.set_tooltip_text(Some(&engine_tooltip(&engine_status)));
     graph_header.append(&graph_hint);
     graph_card.append(&graph_header);
     let graph = graph::response_graph(
@@ -932,6 +930,7 @@ fn build_ui(app: &adw::Application) {
                     .and_then(serde_json::Value::as_bool)
             {
                 engine_readout.set_text(&engine_summary(&service_status));
+                engine_readout.set_tooltip_text(Some(&engine_tooltip(&service_status)));
                 engine.set_sensitive(true);
                 model.syncing_engine.set(true);
                 engine.set_active(!engine_off);
@@ -3211,15 +3210,117 @@ fn engine_summary(status: &serde_json::Value) -> String {
         .get("cpu_percent_of_deadline")
         .and_then(serde_json::Value::as_f64)
         .unwrap_or_default();
+    let source = match source_rate(status) {
+        Some(SourceRate::Native) => " · SOURCE NATIVE".to_owned(),
+        Some(SourceRate::Resampled { source, .. }) => {
+            format!(" · SOURCE {:.1} kHz → RESAMPLED", source as f64 / 1000.0)
+        }
+        None => String::new(),
+    };
     if active
         .get("cpu_warning")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        format!("NATIVE DSP · {rate:.1} kHz · {latency:.1} ms · CPU {cpu:.0}% ⚠")
+        format!("NATIVE DSP · {rate:.1} kHz{source} · {latency:.1} ms · CPU {cpu:.0}% ⚠")
     } else {
-        format!("NATIVE DSP · {rate:.1} kHz · {latency:.1} ms")
+        format!("NATIVE DSP · {rate:.1} kHz{source} · {latency:.1} ms")
     }
+}
+
+/// Whether playing audio reaches the graph at its own rate.
+#[derive(Debug, PartialEq)]
+enum SourceRate {
+    Native,
+    Resampled {
+        source: u32,
+        graph: u32,
+        /// PipeWire would be allowed to switch to the source's rate.
+        allowed: bool,
+        /// Only one rate is allowed, so PipeWire can never switch.
+        fixed: bool,
+    },
+}
+
+fn source_rate(status: &serde_json::Value) -> Option<SourceRate> {
+    let graph = status.pointer("/graph/rate")?.as_u64()? as u32;
+    let streams = status.pointer("/graph/streams")?.as_array()?;
+    let allowed = status
+        .pointer("/graph/allowed_rates")
+        .and_then(serde_json::Value::as_array)
+        .map(|rates| {
+            rates
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|rate| rate as u32)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let rates = streams
+        .iter()
+        .filter_map(|stream| stream.get("rate")?.as_u64())
+        .map(|rate| rate as u32)
+        .collect::<Vec<_>>();
+    if rates.is_empty() {
+        return None;
+    }
+    match rates.iter().find(|rate| **rate != graph) {
+        None => Some(SourceRate::Native),
+        Some(&source) => Some(SourceRate::Resampled {
+            source,
+            graph,
+            allowed: allowed.contains(&source),
+            fixed: allowed.len() <= 1,
+        }),
+    }
+}
+
+fn engine_tooltip(status: &serde_json::Value) -> String {
+    let khz = |rate: u32| format!("{} kHz", rate as f64 / 1000.0);
+    let rate = match source_rate(status) {
+        Some(SourceRate::Native) => {
+            "Playing audio reaches MassiveEQ at its own sample rate, with no resampling.\n\n"
+                .to_owned()
+        }
+        Some(SourceRate::Resampled {
+            source,
+            graph,
+            fixed: true,
+            ..
+        }) => format!(
+            "PipeWire is converting {} audio to {} because that is the only rate it may run \
+             at. To play each source at its own rate, create \
+             ~/.config/pipewire/pipewire.conf.d/rates.conf containing\n\n\
+             context.properties = {{ default.clock.allowed-rates = [ 44100 48000 88200 96000 \
+             176400 192000 ] }}\n\nthen restart PipeWire. MassiveEQ follows the new rate \
+             automatically.\n\n",
+            khz(source),
+            khz(graph)
+        ),
+        Some(SourceRate::Resampled {
+            source,
+            graph,
+            allowed: true,
+            ..
+        }) => format!(
+            "PipeWire is converting {} audio to {}. It runs at one rate at a time, so \
+             another playing stream or the output's supported rates are holding it at {}.\n\n",
+            khz(source),
+            khz(graph),
+            khz(graph)
+        ),
+        Some(SourceRate::Resampled { source, graph, .. }) => format!(
+            "PipeWire is converting {} audio to {}: {} is not in PipeWire's \
+             default.clock.allowed-rates.\n\n",
+            khz(source),
+            khz(graph),
+            khz(source)
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{rate}Click empty graph space to add a band, drag points to edit, or use arrows on the selected point"
+    )
 }
 
 fn install_css() {
@@ -3914,7 +4015,8 @@ fn show_startup_error(app: &adw::Application, message: &str) {
 mod tests {
     use super::{
         ChannelSelection, DeviceInfo, Filter, FilterKind, PendingDeviceBypass, ProfileDocument,
-        can_add_filter, device_focus_target, displayed_device_bypass, preferred_device_index,
+        SourceRate, can_add_filter, device_focus_target, displayed_device_bypass, engine_tooltip,
+        preferred_device_index, source_rate,
     };
     use massiveeq_core::DeviceKey;
 
@@ -3933,6 +4035,40 @@ mod tests {
             bypassed: false,
             is_default,
         }
+    }
+
+    #[test]
+    fn source_rate_tells_native_from_resampled_playback() {
+        let status = |allowed: &[u32], streams: &[u32]| {
+            serde_json::json!({ "graph": {
+                "rate": 48_000,
+                "allowed_rates": allowed,
+                "streams": streams.iter().map(|rate| serde_json::json!({"name": "x", "rate": rate})).collect::<Vec<_>>(),
+            }})
+        };
+        assert_eq!(source_rate(&status(&[48_000], &[])), None);
+        assert_eq!(
+            source_rate(&status(&[48_000], &[48_000])),
+            Some(SourceRate::Native)
+        );
+        assert_eq!(
+            source_rate(&status(&[48_000], &[44_100])),
+            Some(SourceRate::Resampled {
+                source: 44_100,
+                graph: 48_000,
+                allowed: false,
+                fixed: true
+            })
+        );
+        assert!(matches!(
+            source_rate(&status(&[44_100, 48_000], &[48_000, 44_100])),
+            Some(SourceRate::Resampled {
+                allowed: true,
+                fixed: false,
+                ..
+            })
+        ));
+        assert!(engine_tooltip(&status(&[48_000], &[44_100])).contains("allowed-rates"));
     }
 
     #[test]

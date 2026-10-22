@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use massiveeq_core::{DeviceInfo, DeviceKey, Library, RememberedDevice};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::process::Command;
 
@@ -30,7 +31,90 @@ pub async fn graph_settings() -> GraphSettings {
     }
 }
 
-pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
+/// The rate PipeWire's graph runs at, the rates it may switch to, and the
+/// rates of the audio playing into it, to tell native playback from resampled.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct GraphInfo {
+    pub rate: Option<u32>,
+    pub allowed_rates: Vec<u32>,
+    pub streams: Vec<StreamRate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StreamRate {
+    pub name: String,
+    pub rate: u32,
+}
+
+pub fn graph_info(objects: &[Value]) -> GraphInfo {
+    let settings = objects
+        .iter()
+        .filter(|object| {
+            object.get("type").and_then(Value::as_str) == Some("PipeWire:Interface:Metadata")
+                && object
+                    .pointer("/props/metadata.name")
+                    .and_then(Value::as_str)
+                    == Some("settings")
+        })
+        .filter_map(|object| object.get("metadata").and_then(Value::as_array))
+        .flatten()
+        .collect::<Vec<_>>();
+    let setting = |key: &str| {
+        settings
+            .iter()
+            .find(|entry| entry.get("key").and_then(Value::as_str) == Some(key))
+            .and_then(|entry| entry.get("value"))
+    };
+    let number = |value: &Value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str()?.trim().parse().ok())
+            .map(|value| value as u32)
+    };
+    let forced = setting("clock.force-rate")
+        .and_then(number)
+        .filter(|rate| *rate > 0);
+    let allowed_rates = match setting("clock.allowed-rates") {
+        Some(Value::Array(values)) => values.iter().filter_map(number).collect(),
+        Some(Value::String(text)) => text
+            .trim_matches(|c| c == '[' || c == ']')
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|value| value.parse().ok())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let streams = objects
+        .iter()
+        .filter(|object| {
+            object.get("type").and_then(Value::as_str) == Some("PipeWire:Interface:Node")
+                && object.pointer("/info/state").and_then(Value::as_str) == Some("running")
+        })
+        .filter_map(|object| {
+            let props = object.pointer("/info/props")?.as_object()?;
+            if string(props, "media.class") != Some("Stream/Output/Audio")
+                || string(props, "node.name").is_some_and(|name| name.starts_with("massiveeq."))
+            {
+                return None;
+            }
+            let rate = object
+                .pointer("/info/params/Format/0/rate")
+                .and_then(Value::as_u64)? as u32;
+            let name = string(props, "application.name")
+                .or_else(|| string(props, "media.name"))
+                .or_else(|| string(props, "node.name"))
+                .unwrap_or("Audio")
+                .to_owned();
+            Some(StreamRate { name, rate })
+        })
+        .collect();
+    GraphInfo {
+        rate: forced.or_else(|| setting("clock.rate").and_then(number)),
+        allowed_rates,
+        streams,
+    }
+}
+
+pub async fn discover(library: &mut Library) -> Result<(Vec<DeviceInfo>, GraphInfo)> {
     let output = Command::new("pw-dump")
         .output()
         .await
@@ -41,6 +125,7 @@ pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
     let objects: Vec<Value> =
         serde_json::from_slice(&output.stdout).context("invalid pw-dump JSON")?;
     let default_sink = default_sink_name(&objects);
+    let graph = graph_info(&objects);
     let mut devices = Vec::new();
     for object in objects {
         if object.get("type").and_then(Value::as_str) != Some("PipeWire:Interface:Node") {
@@ -149,7 +234,7 @@ pub async fn discover(library: &mut Library) -> Result<Vec<DeviceInfo>> {
             .cmp(&a.connected)
             .then_with(|| a.description.cmp(&b.description))
     });
-    Ok(devices)
+    Ok((devices, graph))
 }
 
 /// Node name of `default.audio.sink` from the `default` metadata object in a pw-dump.
@@ -241,6 +326,41 @@ mod tests {
         let text = "update: id:0 key:'clock.rate' value:'96000' type:''\nupdate: id:0 key:'clock.max-quantum' value:'4096' type:''";
         assert_eq!(metadata_number(text, "clock.rate"), Some(96_000));
         assert_eq!(metadata_number(text, "clock.max-quantum"), Some(4_096));
+    }
+
+    #[test]
+    fn reads_graph_and_stream_rates_from_pw_dump() {
+        let objects: Vec<Value> = serde_json::from_str(
+            r#"[
+              {"type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "settings"},
+               "metadata": [
+                 {"key": "clock.rate", "value": 48000},
+                 {"key": "clock.allowed-rates", "value": "[ 44100 48000 ]"},
+                 {"key": "clock.force-rate", "value": 0}
+               ]},
+              {"type": "PipeWire:Interface:Node", "info": {"state": "running",
+               "props": {"media.class": "Stream/Output/Audio", "application.name": "mpv"},
+               "params": {"Format": [{"rate": 44100}]}}},
+              {"type": "PipeWire:Interface:Node", "info": {"state": "idle",
+               "props": {"media.class": "Stream/Output/Audio", "application.name": "Firefox"},
+               "params": {"Format": [{"rate": 48000}]}}},
+              {"type": "PipeWire:Interface:Node", "info": {"state": "running",
+               "props": {"media.class": "Stream/Output/Audio", "node.name": "massiveeq.output.1"},
+               "params": {"Format": [{"rate": 48000}]}}}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            graph_info(&objects),
+            GraphInfo {
+                rate: Some(48_000),
+                allowed_rates: vec![44_100, 48_000],
+                streams: vec![StreamRate {
+                    name: "mpv".into(),
+                    rate: 44_100
+                }],
+            }
+        );
     }
 
     #[test]
