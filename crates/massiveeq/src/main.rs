@@ -8,8 +8,8 @@ use libadwaita as adw;
 use massiveeq_core::{
     COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
     ImpulseLayout, MAX_COMPARISON_PROFILES, MAX_FILTERS_PER_CHANNEL, ProfileAnalysis,
-    ProfileDocument, ProfileInfo, analyze_profile_preview, parse_text, serialize_profile,
-    sort_profiles,
+    ProfileDocument, ProfileInfo, analysis::ResponsePoint, analyze_profile_preview, parse_text,
+    serialize_profile, sort_profiles,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -44,6 +44,9 @@ struct Model {
     restoring_device: Cell<bool>,
     live: RefCell<Option<LiveIndicators>>,
     profile_pills: RefCell<Vec<gtk::Label>>,
+    /// The impulse response's own curve per ear (service analysis minus the
+    /// EQ), so live previews while dragging include it.
+    ir_curve: RefCell<Option<[Vec<ResponsePoint>; 2]>>,
     /// Last click, key press, or scroll anywhere in the window.
     last_input: Cell<Option<std::time::Instant>>,
     /// Set while the bank is rebuilt in place, so re-selecting the open profile
@@ -77,8 +80,6 @@ struct ConvolutionUi {
     channel: gtk::DropDown,
     choose: gtk::Button,
     remove: gtk::Button,
-    add_filter: gtk::Button,
-    reset_filters: gtk::Button,
     syncing: Rc<Cell<bool>>,
     /// Layout of the open profile's impulse response, as reported by the service.
     layout: Rc<Cell<Option<ImpulseLayout>>>,
@@ -172,6 +173,7 @@ fn build_ui(app: &adw::Application) {
         restoring_device: Cell::new(false),
         live: RefCell::new(None),
         profile_pills: RefCell::new(Vec::new()),
+        ir_curve: RefCell::new(None),
         last_input: Cell::new(None),
         reordering_profiles: Cell::new(false),
     });
@@ -636,7 +638,7 @@ fn build_ui(app: &adw::Application) {
     convolution_actions.append(&remove_convolution);
     convolution_card.append(&convolution_actions);
     let convolution_note = gtk::Label::new(Some(
-        "Convolution replaces the parametric chain for this profile.",
+        "Parametric filters and GraphicEQ apply on top of the impulse response, per ear.",
     ));
     convolution_note.set_xalign(0.0);
     convolution_note.set_wrap(true);
@@ -748,8 +750,6 @@ fn build_ui(app: &adw::Application) {
         channel: convolution_channel,
         choose: choose_convolution,
         remove: remove_convolution,
-        add_filter: add_filter_button.clone(),
-        reset_filters: reset_filters_button.clone(),
         syncing: Rc::new(Cell::new(false)),
         layout: Rc::new(Cell::new(None)),
         parametric_mode: parametric_mode.clone(),
@@ -1024,7 +1024,6 @@ fn wire_actions(
                     status.set_text("This profile already has 64 bands on one channel");
                     return;
                 }
-                document.convolutions.clear();
                 document.graphic_eqs.clear();
                 document.filters.push(Filter {
                     enabled: true,
@@ -1055,7 +1054,6 @@ fn wire_actions(
                 let Some(document) = document.as_mut() else {
                     return;
                 };
-                document.convolutions.clear();
                 document.graphic_eqs.clear();
                 for filter in &mut document.filters {
                     filter.gain_db = 0.0;
@@ -1136,7 +1134,7 @@ fn wire_actions(
                         update_convolution_ui(&ui, &document);
                         if let Ok(analysis) = model.client.analyze(&id) {
                             set_analysis_label(&analysis_label, &analysis);
-                            *model.analysis.borrow_mut() = Some(analysis);
+                            store_service_analysis(&model, analysis);
                         }
                         graph.queue_draw();
                         status.set_text("Convolution active");
@@ -1845,11 +1843,7 @@ fn wire_actions(
                     channels: ChannelSelection::All,
                 });
                 let index = document.filters.len() - 1;
-                let preview = analyze_profile_preview(
-                    document,
-                    model.sample_rate.get(),
-                    model.manual_trim.get(),
-                );
+                let preview = preview_analysis(&model, document);
                 (index, preview)
             };
             *state.borrow_mut() = Some((index, frequency, gain_db));
@@ -1879,7 +1873,6 @@ fn wire_actions(
                 let Some(document) = document.as_mut() else {
                     return;
                 };
-                document.convolutions.clear();
                 document.graphic_eqs.clear();
                 let Some(filter) = document.filters.get_mut(index) else {
                     return;
@@ -1887,7 +1880,7 @@ fn wire_actions(
                 filter.frequency =
                     (start_frequency * (1000.0_f64).powf(dx / width)).clamp(20.0, 20_000.0);
                 filter.gain_db = graph::gain_after_drag(start_gain, dy, height);
-                analyze_profile_preview(document, model.sample_rate.get(), model.manual_trim.get())
+                preview_analysis(&model, document)
             };
             set_analysis_label(&analysis_label, &preview);
             *model.analysis.borrow_mut() = Some(preview);
@@ -1998,9 +1991,10 @@ fn load_profile(
     rebuild_filter_list(filter_list, &document, model, buffer, graph);
     convolution_ui.layout.set(profile.impulse_layout);
     update_convolution_ui(convolution_ui, &document);
+    show_profile_page(convolution_ui, &document);
     if let Ok(analysis) = model.client.analyze(&profile.id) {
         set_analysis_label(analysis_label, &analysis);
-        *model.analysis.borrow_mut() = Some(analysis);
+        store_service_analysis(model, analysis);
         graph.queue_draw();
     }
     model.loading.set(false);
@@ -2033,9 +2027,7 @@ fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
         ui.channel
             .set_tooltip_text(matrix.then_some("This impulse response feeds both ears"));
         ui.remove.set_sensitive(true);
-        ui.stack.set_visible_child_name("convolution");
-        // The stack's own notification can be missed before the window maps.
-        ui.convolution_mode.set_active(true);
+        ui.convolution_mode.set_label("CONVOLUTION ●");
     } else {
         ui.file_name.set_text("No impulse response selected");
         ui.file_path.set_text(
@@ -2045,16 +2037,28 @@ fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
         ui.channel.set_sensitive(true);
         ui.channel.set_tooltip_text(None);
         ui.remove.set_sensitive(false);
-        ui.stack.set_visible_child_name("filters");
+        ui.convolution_mode.set_label("CONVOLUTION");
+    }
+    ui.syncing.set(false);
+}
+
+/// Open a freshly loaded profile on the page that holds its processing: the
+/// impulse response when that is all it has, otherwise the filters.
+fn show_profile_page(ui: &ConvolutionUi, profile: &ProfileDocument) {
+    let convolution_only = !profile.convolutions.is_empty()
+        && profile.filters.is_empty()
+        && profile.graphic_eqs.is_empty();
+    ui.stack.set_visible_child_name(if convolution_only {
+        "convolution"
+    } else {
+        "filters"
+    });
+    // The stack's own notification can be missed before the window maps.
+    if convolution_only {
+        ui.convolution_mode.set_active(true);
+    } else {
         ui.parametric_mode.set_active(true);
     }
-    let parametric = profile.convolutions.is_empty();
-    ui.add_filter.set_visible(parametric);
-    ui.reset_filters.set_visible(true);
-    ui.reset_filters.set_sensitive(parametric);
-    ui.reset_filters
-        .set_opacity(if parametric { 1.0 } else { 0.0 });
-    ui.syncing.set(false);
 }
 
 fn rebuild_filter_list(
@@ -2400,7 +2404,6 @@ fn update_filter(
         let Some(document) = document.as_mut() else {
             return;
         };
-        document.convolutions.clear();
         document.graphic_eqs.clear();
         let Some(filter) = document.filters.get_mut(index) else {
             return;
@@ -2408,7 +2411,7 @@ fn update_filter(
         update(filter);
         (
             serialize_profile(document),
-            analyze_profile_preview(document, model.sample_rate.get(), model.manual_trim.get()),
+            preview_analysis(model, document),
         )
     };
     *model.analysis.borrow_mut() = Some(preview);
@@ -3724,7 +3727,7 @@ fn save_current(
             status.set_text("Saved and applied");
             if let Ok(analysis) = model.client.analyze(&id) {
                 set_analysis_label(analysis_label, &analysis);
-                *model.analysis.borrow_mut() = Some(analysis);
+                store_service_analysis(model, analysis);
                 graph.queue_draw();
             }
             true
@@ -3734,6 +3737,82 @@ fn save_current(
             false
         }
     }
+}
+
+/// Keep the service's analysis of the open profile, and remember what its
+/// impulse response alone contributes for later live previews.
+fn store_service_analysis(model: &Model, analysis: ProfileAnalysis) {
+    let ir_curve = model
+        .document
+        .borrow()
+        .as_ref()
+        .filter(|document| !document.convolutions.is_empty())
+        .map(|document| {
+            let eq = analyze_profile_preview(document, model.sample_rate.get(), 0.0);
+            let without = |full: &[ResponsePoint], eq: &[ResponsePoint]| {
+                full.iter()
+                    .map(|point| ResponsePoint {
+                        frequency: point.frequency,
+                        gain_db: point.gain_db - interpolate_response(eq, point.frequency),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            [
+                without(&analysis.left.response, &eq.left.response),
+                without(&analysis.right.response, &eq.right.response),
+            ]
+        });
+    *model.ir_curve.borrow_mut() = ir_curve;
+    *model.analysis.borrow_mut() = Some(analysis);
+}
+
+/// Instant local analysis of an edited document. The local analyser only
+/// knows EQ, so with an impulse response its stored curve is added and the
+/// gain readouts stay at the service's last exact values.
+fn preview_analysis(model: &Model, document: &ProfileDocument) -> ProfileAnalysis {
+    let mut preview =
+        analyze_profile_preview(document, model.sample_rate.get(), model.manual_trim.get());
+    if document.convolutions.is_empty() {
+        return preview;
+    }
+    if let Some(ir) = model.ir_curve.borrow().as_ref() {
+        for (channel, curve) in [&mut preview.left, &mut preview.right].into_iter().zip(ir) {
+            for point in &mut channel.response {
+                point.gain_db += interpolate_response(curve, point.frequency);
+            }
+        }
+    }
+    if let Some(service) = model.analysis.borrow().as_ref() {
+        preview.match_gain_db = service.match_gain_db;
+        preview.safety_attenuation_db = service.safety_attenuation_db;
+        preview.effective_gain_db = service.effective_gain_db;
+        preview.headroom_limited = service.headroom_limited;
+        preview.left.preamp_db = service.left.preamp_db;
+        preview.right.preamp_db = service.right.preamp_db;
+    }
+    preview
+}
+
+/// Gain of a log-frequency response at `frequency`, linearly interpolated.
+fn interpolate_response(points: &[ResponsePoint], frequency: f64) -> f64 {
+    let Some(first) = points.first() else {
+        return 0.0;
+    };
+    if frequency <= first.frequency {
+        return first.gain_db;
+    }
+    for pair in points.windows(2) {
+        if frequency <= pair[1].frequency {
+            let span = (pair[1].frequency / pair[0].frequency).ln();
+            let amount = if span > 0.0 {
+                (frequency / pair[0].frequency).ln() / span
+            } else {
+                0.0
+            };
+            return pair[0].gain_db + amount * (pair[1].gain_db - pair[0].gain_db);
+        }
+    }
+    points.last().map_or(0.0, |point| point.gain_db)
 }
 
 fn set_analysis_label(label: &gtk::Label, analysis: &ProfileAnalysis) {

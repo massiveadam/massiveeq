@@ -34,8 +34,6 @@ impl CompileOptions {
 pub enum CompileError {
     #[error("profile contains parser errors")]
     ParserErrors,
-    #[error("parametric/GraphicEQ processing and convolution cannot be active in the same profile")]
-    MixedProcessingModes,
     #[error("per-ear profiles cannot be assigned to a mono output")]
     PerEarOnMono,
     #[error("unsupported output channel count {0}; MassiveEQ supports mono and stereo")]
@@ -180,10 +178,6 @@ pub fn compile_profile(
     profile: &ProfileDocument,
     options: &CompileOptions,
 ) -> Result<CompiledProfile, CompileError> {
-    let has_eq = !profile.filters.is_empty() || !profile.graphic_eqs.is_empty();
-    if has_eq && !profile.convolutions.is_empty() {
-        return Err(CompileError::MixedProcessingModes);
-    }
     if !profile.is_activatable() {
         return Err(CompileError::ParserErrors);
     }
@@ -480,13 +474,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mixed_convolution_and_eq() {
-        let profile = parse_text(
-            "test",
-            "Filter: ON PK Fc 1000 Hz Gain 3 dB Q 1\nConvolution: missing.wav",
+    fn eq_applies_on_top_of_convolution() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("assets")).unwrap();
+        // A -6 dB flat IR, per ear and as an identity true-stereo matrix.
+        write_float_wav(&temp.path().join("assets/mono.wav"), 48_000, 1, &[0.5]);
+        write_float_wav(
+            &temp.path().join("assets/matrix.wav"),
+            48_000,
+            4,
+            &[0.5, 0.0, 0.0, 0.5],
         );
-        let result = compile_profile(&profile, &CompileOptions::stereo(48_000, 256, "/tmp"));
-        assert!(matches!(result, Err(CompileError::MixedProcessingModes)));
+        for file in ["mono", "matrix"] {
+            let profile = parse_text(
+                "test",
+                &format!("Filter: ON PK Fc 1000 Hz Gain 6 dB Q 1\nConvolution: assets/{file}.wav"),
+            );
+            let compiled =
+                compile_profile(&profile, &CompileOptions::stereo(48_000, 64, temp.path()))
+                    .unwrap();
+            for channel in &compiled.analysis.channels {
+                let at = |frequency: f64| {
+                    channel
+                        .response
+                        .iter()
+                        .min_by(|a, b| {
+                            (a.frequency.ln() - frequency.ln())
+                                .abs()
+                                .total_cmp(&(b.frequency.ln() - frequency.ln()).abs())
+                        })
+                        .unwrap()
+                        .gain_db
+                };
+                // IR -6 dB everywhere, plus the +6 dB peak at 1 kHz.
+                assert!((at(1_000.0) - 0.0).abs() < 0.2, "{file}: {}", at(1_000.0));
+                assert!((at(50.0) + 6.0).abs() < 0.2, "{file}: {}", at(50.0));
+            }
+            assert_eq!(compiled.channels[0].biquads.len(), 1);
+        }
     }
 
     #[test]

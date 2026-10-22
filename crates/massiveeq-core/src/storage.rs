@@ -330,8 +330,7 @@ impl Storage {
 
         let text = fs::read_to_string(self.profile_path(id))?;
         let mut document = parse_text(&record.name, &text);
-        document.filters.clear();
-        document.graphic_eqs.clear();
+        // The IR replaces any previous one; EQ stays and is applied on top.
         document.convolutions.clear();
         document.convolutions.push(Convolution {
             channels,
@@ -667,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn convolution_mode_copies_asset_and_replaces_parametric_filters() {
+    fn convolution_copies_asset_and_keeps_parametric_filters() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
         let mut library = storage.load_library().unwrap();
@@ -687,7 +686,7 @@ mod tests {
             .set_convolution(&library, &profile.id, &source, ChannelSelection::All)
             .unwrap();
         let parsed = parse_text(&updated.name, &updated.text);
-        assert!(parsed.filters.is_empty());
+        assert_eq!(parsed.filters.len(), 1);
         assert_eq!(parsed.convolutions.len(), 1);
         assert!(parsed.convolutions[0].path.starts_with("assets"));
         assert!(

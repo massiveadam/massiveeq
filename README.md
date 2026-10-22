@@ -302,10 +302,14 @@ programme takes; full-scale content on every surround channel at once can
 still exceed them. Matrix routes use uniformly partitioned convolution sized
 to the PipeWire quantum, which keeps per-callback cost steady.
 
-Profiles use either parametric/GraphicEQ processing or convolution. A profile
-that mixes those modes, references a missing IR, exceeds the device Nyquist
-rate, or fails headroom analysis remains an editable draft while the last valid
-audio chain continues playing.
+A profile can combine an impulse response with parametric filters and
+GraphicEQ: the EQ applies on top, per ear (for a multichannel IR, after its
+speakers are folded into the two ears), so a room or speaker IR and headphone
+correction live in one profile. Equalizer APO applies commands in file order;
+MassiveEQ always applies EQ after the IR, which gives the same result for 1-
+and 2-channel files. A profile that references a missing IR, exceeds the
+device Nyquist rate, or fails headroom analysis remains an editable draft while
+the last valid audio chain continues playing.
 
 ## Diagnostics
 
