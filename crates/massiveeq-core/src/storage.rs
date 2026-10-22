@@ -366,6 +366,48 @@ impl Storage {
         self.save_library(library)
     }
 
+    /// Save (or with `None`, remove) a measurement or target curve shown
+    /// behind this profile's EQ. Returns the profile's curves afterwards.
+    pub fn set_curve(
+        &self,
+        library: &Library,
+        id: &str,
+        kind: crate::CurveKind,
+        source: Option<&Path>,
+    ) -> Result<crate::Curves, StorageError> {
+        if !library.profiles.contains_key(id) {
+            return Err(StorageError::MissingProfile(id.into()));
+        }
+        let directory = self.profile_dir(id).join("curves");
+        let destination = directory.join(kind.file_name());
+        match source {
+            Some(source) => {
+                let text = fs::read_to_string(source)?;
+                crate::parse_curve(&text, kind).map_err(StorageError::InvalidProfile)?;
+                fs::create_dir_all(&directory)?;
+                atomic_write(&destination, text.as_bytes())?;
+            }
+            None => {
+                if destination.exists() {
+                    fs::remove_file(&destination)?;
+                }
+            }
+        }
+        Ok(self.curves(id))
+    }
+
+    /// The curves saved with a profile; unreadable files are left out.
+    pub fn curves(&self, id: &str) -> crate::Curves {
+        let read = |kind: crate::CurveKind| {
+            let path = self.profile_dir(id).join("curves").join(kind.file_name());
+            crate::parse_curve(&fs::read_to_string(path).ok()?, kind).ok()
+        };
+        crate::Curves {
+            measurement: read(crate::CurveKind::Measurement),
+            target: read(crate::CurveKind::Target),
+        }
+    }
+
     pub fn export_profile(
         &self,
         library: &Library,
@@ -544,6 +586,43 @@ mod tests {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn curves_are_saved_with_the_profile_and_can_be_cleared() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "HD 650").unwrap();
+        let source = temp.path().join("hd650.csv");
+        let text = (0..30)
+            .map(|i| format!("{},{}\n", 20 * (i + 1) * (i + 1), i))
+            .collect::<String>();
+        std::fs::write(&source, format!("frequency,raw\n{text}")).unwrap();
+        let curves = storage
+            .set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                Some(&source),
+            )
+            .unwrap();
+        assert_eq!(curves.measurement.unwrap().len(), 30);
+        assert!(curves.target.is_none());
+        let curves = storage
+            .set_curve(&library, &profile.id, crate::CurveKind::Measurement, None)
+            .unwrap();
+        assert!(curves.measurement.is_none());
+        std::fs::write(&source, "not a curve").unwrap();
+        assert!(matches!(
+            storage.set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Target,
+                Some(&source)
+            ),
+            Err(StorageError::InvalidProfile(_))
+        ));
     }
 
     #[test]

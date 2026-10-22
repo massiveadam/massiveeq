@@ -1,6 +1,6 @@
 use gtk4::{DrawingArea, cairo, prelude::*};
 use massiveeq_core::{
-    ChannelSelection, Filter, ProfileAnalysis, ProfileDocument, analysis::ResponsePoint,
+    ChannelSelection, CurvePoint, Filter, ProfileAnalysis, ProfileDocument, analysis::ResponsePoint,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -11,8 +11,19 @@ const LEFT: f64 = 58.0;
 const RIGHT: f64 = 24.0;
 const TOP: f64 = 34.0;
 const BOTTOM: f64 = 42.0;
-const MIN_DB: f64 = -10.0;
-const MAX_DB: f64 = 10.0;
+/// Half the vertical range: ±10 dB for EQ alone, wider behind curves.
+const EQ_RANGE_DB: f64 = 10.0;
+const CURVE_RANGE_DB: f64 = 20.0;
+
+thread_local! {
+    // Set each draw; read by the hit-testing helpers so points and drags
+    // always agree with what is on screen.
+    static RANGE_DB: Cell<f64> = const { Cell::new(EQ_RANGE_DB) };
+}
+
+fn range_db() -> f64 {
+    RANGE_DB.with(Cell::get)
+}
 const MIN_FREQUENCY: f64 = 20.0;
 const MAX_FREQUENCY: f64 = 20_000.0;
 const FINE_FREQUENCY_OCTAVES: f64 = 1.0 / 48.0;
@@ -24,6 +35,15 @@ const Q_STEP_FACTOR: f64 = 1.1;
 pub struct Overlay {
     /// Frequency the tone finder is playing.
     pub tone: Option<f64>,
+    /// A headphone measurement and a target (line or range) for this profile.
+    pub measurement: Option<Vec<CurvePoint>>,
+    pub target: Option<Vec<CurvePoint>>,
+}
+
+impl Overlay {
+    fn has_curves(&self) -> bool {
+        self.measurement.is_some() || self.target.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +73,22 @@ pub fn response_graph(
             foreground.green() as f64,
             foreground.blue() as f64,
         );
+        let overlay_state = overlay.borrow();
+        RANGE_DB.with(|range| {
+            range.set(if overlay_state.has_curves() {
+                CURVE_RANGE_DB
+            } else {
+                EQ_RANGE_DB
+            })
+        });
         draw_background(context, width, height, foreground);
+        draw_curves(
+            context,
+            &overlay_state,
+            analysis.borrow().as_ref(),
+            width,
+            height,
+        );
 
         if let Some(result) = analysis.borrow().as_ref() {
             let stereo = responses_match(&result.left.response, &result.right.response);
@@ -94,7 +129,7 @@ pub fn response_graph(
         if let Some(profile) = document.borrow().as_ref() {
             draw_filter_points(context, profile, selected_filter.get(), width, height);
         }
-        if let Some(frequency) = overlay.borrow().tone {
+        if let Some(frequency) = overlay_state.tone {
             draw_tone_marker(context, frequency, width, height);
         }
     });
@@ -134,7 +169,8 @@ fn draw_background(cr: &cairo::Context, width: f64, height: f64, foreground: (f6
         let _ = cr.show_text(label);
     }
 
-    for db in [-10.0_f64, -5.0, 0.0, 5.0, 10.0] {
+    let range = range_db();
+    for db in [-range, -range / 2.0, 0.0, range / 2.0, range] {
         let y = y_for(db, height);
         let alpha = if db == 0.0 { 0.25 } else { 0.085 };
         cr.set_source_rgba(foreground.0, foreground.1, foreground.2, alpha);
@@ -322,6 +358,159 @@ fn draw_channel_legend(cr: &cairo::Context, width: f64, stereo: bool) {
     }
 }
 
+/// Mean of a curve over 300 Hz–3 kHz, where curves are aligned for comparison.
+fn midband_level(value: &dyn Fn(f64) -> f64) -> f64 {
+    const STEPS: usize = 32;
+    (0..STEPS)
+        .map(|index| value(300.0 * 10.0_f64.powf(index as f64 / (STEPS - 1) as f64)))
+        .sum::<f64>()
+        / STEPS as f64
+}
+
+/// Curve value at `frequency` (log-interpolated), as (low, high).
+pub fn curve_at(points: &[CurvePoint], frequency: f64) -> (f64, f64) {
+    let Some(first) = points.first() else {
+        return (0.0, 0.0);
+    };
+    if frequency <= first.frequency {
+        return (first.low, first.high);
+    }
+    for pair in points.windows(2) {
+        if frequency <= pair[1].frequency {
+            let span = (pair[1].frequency / pair[0].frequency).ln();
+            let amount = if span > 0.0 {
+                (frequency / pair[0].frequency).ln() / span
+            } else {
+                0.0
+            };
+            let lerp = |a: f64, b: f64| a + amount * (b - a);
+            return (
+                lerp(pair[0].low, pair[1].low),
+                lerp(pair[0].high, pair[1].high),
+            );
+        }
+    }
+    points
+        .last()
+        .map_or((0.0, 0.0), |point| (point.low, point.high))
+}
+
+fn eq_at(response: &[ResponsePoint], frequency: f64) -> f64 {
+    let index = response.partition_point(|point| point.frequency < frequency);
+    match (
+        index.checked_sub(1).and_then(|i| response.get(i)),
+        response.get(index),
+    ) {
+        (Some(low), Some(high)) => {
+            let amount = (frequency / low.frequency).ln() / (high.frequency / low.frequency).ln();
+            low.gain_db + amount * (high.gain_db - low.gain_db)
+        }
+        (Some(only), None) | (None, Some(only)) => only.gain_db,
+        (None, None) => 0.0,
+    }
+}
+
+/// Target (range or line), the raw measurement, and the measurement with the
+/// current EQ applied. Each is shifted to 0 dB across 300 Hz–3 kHz.
+fn draw_curves(
+    cr: &cairo::Context,
+    overlay: &Overlay,
+    analysis: Option<&ProfileAnalysis>,
+    width: f64,
+    height: f64,
+) {
+    const POINTS: usize = 400;
+    let frequencies = (0..POINTS)
+        .map(|index| 20.0 * 1000.0_f64.powf(index as f64 / (POINTS - 1) as f64))
+        .collect::<Vec<_>>();
+    let trace = |values: &dyn Fn(f64) -> f64, offset: f64| {
+        for (index, frequency) in frequencies.iter().enumerate() {
+            let (x, y) = (
+                x_for(*frequency, width),
+                y_for(values(*frequency) - offset, height),
+            );
+            if index == 0 {
+                cr.move_to(x, y);
+            } else {
+                cr.line_to(x, y);
+            }
+        }
+    };
+    let stroke = |values: &dyn Fn(f64) -> f64, rgba: (f64, f64, f64, f64), line: f64| {
+        trace(values, midband_level(values));
+        cr.set_source_rgba(rgba.0, rgba.1, rgba.2, rgba.3);
+        cr.set_line_width(line);
+        let _ = cr.stroke();
+    };
+
+    if let Some(target) = &overlay.target {
+        let center = |frequency: f64| {
+            let (low, high) = curve_at(target, frequency);
+            (low + high) / 2.0
+        };
+        if target.iter().any(|point| point.high > point.low) {
+            let offset = midband_level(&center);
+            trace(&|frequency| curve_at(target, frequency).1, offset);
+            for frequency in frequencies.iter().rev() {
+                let (low, _) = curve_at(target, *frequency);
+                cr.line_to(x_for(*frequency, width), y_for(low - offset, height));
+            }
+            cr.close_path();
+            cr.set_source_rgba(0.89, 0.66, 0.31, 0.16);
+            let _ = cr.fill();
+        }
+        cr.set_dash(&[6.0, 4.0], 0.0);
+        stroke(&center, (0.89, 0.66, 0.31, 0.75), 1.4);
+        cr.set_dash(&[], 0.0);
+    }
+
+    if let Some(measurement) = &overlay.measurement {
+        let raw = |frequency: f64| curve_at(measurement, frequency).0;
+        stroke(&raw, (0.62, 0.64, 0.64, 0.55), 1.3);
+        if let Some(analysis) = analysis {
+            let ears = if responses_match(&analysis.left.response, &analysis.right.response) {
+                vec![(&analysis.left.response, (0.54, 0.68, 0.45, 0.95))]
+            } else {
+                vec![
+                    (&analysis.left.response, (0.45, 0.72, 0.86, 0.95)),
+                    (&analysis.right.response, (0.86, 0.52, 0.42, 0.95)),
+                ]
+            };
+            for (response, color) in ears {
+                let corrected = |frequency: f64| raw(frequency) + eq_at(response, frequency);
+                stroke(&corrected, color, 2.0);
+            }
+        }
+    }
+
+    // Legend, above the plot on the left.
+    cr.select_font_face(
+        "Monospace",
+        cairo::FontSlant::Normal,
+        cairo::FontWeight::Bold,
+    );
+    cr.set_font_size(10.0);
+    let mut x = LEFT + 8.0;
+    let mut key = |label: &str, rgba: (f64, f64, f64)| {
+        cr.set_source_rgba(rgba.0, rgba.1, rgba.2, 0.9);
+        cr.rectangle(x, 11.0, 14.0, 3.0);
+        let _ = cr.fill();
+        cr.move_to(x + 20.0, 16.0);
+        let _ = cr.show_text(label);
+        x += 32.0
+            + cr.text_extents(label)
+                .map(|extents| extents.width())
+                .unwrap_or(60.0);
+    };
+    if overlay.measurement.is_some() {
+        key("MEASURED", (0.62, 0.64, 0.64));
+        key("WITH EQ", (0.54, 0.68, 0.45));
+    }
+    if overlay.target.is_some() {
+        key("TARGET", (0.89, 0.66, 0.31));
+    }
+}
+
 fn draw_tone_marker(cr: &cairo::Context, frequency: f64, width: f64, height: f64) {
     let x = x_for(frequency, width);
     cr.set_source_rgba(0.54, 0.68, 0.45, 0.85);
@@ -399,7 +588,7 @@ pub fn filter_point_position(
 
 pub fn gain_after_drag(start_gain: f64, delta_y: f64, height: f64) -> f64 {
     let (_, plot_height) = plot_size(1.0 + LEFT + RIGHT, height);
-    (start_gain - delta_y / plot_height * (MAX_DB - MIN_DB)).clamp(MIN_DB, MAX_DB)
+    (start_gain - delta_y / plot_height * (2.0 * range_db())).clamp(-range_db(), range_db())
 }
 
 pub fn values_at_position(x: f64, y: f64, width: f64, height: f64) -> Option<(f64, f64)> {
@@ -410,17 +599,17 @@ pub fn values_at_position(x: f64, y: f64, width: f64, height: f64) -> Option<(f6
     let frequency_position = ((x - LEFT) / plot_width).clamp(0.0, 1.0);
     let frequency = MIN_FREQUENCY * (MAX_FREQUENCY / MIN_FREQUENCY).powf(frequency_position);
     let gain_position = ((y - TOP) / plot_height).clamp(0.0, 1.0);
-    let gain = MAX_DB - gain_position * (MAX_DB - MIN_DB);
+    let gain = range_db() - gain_position * (2.0 * range_db());
     Some((frequency, gain))
 }
 
 pub fn nudge_filter(filter: &mut Filter, direction: NudgeDirection, shifted: bool) {
     match (direction, shifted) {
         (NudgeDirection::Up, false) => {
-            filter.gain_db = (filter.gain_db + 0.1).clamp(MIN_DB, MAX_DB);
+            filter.gain_db = (filter.gain_db + 0.1).clamp(-range_db(), range_db());
         }
         (NudgeDirection::Down, false) => {
-            filter.gain_db = (filter.gain_db - 0.1).clamp(MIN_DB, MAX_DB);
+            filter.gain_db = (filter.gain_db - 0.1).clamp(-range_db(), range_db());
         }
         (NudgeDirection::Up, true) => {
             filter.q = (filter.q * Q_STEP_FACTOR).clamp(0.01, 1_000.0);
@@ -459,7 +648,8 @@ fn x_for(frequency: f64, width: f64) -> f64 {
 
 fn y_for(db: f64, height: f64) -> f64 {
     let (_, plot_height) = plot_size(1.0 + LEFT + RIGHT, height);
-    TOP + plot_height * (1.0 - ((db.clamp(MIN_DB, MAX_DB) - MIN_DB) / (MAX_DB - MIN_DB)))
+    TOP + plot_height
+        * (1.0 - ((db.clamp(-range_db(), range_db()) + range_db()) / (2.0 * range_db())))
 }
 
 fn frequency_label(frequency: f64) -> &'static str {

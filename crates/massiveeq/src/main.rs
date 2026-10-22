@@ -489,6 +489,8 @@ fn build_ui(app: &adw::Application) {
     graph_hint.add_css_class("level-code");
     graph_hint.set_tooltip_text(Some(&engine_tooltip(&engine_status)));
     graph_header.append(&graph_hint);
+    let curves_ui = build_curves_menu();
+    graph_header.append(&curves_ui.menu);
     graph_card.append(&graph_header);
     let graph = graph::response_graph(
         model.analysis.clone(),
@@ -879,6 +881,7 @@ fn build_ui(app: &adw::Application) {
         &comparison_ui,
         &trim,
     );
+    wire_curves(&window, &model, &curves_ui, &graph, &status);
     wire_tone(
         &window,
         &model,
@@ -2021,12 +2024,145 @@ fn load_profile(
     convolution_ui.layout.set(profile.impulse_layout);
     update_convolution_ui(convolution_ui, &document);
     show_profile_page(convolution_ui, &document);
+    let curves = model.client.curves(&profile.id).unwrap_or_default();
+    {
+        let mut overlay = model.overlay.borrow_mut();
+        overlay.measurement = curves.measurement;
+        overlay.target = curves.target;
+    }
     if let Ok(analysis) = model.client.analyze(&profile.id) {
         set_analysis_label(analysis_label, &analysis);
         store_service_analysis(model, analysis);
         graph.queue_draw();
     }
     model.loading.set(false);
+}
+
+/// The graph header's menu for measurement and target curves.
+struct CurvesUi {
+    menu: gtk::MenuButton,
+    load_measurement: gtk::Button,
+    load_target: gtk::Button,
+    clear_measurement: gtk::Button,
+    clear_target: gtk::Button,
+}
+
+fn build_curves_menu() -> Rc<CurvesUi> {
+    let menu = gtk::MenuButton::new();
+    menu.set_label("CURVES");
+    menu.add_css_class("comparison-menu");
+    menu.set_tooltip_text(Some(
+        "Show a headphone measurement and a target behind the EQ",
+    ));
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    content.set_margin_top(8);
+    content.set_margin_bottom(8);
+    content.set_margin_start(8);
+    content.set_margin_end(8);
+    let note = gtk::Label::new(Some(
+        "Text or CSV: frequency, dB per line (AutoEQ, Squiglink, REW).\nA target with \
+         frequency, low, high is shown as a range.",
+    ));
+    note.set_xalign(0.0);
+    note.add_css_class("level-code");
+    content.append(&note);
+    let button = |label: &str| {
+        let button = gtk::Button::with_label(label);
+        content.append(&button);
+        button
+    };
+    let load_measurement = button("LOAD MEASUREMENT…");
+    let load_target = button("LOAD TARGET…");
+    let clear_measurement = button("CLEAR MEASUREMENT");
+    let clear_target = button("CLEAR TARGET");
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&content));
+    menu.set_popover(Some(&popover));
+    Rc::new(CurvesUi {
+        menu,
+        load_measurement,
+        load_target,
+        clear_measurement,
+        clear_target,
+    })
+}
+
+fn wire_curves(
+    window: &adw::ApplicationWindow,
+    model: &Rc<Model>,
+    ui: &Rc<CurvesUi>,
+    graph: &gtk::DrawingArea,
+    status: &gtk::Label,
+) {
+    // Save (or with an empty path, clear) a curve and show the result.
+    let apply = Rc::new({
+        let model = model.clone();
+        let graph = graph.clone();
+        let status = status.clone();
+        move |kind: &str, path: &str| {
+            let Some(id) = model.current_id.borrow().clone() else {
+                return;
+            };
+            match model.client.set_curve(&id, kind, path) {
+                Ok(curves) => {
+                    let mut overlay = model.overlay.borrow_mut();
+                    overlay.measurement = curves.measurement;
+                    overlay.target = curves.target;
+                    status.set_text(if path.is_empty() {
+                        "Curve cleared"
+                    } else {
+                        "Curve loaded"
+                    });
+                }
+                Err(error) => status.set_text(&error.to_string()),
+            }
+            graph.queue_draw();
+        }
+    });
+    for (button, kind, title) in [
+        (
+            &ui.load_measurement,
+            "measurement",
+            "Choose headphone measurement",
+        ),
+        (&ui.load_target, "target", "Choose target curve"),
+    ] {
+        button.connect_clicked({
+            let window = window.clone();
+            let apply = apply.clone();
+            let menu = ui.menu.clone();
+            move |_| {
+                menu.popdown();
+                let filter = gtk::FileFilter::new();
+                filter.set_name(Some("Frequency response"));
+                for pattern in ["*.txt", "*.csv", "*.TXT", "*.CSV"] {
+                    filter.add_pattern(pattern);
+                }
+                let chooser = gtk::FileDialog::builder()
+                    .title(title)
+                    .accept_label("Show curve")
+                    .default_filter(&filter)
+                    .build();
+                let apply = apply.clone();
+                chooser.open(Some(&window), gtk::gio::Cancellable::NONE, move |result| {
+                    if let Some(path) = result.ok().and_then(|file| file.path()) {
+                        apply(kind, &path.display().to_string());
+                    }
+                });
+            }
+        });
+    }
+    for (button, kind) in [
+        (&ui.clear_measurement, "measurement"),
+        (&ui.clear_target, "target"),
+    ] {
+        let apply = apply.clone();
+        let menu = ui.menu.clone();
+        button.connect_clicked(move |_| {
+            menu.popdown();
+            apply(kind, "");
+        });
+    }
 }
 
 /// Controls of the tone finder page.

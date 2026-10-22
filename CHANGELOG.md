@@ -36,6 +36,14 @@
   that takes over as the system output for its device; Filters off keeps the
   sink and plays a standard downmix. The convolution page shows the detected
   layout.
+- Apply parametric filters and GraphicEQ on top of an impulse response in the
+  same profile, per ear.
+- Add a tone finder: a sine or band of pink noise through the current EQ,
+  with one-click cut and boost at the tone's frequency.
+- Show a headphone measurement and a target or target range behind the EQ,
+  with the measurement as corrected by the current filters.
+- Show whether playing audio is resampled, with the reason and the PipeWire
+  setting that avoids it.
 
 ### Fixed
 

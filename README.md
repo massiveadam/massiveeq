@@ -35,6 +35,11 @@ support contract.
 
 - Squiglink, AutoEQ, and common Equalizer APO text profile import
 - Parametric EQ, per-ear filters, GraphicEQ, preamp, includes, and convolution
+- Tone finder: sweep a sine or band of pink noise through the current EQ and
+  fix peaks and dips on your own ears with one click
+- Headphone measurement and target (or target-range) curves behind the EQ,
+  showing the measurement as corrected by the current filters
+- A readout of whether playing audio is resampled, and how to avoid it
 - Optional true-stereo (4-channel) and 7.1 virtual-surround (14-channel
   HeSuVi) convolution for speaker and room simulation on headphones
 - Automatic profile assignment using stable Bluetooth and ALSA identifiers
@@ -221,6 +226,31 @@ Profiles live in `~/.local/share/massiveeq/profiles/`; assignments and manual
 trims live in `~/.config/massiveeq/state.json`. Unassigned and unsupported
 multichannel devices are never intercepted.
 
+## Tuning by ear: the tone finder
+
+The **Tone** page beside Visual and Text plays a test signal through the
+selected output's current EQ: a sine, or pink noise across the full range,
+one octave, or a third of an octave around the chosen frequency, to the left
+ear, right ear, or both. Sweep the frequency (a marker follows on the graph)
+and listen for spots that jump out or vanish. **Cut** or **Boost** by 1 or
+3 dB adds a peak filter there, as wide as what you were hearing, or adjusts
+the filter already within a twelfth of an octave. Every signal plays at the
+same RMS level, capped at −12 dBFS; start quiet. The tone stops when you
+leave the page, close the window, or within five seconds if the editor goes
+away.
+
+## Measurement and target curves
+
+**Curves** in the graph header shows a headphone measurement and a target
+behind the EQ for the open profile. Files are plain text or CSV with one
+`frequency, dB` pair per line, as exported by AutoEQ, Squiglink, and REW;
+headers and comments are skipped. A target with exactly three numbers per
+line (`frequency, low, high`) is drawn as a range. Curves are aligned to
+0 dB across 300 Hz–3 kHz, and the measurement is drawn twice: as measured,
+and with the profile's current EQ applied (per ear when the ears differ).
+Curves are saved with the profile in its `curves/` folder; they are not part
+of exported profile text.
+
 ## Comparing profiles
 
 Open **Compare** in the Signal Route strip, choose between two and nine
@@ -312,6 +342,11 @@ device Nyquist rate, or fails headroom analysis remains an editable draft while
 the last valid audio chain continues playing.
 
 ## Diagnostics
+
+The engine readout above the graph shows the PipeWire graph rate and whether
+playing audio arrives at that rate (`SOURCE NATIVE`) or is converted
+(`SOURCE 44.1 kHz → RESAMPLED`). Its tooltip explains the cause; most often
+PipeWire is allowed only one rate, which `default.clock.allowed-rates` fixes.
 
 `massiveeqd --self-test-node NODE_NAME` creates a temporary bypass filter for a
 specific PipeWire sink and reports buffer and processing statistics. The D-Bus

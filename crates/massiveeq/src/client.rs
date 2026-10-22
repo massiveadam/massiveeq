@@ -79,6 +79,13 @@ impl Client {
     pub fn set_convolution(&self, id: &str, path: &str, channel: &str) -> Result<ProfileInfo> {
         self.call_json("SetConvolution", &(id, path, channel))
     }
+    pub fn curves(&self, id: &str) -> Result<massiveeq_core::Curves> {
+        self.call_json("GetCurves", &(id,))
+    }
+    /// Save a "measurement" or "target" curve; an empty path removes it.
+    pub fn set_curve(&self, id: &str, kind: &str, path: &str) -> Result<massiveeq_core::Curves> {
+        self.call_json("SetCurve", &(id, kind, path))
+    }
     pub fn put(&self, id: &str, name: &str, text: &str, trim: f64) -> Result<ProfileInfo> {
         self.call_json("PutProfile", &(id, name, text, trim))
     }

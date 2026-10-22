@@ -1,6 +1,7 @@
 //! Shared profile, analysis, storage, device, and PipeWire configuration logic.
 
 pub mod analysis;
+pub mod curve;
 pub mod layout;
 pub mod model;
 pub mod parser;
@@ -8,6 +9,7 @@ pub mod pipewire;
 pub mod storage;
 
 pub use analysis::{ChannelAnalysis, ProfileAnalysis, analyze_profile, analyze_profile_preview};
+pub use curve::{CurveKind, CurvePoint, Curves, parse_curve};
 pub use layout::{ImpulseLayout, ImpulseRoute, SURROUND_71_POSITIONS, validate_impulse};
 pub use model::*;
 pub use parser::{ParseError, parse_file, parse_text, serialize_profile};
