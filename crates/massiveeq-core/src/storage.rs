@@ -152,6 +152,11 @@ impl Storage {
     pub fn get_profile(&self, record: &ProfileRecord) -> Result<ProfileInfo, StorageError> {
         let text = fs::read_to_string(self.profile_path(&record.id))?;
         let parsed = parse_text(record.name.clone(), &text);
+        let impulse_layout = parsed.convolutions.first().and_then(|convolution| {
+            let path = self.profile_dir(&record.id).join(&convolution.path);
+            let (_, _, channels) = crate::pipewire::audio_file_info(&path)?;
+            crate::ImpulseLayout::from_channels(channels)
+        });
         Ok(ProfileInfo {
             id: record.id.clone(),
             name: record.name.clone(),
@@ -159,6 +164,7 @@ impl Storage {
             manual_trim_db: record.manual_trim_db,
             activatable: parsed.is_activatable(),
             diagnostics: parsed.diagnostics,
+            impulse_layout,
         })
     }
 
@@ -241,8 +247,9 @@ impl Storage {
         let profile_dir = self.profile_dir(&id);
         let asset_dir = profile_dir.join("assets");
         fs::create_dir_all(&asset_dir)?;
+        let convolution_count = parsed.convolutions.len();
         for convolution in &mut parsed.convolutions {
-            let Some((frames, sample_rate, _)) =
+            let Some((frames, sample_rate, ir_channels)) =
                 crate::pipewire::audio_file_info(&convolution.path)
             else {
                 return Err(StorageError::InvalidProfile(format!(
@@ -256,6 +263,8 @@ impl Storage {
                     convolution.path.display()
                 )));
             }
+            crate::validate_impulse(ir_channels, convolution.channels, convolution_count)
+                .map_err(StorageError::InvalidProfile)?;
             let file_name = convolution
                 .path
                 .file_name()
@@ -291,7 +300,8 @@ impl Storage {
             .profiles
             .get(id)
             .ok_or_else(|| StorageError::MissingProfile(id.into()))?;
-        let Some((frames, sample_rate, _)) = crate::pipewire::audio_file_info(source) else {
+        let Some((frames, sample_rate, ir_channels)) = crate::pipewire::audio_file_info(source)
+        else {
             return Err(StorageError::InvalidProfile(format!(
                 "Could not read convolution file {} with libsndfile",
                 source.display()
@@ -302,6 +312,12 @@ impl Storage {
                 "Convolution files are limited to 10 seconds".into(),
             ));
         }
+        // Multichannel IRs feed both ears, whatever channel was picked.
+        let channels = match crate::ImpulseLayout::from_channels(ir_channels) {
+            Some(layout) if layout.is_matrix() => ChannelSelection::All,
+            _ => channels,
+        };
+        crate::validate_impulse(ir_channels, channels, 1).map_err(StorageError::InvalidProfile)?;
 
         let asset_dir = self.profile_dir(id).join("assets");
         fs::create_dir_all(&asset_dir)?;
@@ -314,8 +330,7 @@ impl Storage {
 
         let text = fs::read_to_string(self.profile_path(id))?;
         let mut document = parse_text(&record.name, &text);
-        document.filters.clear();
-        document.graphic_eqs.clear();
+        // The IR replaces any previous one; EQ stays and is applied on top.
         document.convolutions.clear();
         document.convolutions.push(Convolution {
             channels,
@@ -349,6 +364,48 @@ impl Storage {
             fs::remove_dir_all(path)?;
         }
         self.save_library(library)
+    }
+
+    /// Save (or with `None`, remove) a measurement or target curve shown
+    /// behind this profile's EQ. Returns the profile's curves afterwards.
+    pub fn set_curve(
+        &self,
+        library: &Library,
+        id: &str,
+        kind: crate::CurveKind,
+        source: Option<&Path>,
+    ) -> Result<crate::Curves, StorageError> {
+        if !library.profiles.contains_key(id) {
+            return Err(StorageError::MissingProfile(id.into()));
+        }
+        let directory = self.profile_dir(id).join("curves");
+        let destination = directory.join(kind.file_name());
+        match source {
+            Some(source) => {
+                let text = fs::read_to_string(source)?;
+                crate::parse_curve(&text, kind).map_err(StorageError::InvalidProfile)?;
+                fs::create_dir_all(&directory)?;
+                atomic_write(&destination, text.as_bytes())?;
+            }
+            None => {
+                if destination.exists() {
+                    fs::remove_file(&destination)?;
+                }
+            }
+        }
+        Ok(self.curves(id))
+    }
+
+    /// The curves saved with a profile; unreadable files are left out.
+    pub fn curves(&self, id: &str) -> crate::Curves {
+        let read = |kind: crate::CurveKind| {
+            let path = self.profile_dir(id).join("curves").join(kind.file_name());
+            crate::parse_curve(&fs::read_to_string(path).ok()?, kind).ok()
+        };
+        crate::Curves {
+            measurement: read(crate::CurveKind::Measurement),
+            target: read(crate::CurveKind::Target),
+        }
     }
 
     pub fn export_profile(
@@ -443,6 +500,8 @@ impl Storage {
                     convolution.path.display()
                 )));
             }
+            crate::validate_impulse(channels, convolution.channels, profile.convolutions.len())
+                .map_err(StorageError::InvalidProfile)?;
         }
         Ok(())
     }
@@ -504,7 +563,11 @@ mod tests {
     use super::*;
 
     fn write_test_wav(path: &Path) {
-        let samples = [0_i16; 48];
+        write_test_wav_channels(path, 1);
+    }
+
+    fn write_test_wav_channels(path: &Path, channels: u16) {
+        let samples = vec![0_i16; 48 * channels as usize];
         let data_size = (samples.len() * 2) as u32;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"RIFF");
@@ -512,10 +575,10 @@ mod tests {
         bytes.extend_from_slice(b"WAVEfmt ");
         bytes.extend_from_slice(&16_u32.to_le_bytes());
         bytes.extend_from_slice(&1_u16.to_le_bytes());
-        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
         bytes.extend_from_slice(&48_000_u32.to_le_bytes());
-        bytes.extend_from_slice(&96_000_u32.to_le_bytes());
-        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&(96_000 * channels as u32).to_le_bytes());
+        bytes.extend_from_slice(&(2 * channels).to_le_bytes());
         bytes.extend_from_slice(&16_u16.to_le_bytes());
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&data_size.to_le_bytes());
@@ -523,6 +586,69 @@ mod tests {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn curves_are_saved_with_the_profile_and_can_be_cleared() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "HD 650").unwrap();
+        let source = temp.path().join("hd650.csv");
+        let text = (0..30)
+            .map(|i| format!("{},{}\n", 20 * (i + 1) * (i + 1), i))
+            .collect::<String>();
+        std::fs::write(&source, format!("frequency,raw\n{text}")).unwrap();
+        let curves = storage
+            .set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                Some(&source),
+            )
+            .unwrap();
+        assert_eq!(curves.measurement.unwrap().len(), 30);
+        assert!(curves.target.is_none());
+        let curves = storage
+            .set_curve(&library, &profile.id, crate::CurveKind::Measurement, None)
+            .unwrap();
+        assert!(curves.measurement.is_none());
+        std::fs::write(&source, "not a curve").unwrap();
+        assert!(matches!(
+            storage.set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Target,
+                Some(&source)
+            ),
+            Err(StorageError::InvalidProfile(_))
+        ));
+    }
+
+    #[test]
+    fn surround_impulse_feeds_both_ears_and_reports_its_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "BRIR").unwrap();
+        let source = temp.path().join("hesuvi.wav");
+        write_test_wav_channels(&source, 14);
+        let updated = storage
+            .set_convolution(&library, &profile.id, &source, ChannelSelection::Left)
+            .unwrap();
+        assert_eq!(
+            updated.impulse_layout,
+            Some(crate::ImpulseLayout::Surround71)
+        );
+        let parsed = parse_text(&updated.name, &updated.text);
+        assert_eq!(parsed.convolutions[0].channels, ChannelSelection::All);
+
+        let odd = temp.path().join("six.wav");
+        write_test_wav_channels(&odd, 6);
+        assert!(matches!(
+            storage.set_convolution(&library, &profile.id, &odd, ChannelSelection::All),
+            Err(StorageError::InvalidProfile(_))
+        ));
     }
 
     #[test]
@@ -619,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn convolution_mode_copies_asset_and_replaces_parametric_filters() {
+    fn convolution_copies_asset_and_keeps_parametric_filters() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
         let mut library = storage.load_library().unwrap();
@@ -639,7 +765,7 @@ mod tests {
             .set_convolution(&library, &profile.id, &source, ChannelSelection::All)
             .unwrap();
         let parsed = parse_text(&updated.name, &updated.text);
-        assert!(parsed.filters.is_empty());
+        assert_eq!(parsed.filters.len(), 1);
         assert_eq!(parsed.convolutions.len(), 1);
         assert!(parsed.convolutions[0].path.starts_with("assets"));
         assert!(

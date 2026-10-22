@@ -111,6 +111,43 @@ impl Service {
         Ok(result)
     }
 
+    /// Save a measurement or target curve with a profile; an empty path
+    /// removes it. Returns the profile's curves as JSON.
+    async fn set_curve(
+        &self,
+        id: &str,
+        kind: &str,
+        path: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<String> {
+        let kind = match kind {
+            "measurement" => massiveeq_core::CurveKind::Measurement,
+            "target" => massiveeq_core::CurveKind::Target,
+            other => {
+                return Err(fdo::Error::InvalidArgs(format!(
+                    "unknown curve kind {other:?}"
+                )));
+            }
+        };
+        let state = self.state.lock().await;
+        let source = (!path.is_empty()).then(|| std::path::Path::new(path));
+        let curves = state
+            .storage
+            .set_curve(&state.library, id, kind, source)
+            .map_err(failed)?;
+        let result = serde_json::to_string(&curves).map_err(failed)?;
+        Self::changed(&emitter, "profiles").await.map_err(failed)?;
+        Ok(result)
+    }
+
+    async fn get_curves(&self, id: &str) -> fdo::Result<String> {
+        let state = self.state.lock().await;
+        if !state.library.profiles.contains_key(id) {
+            return Err(fdo::Error::Failed(format!("profile {id} not found")));
+        }
+        serde_json::to_string(&state.storage.curves(id)).map_err(failed)
+    }
+
     async fn delete_profile(
         &self,
         id: &str,
@@ -325,6 +362,39 @@ impl Service {
         Self::changed(&emitter, "bypass").await.map_err(failed)
     }
 
+    /// Play (or retune) the tone finder's test tone on an output. Must be
+    /// called again within five seconds to keep it playing.
+    async fn play_tone(&self, device_key: &str, settings: &str) -> fdo::Result<()> {
+        let settings: crate::tone::ToneSettings = serde_json::from_str(settings)
+            .map_err(|error| fdo::Error::InvalidArgs(error.to_string()))?;
+        let mut state = self.state.lock().await;
+        if let Some(tone) = state.tone.as_mut()
+            && tone.device_key == device_key
+        {
+            tone.update(settings);
+            return Ok(());
+        }
+        if let Some(tone) = state.tone.take() {
+            tone.stop();
+        }
+        let device = state
+            .devices
+            .iter()
+            .find(|device| device.connected && device.key.as_storage_key() == device_key)
+            .cloned()
+            .ok_or_else(|| fdo::Error::Failed("that output is not connected".into()))?;
+        let rate = crate::device::graph_settings().await.sample_rate;
+        state.tone = Some(crate::tone::Tone::start(&device, rate, settings).map_err(failed)?);
+        Ok(())
+    }
+
+    async fn stop_tone(&self) -> fdo::Result<()> {
+        if let Some(tone) = self.state.lock().await.tone.take() {
+            tone.stop();
+        }
+        Ok(())
+    }
+
     async fn set_global_bypass(
         &self,
         bypassed: bool,
@@ -359,7 +429,7 @@ impl Service {
 
     async fn status(&self) -> fdo::Result<String> {
         let state = self.state.lock().await;
-        Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass, "comparisons": state.library.comparison_sets, "engine": state.host.status_json() }).to_string())
+        Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass, "comparisons": state.library.comparison_sets, "engine": state.host.status_json(), "graph": state.graph }).to_string())
     }
 
     #[zbus(signal)]

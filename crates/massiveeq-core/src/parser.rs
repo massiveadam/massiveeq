@@ -409,16 +409,6 @@ fn diagnostic(
 }
 
 fn enforce_limits(profile: &mut ProfileDocument) {
-    if !profile.convolutions.is_empty()
-        && (!profile.filters.is_empty() || !profile.graphic_eqs.is_empty())
-    {
-        profile.diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Error,
-            line: 0,
-            source: profile.name.clone(),
-            message: "Parametric/GraphicEQ processing and convolution cannot be active in the same profile".into(),
-        });
-    }
     for channel in [Channel::Left, Channel::Right] {
         if profile.filters_for(channel).count() > MAX_FILTERS_PER_CHANNEL {
             profile.diagnostics.push(Diagnostic {
@@ -558,12 +548,14 @@ Filter 3: OFF HSC Fc 8000 Hz Gain -1.5 dB Q 0.8
     }
 
     #[test]
-    fn rejects_mixed_eq_and_convolution_modes() {
+    fn accepts_eq_together_with_convolution() {
         let profile = parse_text(
             "fixture",
             "Filter: ON PK Fc 1000 Hz Gain 1 dB Q 1\nConvolution: room.wav",
         );
-        assert!(!profile.is_activatable());
+        assert!(profile.is_activatable());
+        assert_eq!(profile.filters.len(), 1);
+        assert_eq!(profile.convolutions.len(), 1);
     }
 
     #[test]

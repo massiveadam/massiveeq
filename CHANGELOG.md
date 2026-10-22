@@ -30,6 +30,30 @@
   when the open profile is renamed.
 - Name the profile playing on the system output in the tray title, list the
   system output first, and mark each output's playing profile in the menu.
+- Optionally support true-stereo (4-channel) and 7.1 virtual-surround
+  (14-channel HeSuVi) impulse responses. Stereo profiles are unchanged. A 7.1
+  profile exposes a selectable "MassiveEQ 7.1" sink
+  that takes over as the system output for its device; Filters off keeps the
+  sink and plays a standard downmix. The convolution page shows the detected
+  layout.
+- Apply parametric filters and GraphicEQ on top of an impulse response in the
+  same profile, per ear.
+- Add a tone finder: a sine or band of pink noise through the current EQ,
+  with one-click cut and boost at the tone's frequency.
+- Show a headphone measurement and a target or target range behind the EQ,
+  with the measurement as corrected by the current filters.
+- Show whether playing audio is resampled, with the reason and the PipeWire
+  setting that avoids it.
+
+### Fixed
+
+- Apply the narrow (under 720 px) layout. It never took effect because the
+  wider route breakpoint, added later, always won; narrow windows were
+  clipped on the right instead of reflowing.
+- Mark the Convolution tab, not Parametric, when the editor opens on a
+  convolution profile.
+- Play 4-channel impulse responses as true stereo. They previously played only
+  their L→L and L→R channels, as the left and right ears.
 
 ## 0.3.0-beta.2 — 2026-07-15
 

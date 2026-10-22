@@ -35,6 +35,13 @@ support contract.
 
 - Squiglink, AutoEQ, and common Equalizer APO text profile import
 - Parametric EQ, per-ear filters, GraphicEQ, preamp, includes, and convolution
+- Tone finder: sweep a sine or band of pink noise through the current EQ and
+  fix peaks and dips on your own ears with one click
+- Headphone measurement and target (or target-range) curves behind the EQ,
+  showing the measurement as corrected by the current filters
+- A readout of whether playing audio is resampled, and how to avoid it
+- Optional true-stereo (4-channel) and 7.1 virtual-surround (14-channel
+  HeSuVi) convolution for speaker and room simulation on headphones
 - Automatic profile assignment using stable Bluetooth and ALSA identifiers
 - Unlimited saved profiles with per-output assignment or an explicit unassigned state
 - Per-output comparison banks for 2–9 profiles plus level-matched dry playback
@@ -219,6 +226,31 @@ Profiles live in `~/.local/share/massiveeq/profiles/`; assignments and manual
 trims live in `~/.config/massiveeq/state.json`. Unassigned and unsupported
 multichannel devices are never intercepted.
 
+## Tuning by ear: the tone finder
+
+The **Tone** page beside Visual and Text plays a test signal through the
+selected output's current EQ: a sine, or pink noise across the full range,
+one octave, or a third of an octave around the chosen frequency, to the left
+ear, right ear, or both. Sweep the frequency (a marker follows on the graph)
+and listen for spots that jump out or vanish. **Cut** or **Boost** by 1 or
+3 dB adds a peak filter there, as wide as what you were hearing, or adjusts
+the filter already within a twelfth of an octave. Every signal plays at the
+same RMS level, capped at −12 dBFS; start quiet. The tone stops when you
+leave the page, close the window, or within five seconds if the editor goes
+away.
+
+## Measurement and target curves
+
+**Curves** in the graph header shows a headphone measurement and a target
+behind the EQ for the open profile. Files are plain text or CSV with one
+`frequency, dB` pair per line, as exported by AutoEQ, Squiglink, and REW;
+headers and comments are skipped. A target with exactly three numbers per
+line (`frequency, low, high`) is drawn as a range. Curves are aligned to
+0 dB across 300 Hz–3 kHz, and the measurement is drawn twice: as measured,
+and with the profile's current EQ applied (per ear when the ears differ).
+Curves are saved with the profile in its `curves/` folder; they are not part
+of exported profile text.
+
 ## Comparing profiles
 
 Open **Compare** in the Signal Route strip, choose between two and nine
@@ -267,12 +299,54 @@ Convolution assets are decoded with libsndfile and resampled offline with
 libsamplerate's highest-quality sinc converter. The real-time callback performs
 no allocation, locking, file access, logging, process control, or D-Bus work.
 
-Profiles use either parametric/GraphicEQ processing or convolution. A profile
-that mixes those modes, references a missing IR, exceeds the device Nyquist
-rate, or fails headroom analysis remains an editable draft while the last valid
-audio chain continues playing.
+### Advanced: multichannel impulse responses
+
+MassiveEQ is a stereo equalizer first. EQ profiles and ordinary 1- or
+2-channel impulse responses never change an output's channel layout. Multichannel
+convolution is opt-in: it applies only when a profile loads a 4- or
+14-channel file. The layout of a convolution file follows from its channel
+count:
+
+| Channels | Layout | Input | How it is applied |
+| --- | --- | --- | --- |
+| 1 | Mono | Output's own | The same IR on every output channel |
+| 2 | Per ear | Output's own | Channel 1 on the left ear, channel 2 on the right |
+| 4 | True stereo | Stereo | L→L, L→R, R→L, R→R, summed per ear |
+| 14 | HeSuVi 7.1 | 7.1 | Each speaker reaches both ears through its own pair |
+
+Fourteen-channel files use [HeSuVi](https://sourceforge.net/projects/hesuvi/)'s
+channel order (`FL-L FL-R SL-L SL-R RL-L RL-R FC-L FR-R FR-L SR-R SR-L RR-R
+RR-L FC-R`), the same mapping as PipeWire's `sink-virtual-surround-7.1-hesuvi`.
+LFE is heard through the center pair. Multichannel files always feed both ears,
+must be the profile's only convolution, and need a stereo output.
+
+A 7.1 profile turns its output's MassiveEQ sink into a visible 7.1 device,
+**MassiveEQ 7.1 — *output name***, because games and players only send
+surround audio to an output that advertises it. While the physical output is
+the system output, the 7.1 sink becomes the system output in its place; when
+the profile is unassigned, the physical output is restored. Stereo programme
+is upmixed by PipeWire as for any 7.1 sink. Turning **Filters** off keeps the
+7.1 sink and plays a standard downmix (center and surrounds at −3 dB, LFE
+dropped). Level matching and headroom for these files use the paths stereo
+programme takes; full-scale content on every surround channel at once can
+still exceed them. Matrix routes use uniformly partitioned convolution sized
+to the PipeWire quantum, which keeps per-callback cost steady.
+
+A profile can combine an impulse response with parametric filters and
+GraphicEQ: the EQ applies on top, per ear (for a multichannel IR, after its
+speakers are folded into the two ears), so a room or speaker IR and headphone
+correction live in one profile. Equalizer APO applies commands in file order;
+MassiveEQ always applies EQ after the IR, which gives the same result for 1-
+and 2-channel files. A profile that references a missing IR, exceeds the
+device Nyquist rate, or fails headroom analysis remains an editable draft while
+the last valid audio chain continues playing.
 
 ## Diagnostics
+
+The engine readout above the graph shows the PipeWire graph rate and whether
+playing audio arrives at that rate (`SOURCE NATIVE`) or is converted
+(`SOURCE 44.1 kHz → RESAMPLED`). Its tooltip explains the cause; most often
+PipeWire is allowed only one rate, which `default.clock.allowed-rates` fixes.
 
 `massiveeqd --self-test-node NODE_NAME` creates a temporary bypass filter for a
 specific PipeWire sink and reports buffer and processing statistics. The D-Bus

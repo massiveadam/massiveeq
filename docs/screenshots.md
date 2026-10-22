@@ -44,7 +44,7 @@ keeps invalid drafts visible while the last valid audio chain continues.
 ![Convolution impulse-response editor](screenshots/convolution-editor.png)
 
 The convolution page selects a portable impulse-response file and output
-channel. Convolution replaces the profile's parametric chain.
+channel. Parametric filters and GraphicEQ apply on top of it.
 
 ## Level-matched comparison
 

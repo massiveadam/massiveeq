@@ -1,4 +1,7 @@
-use crate::storage::{COMPARISON_BYPASS_ID, ComparisonSet};
+use crate::{
+    layout::ImpulseLayout,
+    storage::{COMPARISON_BYPASS_ID, ComparisonSet},
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf};
 
@@ -263,6 +266,9 @@ pub struct ProfileInfo {
     pub manual_trim_db: f64,
     pub activatable: bool,
     pub diagnostics: Vec<Diagnostic>,
+    /// Layout of the profile's impulse response, when it uses convolution.
+    #[serde(default)]
+    pub impulse_layout: Option<ImpulseLayout>,
 }
 
 /// Profile bank order: by name, case-insensitively, then by id for equal names.
@@ -359,6 +365,7 @@ mod tests {
             manual_trim_db: 0.0,
             activatable: true,
             diagnostics: Vec::new(),
+            impulse_layout: None,
         };
         let mut profiles = vec![
             profile("1", "studio"),

@@ -1,4 +1,7 @@
-use crate::{CompileError, compiler::CompiledChannel};
+use crate::{
+    CompileError,
+    compiler::{CompiledChannel, MatrixRoute},
+};
 use rustfft::{FftPlanner, num_complex::Complex64};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -61,8 +64,17 @@ impl FirTransfer {
     }
 }
 
+/// Matrix paths into one output, for analysing a multichannel impulse response.
+struct OutputPaths {
+    /// The output's own front speaker (front left for the left ear).
+    direct: Option<FirTransfer>,
+    /// Every path a stereo source takes into this output.
+    stereo: Vec<FirTransfer>,
+}
+
 pub(crate) fn analyze_compiled(
     channels: &[CompiledChannel],
+    routes: &[MatrixRoute],
     source_preamps: &[f64],
     sample_rate: u32,
     manual_trim_db: f64,
@@ -77,6 +89,24 @@ pub(crate) fn analyze_compiled(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    // Stereo programme feeds inputs 0 and 1. Rear and center speakers are left
+    // out of loudness and headroom: they carry nothing for stereo music, and
+    // counting all 7.1 channels at full scale at once would bury normal use.
+    let paths = (!routes.is_empty()).then(|| {
+        (0..channels.len())
+            .map(|output| OutputPaths {
+                direct: routes
+                    .iter()
+                    .find(|route| route.output == output && route.input == output)
+                    .map(|route| FirTransfer::new(&route.kernel.impulse, sample_rate)),
+                stereo: routes
+                    .iter()
+                    .filter(|route| route.output == output && route.input < 2)
+                    .map(|route| FirTransfer::new(&route.kernel.impulse, sample_rate))
+                    .collect(),
+            })
+            .collect::<Vec<_>>()
+    });
     let max_frequency = 20_000.0_f64.min(sample_rate as f64 * 0.499);
     let mut energy_frequencies = log_grid(20.0, max_frequency, 16_384);
     for channel in channels {
@@ -97,6 +127,36 @@ pub(crate) fn analyze_compiled(
         }
         response
     };
+    // What the graph shows: the output's own path.
+    let display = |channel_index: usize, frequency: f64| {
+        let path = paths
+            .as_ref()
+            .and_then(|paths| paths[channel_index].direct.as_ref())
+            .map_or(Complex64::new(1.0, 0.0), |fir| fir.at(frequency));
+        transfer(channel_index, frequency) * path
+    };
+    // Output power for uncorrelated unit-power stereo input.
+    let power = |channel_index: usize, frequency: f64| {
+        let paths = paths.as_ref().map_or(1.0, |paths| {
+            paths[channel_index]
+                .stereo
+                .iter()
+                .map(|fir| fir.at(frequency).norm_sqr())
+                .sum()
+        });
+        transfer(channel_index, frequency).norm_sqr() * paths
+    };
+    // Worst-case magnitude, with every stereo path adding in phase.
+    let magnitude = |channel_index: usize, frequency: f64| {
+        let paths = paths.as_ref().map_or(1.0, |paths| {
+            paths[channel_index]
+                .stereo
+                .iter()
+                .map(|fir| fir.at(frequency).norm())
+                .sum()
+        });
+        transfer(channel_index, frequency).norm() * paths
+    };
 
     let mut bypass_energy = 0.0;
     let mut profile_energy = 0.0;
@@ -110,7 +170,7 @@ pub(crate) fn analyze_compiled(
         let weight = k_weight_power(*frequency, sample_rate as f64) * width;
         bypass_energy += weight * channels.len() as f64;
         profile_energy += (0..channels.len())
-            .map(|channel| transfer(channel, *frequency).norm_sqr() * weight)
+            .map(|channel| power(channel, *frequency) * weight)
             .sum::<f64>();
     }
     if !bypass_energy.is_finite() || !profile_energy.is_finite() || profile_energy <= 0.0 {
@@ -121,19 +181,19 @@ pub(crate) fn analyze_compiled(
     let mut peak = f64::NEG_INFINITY;
     for channel_index in 0..channels.len() {
         for frequency in &energy_frequencies {
-            peak = peak.max(linear_to_db(transfer(channel_index, *frequency).norm()));
+            peak = peak.max(linear_to_db(magnitude(channel_index, *frequency)));
         }
     }
     // Iteratively refine the largest composite peak in log-frequency space.
     for channel_index in 0..channels.len() {
         let coarse = log_grid(20.0, max_frequency, 8_192);
         for window in coarse.windows(3) {
-            let center = linear_to_db(transfer(channel_index, window[1]).norm());
-            if center >= linear_to_db(transfer(channel_index, window[0]).norm())
-                && center >= linear_to_db(transfer(channel_index, window[2]).norm())
+            let center = linear_to_db(magnitude(channel_index, window[1]));
+            if center >= linear_to_db(magnitude(channel_index, window[0]))
+                && center >= linear_to_db(magnitude(channel_index, window[2]))
             {
                 peak = peak.max(refine_peak(window[0], window[2], |frequency| {
-                    linear_to_db(transfer(channel_index, frequency).norm())
+                    linear_to_db(magnitude(channel_index, frequency))
                 }));
             }
         }
@@ -161,7 +221,7 @@ pub(crate) fn analyze_compiled(
             source_preamp_db: source_preamps[channel_index],
             uncorrected_peak_db: graph_frequencies
                 .iter()
-                .map(|frequency| linear_to_db(transfer(channel_index, *frequency).norm()))
+                .map(|frequency| linear_to_db(magnitude(channel_index, *frequency)))
                 .fold(f64::NEG_INFINITY, f64::max),
             response: graph_frequencies
                 .iter()
@@ -171,7 +231,7 @@ pub(crate) fn analyze_compiled(
                     // transfer. Source preamp, perceptual match, correction,
                     // and safety attenuation belong to the separate preamp
                     // readout and must not vertically translate the curve.
-                    gain_db: linear_to_db(transfer(channel_index, *frequency).norm())
+                    gain_db: linear_to_db(display(channel_index, *frequency).norm())
                         - source_preamps[channel_index],
                 })
                 .collect(),

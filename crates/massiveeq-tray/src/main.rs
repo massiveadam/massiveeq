@@ -108,7 +108,7 @@ impl MassiveEqTray {
             label.push_str(" (system output)");
         }
         match self.playing_on(device) {
-            Some(profile) => format!("{label} — ▶ {profile}"),
+            Some(profile) => format!("{label} — {profile}"),
             None => label,
         }
     }
@@ -318,7 +318,11 @@ impl ksni::Tray for MassiveEqTray {
                                 .map_or("Unassigned", |profile| profile.name.as_str())
                                 .to_owned()
                         });
-                    let marker = if device.is_default { "▶ " } else { "" };
+                    let marker = if device.is_default {
+                        "System output: "
+                    } else {
+                        ""
+                    };
                     if device.bypassed {
                         format!(
                             "{marker}{} — Filters off · level matched to {profile}",
@@ -674,6 +678,7 @@ mod tests {
                     manual_trim_db: 0.0,
                     activatable: true,
                     diagnostics: Vec::new(),
+                    impulse_layout: None,
                 }],
                 devices,
                 ..Default::default()
@@ -691,7 +696,7 @@ mod tests {
         assert_eq!(tray.state_label(), "Harman");
         assert_eq!(
             tray.device_label(&tray.snapshot.devices[1]),
-            "Buds (system output) — ▶ Harman"
+            "Buds (system output) — Harman"
         );
         assert_eq!(tray.device_label(&tray.snapshot.devices[0]), "Speakers");
 

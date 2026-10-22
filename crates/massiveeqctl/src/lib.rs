@@ -308,6 +308,7 @@ mod tests {
             manual_trim_db: 0.0,
             activatable,
             diagnostics: Vec::<Diagnostic>::new(),
+            impulse_layout: None,
         }
     }
 
@@ -319,6 +320,7 @@ mod tests {
             manual_trim_db: 0.0,
             activatable: true,
             diagnostics: Vec::<Diagnostic>::new(),
+            impulse_layout: None,
         }
     }
 

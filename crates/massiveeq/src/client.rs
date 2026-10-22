@@ -79,6 +79,13 @@ impl Client {
     pub fn set_convolution(&self, id: &str, path: &str, channel: &str) -> Result<ProfileInfo> {
         self.call_json("SetConvolution", &(id, path, channel))
     }
+    pub fn curves(&self, id: &str) -> Result<massiveeq_core::Curves> {
+        self.call_json("GetCurves", &(id,))
+    }
+    /// Save a "measurement" or "target" curve; an empty path removes it.
+    pub fn set_curve(&self, id: &str, kind: &str, path: &str) -> Result<massiveeq_core::Curves> {
+        self.call_json("SetCurve", &(id, kind, path))
+    }
     pub fn put(&self, id: &str, name: &str, text: &str, trim: f64) -> Result<ProfileInfo> {
         self.call_json("PutProfile", &(id, name, text, trim))
     }
@@ -101,6 +108,17 @@ impl Client {
         self.proxy()?
             .call("SetDeviceBypass", &(device_key, bypassed))
             .context("bypass failed")
+    }
+    /// Start or retune the test tone; repeat within five seconds to keep it playing.
+    pub fn play_tone(&self, device_key: &str, settings: &serde_json::Value) -> Result<()> {
+        self.proxy()?
+            .call("PlayTone", &(device_key, settings.to_string()))
+            .context("could not play the test tone")
+    }
+    pub fn stop_tone(&self) -> Result<()> {
+        self.proxy()?
+            .call("StopTone", &())
+            .context("could not stop the test tone")
     }
     pub fn set_global_bypass(&self, bypassed: bool) -> Result<()> {
         self.proxy()?

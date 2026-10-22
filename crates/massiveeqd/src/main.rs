@@ -4,6 +4,7 @@ mod device;
 mod device_monitor;
 mod filter_host;
 mod native_filter;
+mod tone;
 
 use anyhow::Result;
 use api::Service;
@@ -21,12 +22,16 @@ pub struct AppState {
     storage: Storage,
     library: Library,
     devices: Vec<DeviceInfo>,
+    graph: device::GraphInfo,
     host: FilterHost,
+    /// Test tone for the editor's tone finder, renewed while it is open.
+    tone: Option<tone::Tone>,
 }
 
 pub async fn refresh_locked(state: &mut AppState, force_restart: bool) -> Result<()> {
     let remembered_before = state.library.remembered_devices.clone();
-    let devices = device::discover(&mut state.library).await?;
+    let (devices, graph) = device::discover(&mut state.library).await?;
+    state.graph = graph;
     if state.library.remembered_devices != remembered_before {
         state.storage.save_library(&state.library)?;
     }
@@ -83,6 +88,8 @@ async fn main() -> Result<()> {
         storage,
         library,
         devices: Vec::new(),
+        graph: device::GraphInfo::default(),
+        tone: None,
         host,
     }));
     // Own the control name before creating any PipeWire filters. A second
@@ -128,9 +135,28 @@ async fn main() -> Result<()> {
         }
     });
 
+    // A tone must never outlive the editor that asked for it.
+    let tone_state = state.clone();
+    let tone_task = tokio::spawn(async move {
+        let mut timer = interval(Duration::from_secs(1));
+        loop {
+            timer.tick().await;
+            let mut guard = tone_state.lock().await;
+            if guard.tone.as_ref().is_some_and(tone::Tone::expired)
+                && let Some(tone) = guard.tone.take()
+            {
+                tone.stop();
+            }
+        }
+    });
+
     shutdown_signal().await?;
     event_task.abort();
     health_task.abort();
+    tone_task.abort();
+    if let Some(tone) = state.lock().await.tone.take() {
+        tone.stop();
+    }
     monitor.stop();
     state.lock().await.host.stop_all().await;
     drop(connection);

@@ -1,5 +1,5 @@
 use crate::{Biquad, compiler::CompiledChannel, compiler::CompiledProfile};
-use fft_convolver::{FFTConvolverError, TwoStageFFTConvolver};
+use fft_convolver::{FFTConvolver, FFTConvolverError, TwoStageFFTConvolver};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -92,15 +92,45 @@ impl ChannelProcessor {
     }
 }
 
+/// One input channel convolved into one output channel.
+#[derive(Debug, Clone)]
+struct RouteProcessor {
+    input: usize,
+    output: usize,
+    convolver: FFTConvolver<f32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProfileProcessor {
+    /// Per-output gain and filters.
     channels: Vec<ChannelProcessor>,
     capacity: usize,
+    input_channels: usize,
+    /// `[profile input][sink channel]` gains when the sink is wider than the profile.
+    downmix: Option<Vec<Vec<f32>>>,
+    routes: Vec<RouteProcessor>,
+    /// The profile's own inputs after downmixing.
+    mixed: Vec<Vec<f32>>,
+    /// Matrix-convolution sums per output.
+    summed: Vec<Vec<f32>>,
+    route_output: Vec<f32>,
 }
 
 impl ProfileProcessor {
     pub fn new(profile: &CompiledProfile) -> Result<Self, ProcessError> {
         let capacity = profile.quantum as usize;
+        let mut routes = Vec::with_capacity(profile.routes.len());
+        for route in &profile.routes {
+            let mut convolver = FFTConvolver::<f32>::default();
+            convolver.init(capacity, &route.kernel.impulse)?;
+            routes.push(RouteProcessor {
+                input: route.input,
+                output: route.output,
+                convolver,
+            });
+        }
+        let outputs = profile.channels.len();
+        let mixed = profile.downmix.as_ref().map_or(0, |downmix| downmix.len());
         Ok(Self {
             channels: profile
                 .channels
@@ -108,7 +138,110 @@ impl ProfileProcessor {
                 .map(|channel| ChannelProcessor::new(channel, capacity))
                 .collect::<Result<_, _>>()?,
             capacity,
+            input_channels: profile.input_channels as usize,
+            downmix: profile.downmix.clone(),
+            routes,
+            mixed: vec![vec![0.0; capacity]; mixed],
+            summed: vec![
+                vec![
+                    0.0;
+                    if profile.routes.is_empty() {
+                        0
+                    } else {
+                        capacity
+                    }
+                ];
+                outputs
+            ],
+            route_output: vec![0.0; capacity],
         })
+    }
+
+    pub fn input_channels(&self) -> usize {
+        self.input_channels
+    }
+
+    pub fn output_channels(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// Process `frames` frames from planar inputs (one buffer per sink
+    /// channel) into planar outputs (one per output channel). Allocation-free.
+    pub fn process<I: AsRef<[f32]>, O: AsMut<[f32]>>(
+        &mut self,
+        inputs: &[I],
+        outputs: &mut [O],
+        frames: usize,
+    ) -> Result<(), ProcessError> {
+        if inputs.len() != self.input_channels || outputs.len() != self.channels.len() {
+            return Err(ProcessError::ChannelCountMismatch);
+        }
+        if frames > self.capacity {
+            return Err(ProcessError::BlockTooLarge {
+                actual: frames,
+                capacity: self.capacity,
+            });
+        }
+        if inputs.iter().any(|input| input.as_ref().len() < frames)
+            || outputs
+                .iter_mut()
+                .any(|output| output.as_mut().len() < frames)
+        {
+            return Err(ProcessError::BlockSizeMismatch);
+        }
+        let Self {
+            channels,
+            downmix,
+            routes,
+            mixed,
+            summed,
+            route_output,
+            ..
+        } = self;
+        if let Some(downmix) = downmix {
+            for (target, gains) in mixed.iter_mut().zip(downmix.iter()) {
+                let target = &mut target[..frames];
+                target.fill(0.0);
+                for (input, gain) in inputs.iter().zip(gains) {
+                    if *gain != 0.0 {
+                        for (sample, source) in target.iter_mut().zip(input.as_ref()) {
+                            *sample += source * gain;
+                        }
+                    }
+                }
+            }
+        }
+        let source = |index: usize| -> &[f32] {
+            if downmix.is_some() {
+                &mixed[index][..frames]
+            } else {
+                &inputs[index].as_ref()[..frames]
+            }
+        };
+        if routes.is_empty() {
+            for (index, (processor, output)) in channels.iter_mut().zip(outputs).enumerate() {
+                processor.process(source(index), &mut output.as_mut()[..frames])?;
+            }
+            return Ok(());
+        }
+        for sum in summed.iter_mut() {
+            sum[..frames].fill(0.0);
+        }
+        for route in routes.iter_mut() {
+            route
+                .convolver
+                .process(source(route.input), &mut route_output[..frames])?;
+            for (sample, value) in summed[route.output][..frames]
+                .iter_mut()
+                .zip(&route_output[..frames])
+            {
+                *sample += value;
+            }
+        }
+        for ((processor, sum), output) in channels.iter_mut().zip(summed.iter()).zip(outputs) {
+            processor.process(&sum[..frames], &mut output.as_mut()[..frames])?;
+        }
+        Ok(())
     }
 
     pub fn process_planar(
@@ -116,35 +249,8 @@ impl ProfileProcessor {
         inputs: &[&[f32]],
         outputs: &mut [&mut [f32]],
     ) -> Result<(), ProcessError> {
-        if inputs.len() != self.channels.len() || outputs.len() != self.channels.len() {
-            return Err(ProcessError::ChannelCountMismatch);
-        }
-        for ((processor, input), output) in self.channels.iter_mut().zip(inputs).zip(outputs) {
-            processor.process(input, output)?;
-        }
-        Ok(())
-    }
-
-    pub fn process_mono(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), ProcessError> {
-        if self.channels.len() != 1 {
-            return Err(ProcessError::ChannelCountMismatch);
-        }
-        self.channels[0].process(input, output)
-    }
-
-    pub fn process_stereo(
-        &mut self,
-        left_input: &[f32],
-        right_input: &[f32],
-        left_output: &mut [f32],
-        right_output: &mut [f32],
-    ) -> Result<(), ProcessError> {
-        if self.channels.len() != 2 {
-            return Err(ProcessError::ChannelCountMismatch);
-        }
-        let (left, right) = self.channels.split_at_mut(1);
-        left[0].process(left_input, left_output)?;
-        right[0].process(right_input, right_output)
+        let frames = inputs.first().map_or(0, |input| input.len());
+        self.process(inputs, outputs, frames)
     }
 
     pub fn capacity(&self) -> usize {
@@ -154,6 +260,9 @@ impl ProfileProcessor {
     pub fn reset(&mut self) {
         for channel in &mut self.channels {
             channel.reset();
+        }
+        for route in &mut self.routes {
+            route.convolver.reset();
         }
     }
 }
@@ -208,5 +317,56 @@ mod tests {
         assert!((output[0] - 0.5).abs() < 1e-5);
         assert!((output[1] - 0.25).abs() < 1e-5);
         assert!((output[2] + 0.125).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use crate::{CompiledProfile, MatrixRoute, compile_bypass};
+
+    /// `cargo test --release -p massiveeq-dsp surround_load -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn surround_load() {
+        let mut profile: CompiledProfile = compile_bypass(48_000, 2048, 2);
+        profile.input_channels = 8;
+        let mut seed = 1_u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32 - 0.5
+        };
+        for route in massiveeq_core::ImpulseLayout::Surround71.routes() {
+            let impulse = (0..48_000)
+                .map(|index| noise() * (-(index as f32) / 7_200.0).exp())
+                .collect();
+            profile.routes.push(MatrixRoute {
+                input: route.input,
+                output: route.output,
+                kernel: crate::ConvolutionKernel {
+                    sample_rate: 48_000,
+                    impulse,
+                    latency_frames: 0,
+                },
+            });
+        }
+        let mut processor = super::ProfileProcessor::new(&profile).unwrap();
+        for frames in [1024_usize, 256] {
+            let inputs = (0..8)
+                .map(|_| (0..frames).map(|_| noise()).collect::<Vec<f32>>())
+                .collect::<Vec<_>>();
+            let mut outputs = vec![vec![0.0_f32; frames]; 2];
+            let mut times = Vec::new();
+            for _ in 0..(400 * 1024 / frames) {
+                let started = std::time::Instant::now();
+                processor.process(&inputs, &mut outputs, frames).unwrap();
+                times.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            let average = times.iter().sum::<f64>() / times.len() as f64;
+            let peak = times.iter().copied().fold(0.0, f64::max);
+            let budget = frames as f64 / 48.0;
+            println!(
+                "{frames}-frame blocks ({budget:.1} ms budget): average {average:.2} ms, peak {peak:.2} ms"
+            );
+        }
     }
 }
