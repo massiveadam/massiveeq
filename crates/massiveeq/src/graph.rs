@@ -1,6 +1,7 @@
 use gtk4::{DrawingArea, cairo, prelude::*};
 use massiveeq_core::{
-    ChannelSelection, CurvePoint, Filter, ProfileAnalysis, ProfileDocument, analysis::ResponsePoint,
+    ChannelSelection, CurvePoint, Excursion, Filter, MeasurementField, ProfileAnalysis,
+    ProfileDocument, alignment_level, analysis::ResponsePoint, curve_at, excursions, is_range,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -37,8 +38,11 @@ pub struct Overlay {
     /// Frequency the tone finder is playing.
     pub tone: Option<f64>,
     /// A headphone measurement and a target (line or range) for this profile.
+    /// With placements this is their median.
     pub measurement: Option<Vec<CurvePoint>>,
     pub target: Option<Vec<CurvePoint>>,
+    /// The spread of the measurement and its placements, when there are any.
+    pub field: Option<MeasurementField>,
 }
 
 impl Overlay {
@@ -347,42 +351,6 @@ fn draw_channel_legend(cr: &cairo::Context, width: f64, stereo: bool) {
 }
 
 /// Mean of a curve over 300 Hz–3 kHz, where curves are aligned for comparison.
-fn midband_level(value: &dyn Fn(f64) -> f64) -> f64 {
-    const STEPS: usize = 32;
-    (0..STEPS)
-        .map(|index| value(300.0 * 10.0_f64.powf(index as f64 / (STEPS - 1) as f64)))
-        .sum::<f64>()
-        / STEPS as f64
-}
-
-/// Curve value at `frequency` (log-interpolated), as (low, high).
-pub fn curve_at(points: &[CurvePoint], frequency: f64) -> (f64, f64) {
-    let Some(first) = points.first() else {
-        return (0.0, 0.0);
-    };
-    if frequency <= first.frequency {
-        return (first.low, first.high);
-    }
-    for pair in points.windows(2) {
-        if frequency <= pair[1].frequency {
-            let span = (pair[1].frequency / pair[0].frequency).ln();
-            let amount = if span > 0.0 {
-                (frequency / pair[0].frequency).ln() / span
-            } else {
-                0.0
-            };
-            let lerp = |a: f64, b: f64| a + amount * (b - a);
-            return (
-                lerp(pair[0].low, pair[1].low),
-                lerp(pair[0].high, pair[1].high),
-            );
-        }
-    }
-    points
-        .last()
-        .map_or((0.0, 0.0), |point| (point.low, point.high))
-}
-
 fn eq_at(response: &[ResponsePoint], frequency: f64) -> f64 {
     let index = response.partition_point(|point| point.frequency < frequency);
     match (
@@ -398,8 +366,11 @@ fn eq_at(response: &[ResponsePoint], frequency: f64) -> f64 {
     }
 }
 
-/// Target (range or line), the raw measurement, and the measurement with the
-/// current EQ applied. Each is shifted to 0 dB across 300 Hz–3 kHz.
+/// Target (range or line), the measurement (a band when placements were
+/// added), and the measurement with the current EQ applied. Each is aligned
+/// to 0 dB at 630 Hz ± one octave, as GraphWorks does, so imported bounds
+/// line up the same way. The corrected curve turns red where it leaves a
+/// target range.
 fn draw_curves(
     cr: &cairo::Context,
     overlay: &Overlay,
@@ -411,62 +382,111 @@ fn draw_curves(
     let frequencies = (0..POINTS)
         .map(|index| 20.0 * 1000.0_f64.powf(index as f64 / (POINTS - 1) as f64))
         .collect::<Vec<_>>();
-    let trace = |values: &dyn Fn(f64) -> f64, offset: f64| {
-        for (index, frequency) in frequencies.iter().enumerate() {
+    let trace = |values: &dyn Fn(f64) -> f64, offset: f64, within: (f64, f64)| {
+        let mut started = false;
+        for frequency in frequencies
+            .iter()
+            .filter(|frequency| (within.0..=within.1).contains(*frequency))
+        {
             let (x, y) = (
                 x_for(*frequency, width),
                 y_for(values(*frequency) - offset, height),
             );
-            if index == 0 {
-                cr.move_to(x, y);
-            } else {
+            if started {
                 cr.line_to(x, y);
+            } else {
+                cr.move_to(x, y);
+                started = true;
             }
         }
     };
+    let everywhere = (0.0, f64::INFINITY);
     let stroke = |values: &dyn Fn(f64) -> f64, rgba: (f64, f64, f64, f64), line: f64| {
-        trace(values, midband_level(values));
+        trace(values, alignment_level(values), everywhere);
         cr.set_source_rgba(rgba.0, rgba.1, rgba.2, rgba.3);
         cr.set_line_width(line);
         let _ = cr.stroke();
     };
+    let band = |points: &[CurvePoint], offset: f64, rgba: (f64, f64, f64, f64)| {
+        trace(
+            &|frequency| curve_at(points, frequency).1,
+            offset,
+            everywhere,
+        );
+        for frequency in frequencies.iter().rev() {
+            let (low, _) = curve_at(points, *frequency);
+            cr.line_to(x_for(*frequency, width), y_for(low - offset, height));
+        }
+        cr.close_path();
+        cr.set_source_rgba(rgba.0, rgba.1, rgba.2, rgba.3);
+        let _ = cr.fill();
+    };
 
+    let bounds = overlay.target.as_deref().filter(|target| is_range(target));
     if let Some(target) = &overlay.target {
         let center = |frequency: f64| {
             let (low, high) = curve_at(target, frequency);
             (low + high) / 2.0
         };
-        if target.iter().any(|point| point.high > point.low) {
-            let offset = midband_level(&center);
-            trace(&|frequency| curve_at(target, frequency).1, offset);
-            for frequency in frequencies.iter().rev() {
-                let (low, _) = curve_at(target, *frequency);
-                cr.line_to(x_for(*frequency, width), y_for(low - offset, height));
-            }
-            cr.close_path();
-            cr.set_source_rgba(0.80, 0.78, 0.72, 0.10);
-            let _ = cr.fill();
+        if bounds.is_some() {
+            band(target, alignment_level(&center), (0.80, 0.78, 0.72, 0.10));
         }
         cr.set_dash(&[6.0, 4.0], 0.0);
         stroke(&center, (0.80, 0.78, 0.72, 0.6), 1.3);
         cr.set_dash(&[], 0.0);
     }
 
+    // Where each ear's corrected curve leaves the bounds, for the readout.
+    let mut outside: Vec<(&str, Excursion)> = Vec::new();
     if let Some(measurement) = &overlay.measurement {
         let raw = |frequency: f64| curve_at(measurement, frequency).0;
+        if let Some(field) = &overlay.field {
+            let offset = alignment_level(&raw);
+            band(&field.outer, offset, (0.62, 0.64, 0.64, 0.10));
+            band(&field.inner, offset, (0.62, 0.64, 0.64, 0.16));
+        }
         stroke(&raw, (0.62, 0.64, 0.64, 0.55), 1.3);
         if let Some(analysis) = analysis {
             let ears = if responses_match(&analysis.left.response, &analysis.right.response) {
-                vec![(&analysis.left.response, (1.0, 0.48, 0.10, 0.95))]
+                vec![("", &analysis.left.response, (1.0, 0.48, 0.10, 0.95))]
             } else {
                 vec![
-                    (&analysis.left.response, (0.45, 0.72, 0.86, 0.95)),
-                    (&analysis.right.response, (0.86, 0.52, 0.42, 0.95)),
+                    ("L ", &analysis.left.response, (0.45, 0.72, 0.86, 0.95)),
+                    ("R ", &analysis.right.response, (0.86, 0.52, 0.42, 0.95)),
                 ]
             };
-            for (response, color) in ears {
+            for (ear, response, color) in ears {
                 let corrected = |frequency: f64| raw(frequency) + eq_at(response, frequency);
                 stroke(&corrected, color, 2.0);
+                let Some(target) = bounds else {
+                    continue;
+                };
+                // Shade the gap between the curve and the bound it crosses.
+                let offset = alignment_level(&corrected);
+                let target_offset = alignment_level(&|frequency| {
+                    let (low, high) = curve_at(target, frequency);
+                    (low + high) / 2.0
+                });
+                for excursion in excursions(&corrected, target) {
+                    let within = (excursion.start, excursion.end);
+                    trace(&corrected, offset, within);
+                    for frequency in frequencies
+                        .iter()
+                        .rev()
+                        .filter(|frequency| (within.0..=within.1).contains(*frequency))
+                    {
+                        let (low, high) = curve_at(target, *frequency);
+                        let edge = if excursion.worst_db > 0.0 { high } else { low };
+                        cr.line_to(
+                            x_for(*frequency, width),
+                            y_for(edge - target_offset, height),
+                        );
+                    }
+                    cr.close_path();
+                    cr.set_source_rgba(OUTSIDE.0, OUTSIDE.1, OUTSIDE.2, 0.42);
+                    let _ = cr.fill();
+                    outside.push((ear, excursion));
+                }
             }
         }
     }
@@ -494,11 +514,60 @@ fn draw_curves(
                 .unwrap_or(60.0);
     };
     if overlay.measurement.is_some() {
-        key("MEASURED", (0.62, 0.64, 0.64));
+        match &overlay.field {
+            Some(field) => key(
+                &format!("MEASURED ×{} PLACEMENTS", field.count),
+                (0.62, 0.64, 0.64),
+            ),
+            None => key("MEASURED", (0.62, 0.64, 0.64)),
+        }
         key("PREDICTED", (1.0, 0.48, 0.10));
     }
     if overlay.target.is_some() {
-        key("TARGET", (0.80, 0.78, 0.72));
+        key(
+            if bounds.is_some() { "BOUNDS" } else { "TARGET" },
+            (0.80, 0.78, 0.72),
+        );
+    }
+    if !outside.is_empty() {
+        key("OUTSIDE BOUNDS", OUTSIDE);
+        // The widest excursions first, as a short readout under the legend.
+        outside.sort_by(|a, b| b.1.worst_db.abs().total_cmp(&a.1.worst_db.abs()));
+        let shown = outside
+            .iter()
+            .take(4)
+            .map(|(ear, excursion)| {
+                format!(
+                    "{ear}{}–{} {:+.1}",
+                    compact_hz(excursion.start),
+                    compact_hz(excursion.end),
+                    excursion.worst_db
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+        let more = outside.len().saturating_sub(4);
+        cr.set_font_size(9.5);
+        cr.set_source_rgba(OUTSIDE.0, OUTSIDE.1, OUTSIDE.2, 0.95);
+        cr.move_to(LEFT + 8.0, 31.0);
+        let _ = cr.show_text(&if more > 0 {
+            format!("{shown}  · +{more} more")
+        } else {
+            shown
+        });
+    }
+}
+
+/// Where a corrected curve leaves the bounds: magenta, clear of the orange
+/// prediction and the red right ear.
+const OUTSIDE: (f64, f64, f64) = (0.93, 0.24, 0.62);
+
+/// "850" or "2.1k", for the bounds readout.
+fn compact_hz(frequency: f64) -> String {
+    if frequency >= 1000.0 {
+        format!("{:.1}k", frequency / 1000.0)
+    } else {
+        format!("{frequency:.0}")
     }
 }
 

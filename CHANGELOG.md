@@ -2,7 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- Show where the corrected measurement leaves a target range (preference
+  bounds): each stretch outside is shaded and listed with how far out it goes.
+- Add placements: more measurements of the same headphone after putting it on
+  again, drawn as a median with 50% and 90% bands; the median is corrected.
+- Choose the measurement fixture from a list (B&K 5128, GRAS KB50xx, B&K 4128,
+  IEC 711) and recognise fixtures however they were typed; a measurement
+  from another fixture than its target or bounds is named in the note.
+
 ### Changed
+
+- Align curves at 630 Hz ± one octave, as GraphWorks does, instead of across
+  300 Hz–3 kHz.
 
 - Rename LISTEN to TONE GEN. While the tone plays, the output level holds
   where it was when the tone started, for the edit and the A/B starting

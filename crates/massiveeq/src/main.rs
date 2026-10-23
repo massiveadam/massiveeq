@@ -38,6 +38,7 @@ struct Model {
     graph_tone: RefCell<Option<GraphToneUi>>,
     curves: RefCell<massiveeq_core::Curves>,
     curve_context: RefCell<Option<gtk::Label>>,
+    curves_ui: RefCell<Option<Rc<CurvesUi>>>,
     history: RefCell<editing::History>,
     reference: RefCell<Option<editing::Snapshot>>,
     restoring_history: Cell<bool>,
@@ -192,6 +193,7 @@ fn build_ui(app: &adw::Application) {
         graph_tone: RefCell::new(None),
         curves: RefCell::new(massiveeq_core::Curves::default()),
         curve_context: RefCell::new(None),
+        curves_ui: RefCell::new(None),
         history: RefCell::new(editing::History::default()),
         reference: RefCell::new(None),
         restoring_history: Cell::new(false),
@@ -475,6 +477,7 @@ fn build_ui(app: &adw::Application) {
         bypass: device_bypass.clone(),
     });
     let curves_ui = build_curves_menu();
+    *model.curves_ui.borrow_mut() = Some(curves_ui.clone());
 
     // Preset bar: step through the profile bank, or open it.
     let previous_profile = gtk::Button::from_icon_name("go-previous-symbolic");
@@ -2477,12 +2480,47 @@ fn show_curve_details(
         "Author, publication, or source URL",
     );
     source.set_max_length(2048);
-    let fixture = entry(
-        "Measurement fixture",
-        &metadata.fixture,
-        "Unknown unless documented by the source",
-    );
+    // Known fixtures by name, so mismatches are found however they were
+    // typed; anything else goes in the text field.
+    let fixture_title = gtk::Label::new(Some("Measurement fixture"));
+    fixture_title.set_xalign(0.0);
+    fixture_title.add_css_class("level-code");
+    content.append(&fixture_title);
+    let mut fixture_options = vec!["Unknown fixture"];
+    fixture_options.extend(massiveeq_core::FIXTURES.iter().map(|(_, label)| *label));
+    fixture_options.push("Other fixture…");
+    let other_fixture = fixture_options.len() as u32 - 1;
+    let fixture_choice = gtk::DropDown::from_strings(&fixture_options);
+    fixture_choice.update_property(&[gtk::accessible::Property::Label("Measurement fixture")]);
+    let known = massiveeq_core::fixture_key(&metadata.fixture).and_then(|key| {
+        massiveeq_core::FIXTURES
+            .iter()
+            .position(|(candidate, _)| *candidate == key)
+    });
+    fixture_choice.set_selected(match known {
+        Some(index) => index as u32 + 1,
+        None if metadata.fixture.trim().is_empty() => 0,
+        None => other_fixture,
+    });
+    content.append(&fixture_choice);
+    let fixture = gtk::Entry::new();
     fixture.set_max_length(256);
+    fixture.set_placeholder_text(Some("Fixture name, as the source gives it"));
+    fixture.update_property(&[gtk::accessible::Property::Label("Other fixture name")]);
+    if known.is_none() {
+        fixture.set_text(&metadata.fixture);
+    }
+    fixture.set_visible(fixture_choice.selected() == other_fixture);
+    content.append(&fixture);
+    fixture_choice.connect_selected_notify({
+        let fixture = fixture.clone();
+        move |choice| fixture.set_visible(choice.selected() == other_fixture)
+    });
+    let fixture_name = move || match fixture_choice.selected() {
+        0 => String::new(),
+        index if index == other_fixture => fixture.text().trim().to_owned(),
+        index => massiveeq_core::FIXTURES[index as usize - 1].1.to_owned(),
+    };
     let compensation = gtk::DropDown::from_strings(&[
         "Unknown compensation",
         "Raw response",
@@ -2529,6 +2567,11 @@ fn show_curve_details(
         "Headphones.com research and context",
     );
     content.append(&link);
+    let graphworks = gtk::LinkButton::with_label(
+        "https://graph.headphones.com",
+        "GraphWorks measurements and preference bounds",
+    );
+    content.append(&graphworks);
     let error = gtk::Label::new(None);
     error.set_wrap(true);
     error.set_xalign(0.0);
@@ -2555,7 +2598,7 @@ fn show_curve_details(
         move |_| {
             let metadata = CurveMetadata {
                 source: source.text().into(),
-                fixture: fixture.text().into(),
+                fixture: fixture_name(),
                 baseline: baseline.text().into(),
                 compensation: match compensation.selected() {
                     1 => Compensation::Raw,
@@ -2594,18 +2637,67 @@ fn update_curve_context(model: &Model, curves: massiveeq_core::Curves) {
     if let Some(label) = model.curve_context.borrow().as_ref() {
         // Most curves carry no context at all; only a real conflict is worth a line.
         label.set_visible(full.contains("contexts differ"));
-        label.set_text(if full.contains("contexts differ") {
-            "Measurement and target contexts differ. See curve details."
-        } else if full.contains("matching user-entered") {
-            "Curves share declared context. EQ response is predicted."
-        } else {
-            "Curve context is incomplete. See curve details before comparing targets."
+        let fixtures = curves
+            .measurement_metadata
+            .as_ref()
+            .zip(curves.target_metadata.as_ref())
+            .map(|(measurement, target)| (measurement.fixture.trim(), target.fixture.trim()))
+            .filter(|(measurement, target)| !measurement.is_empty() && !target.is_empty());
+        let fixture_note =
+            fixtures
+                .filter(|_| full.contains("do not transfer"))
+                .map(|(measurement, target)| {
+                    let what = if curves
+                        .target
+                        .as_deref()
+                        .is_some_and(massiveeq_core::is_range)
+                    {
+                        "bounds are"
+                    } else {
+                        "target is"
+                    };
+                    format!(
+                        "Measured on {measurement}, but the {what} made for {target}; \
+                     they do not transfer to another fixture's ears."
+                    )
+                });
+        label.set_text(&match fixture_note {
+            Some(note) => note,
+            None if full.contains("contexts differ") => {
+                "Measurement and target contexts differ. See curve details.".to_owned()
+            }
+            None if full.contains("matching user-entered") => {
+                "Curves share declared context. EQ response is predicted.".to_owned()
+            }
+            None => "Curve context is incomplete. See curve details before comparing targets."
+                .to_owned(),
         });
         label.set_tooltip_text(Some(&full));
     }
+    let field = curves.measurement.as_ref().and_then(|measurement| {
+        let takes = std::iter::once(measurement.as_slice())
+            .chain(curves.placements.iter().map(Vec::as_slice))
+            .collect::<Vec<_>>();
+        massiveeq_core::measurement_field(&takes)
+    });
+    if let Some(ui) = model.curves_ui.borrow().as_ref() {
+        let count = curves.placements.len();
+        ui.add_placement
+            .set_sensitive(curves.measurement.is_some() && count < massiveeq_core::MAX_PLACEMENTS);
+        ui.clear_placements.set_visible(count > 0);
+        ui.clear_placements.set_label(&format!(
+            "CLEAR {count} PLACEMENT{}",
+            if count == 1 { "" } else { "S" }
+        ));
+    }
     let mut overlay = model.overlay.borrow_mut();
-    overlay.measurement = curves.measurement.clone();
+    // With placements, the curve to correct is the typical one: their median.
+    overlay.measurement = match &field {
+        Some(field) => Some(field.median.clone()),
+        None => curves.measurement.clone(),
+    };
     overlay.target = curves.target.clone();
+    overlay.field = field;
     *model.curves.borrow_mut() = curves;
 }
 
@@ -2613,6 +2705,9 @@ fn update_curve_context(model: &Model, curves: massiveeq_core::Curves) {
 struct CurvesUi {
     menu: gtk::MenuButton,
     load_measurement: gtk::Button,
+    /// Another measurement of the same headphone after putting it on again.
+    add_placement: gtk::Button,
+    clear_placements: gtk::Button,
     load_target: gtk::Button,
     clear_measurement: gtk::Button,
     clear_target: gtk::Button,
@@ -2633,7 +2728,7 @@ fn build_curves_menu() -> Rc<CurvesUi> {
     content.set_margin_start(8);
     content.set_margin_end(8);
     let note = gtk::Label::new(Some(
-        "Frequency and dB per line, as AutoEQ, Squiglink,\nand REW export. Three columns make a range.",
+        "Frequency and dB per line, as AutoEQ, Squiglink,\nand REW export. Three columns make a range,\nsuch as preference bounds. Curves align at\n630 Hz ± 1 octave, as on GraphWorks.",
     ));
     note.set_xalign(0.0);
     note.add_css_class("level-code");
@@ -2644,9 +2739,17 @@ fn build_curves_menu() -> Rc<CurvesUi> {
         button
     };
     let load_measurement = button("LOAD MEASUREMENT…");
-    let load_target = button("LOAD TARGET…");
+    let add_placement = button("ADD PLACEMENT…");
+    add_placement.set_sensitive(false);
+    add_placement.set_tooltip_text(Some(
+        "Add another measurement of this headphone after putting it on again. \
+         The graph shows how much its response moves between placements.",
+    ));
+    let load_target = button("LOAD TARGET OR BOUNDS…");
     let clear_measurement = button("CLEAR MEASUREMENT");
     let clear_target = button("CLEAR TARGET");
+    let clear_placements = button("CLEAR PLACEMENTS");
+    clear_placements.set_visible(false);
     let measurement_details = button("Measurement details…");
     let target_details = button("Target details…");
     let popover = gtk::Popover::new();
@@ -2655,6 +2758,8 @@ fn build_curves_menu() -> Rc<CurvesUi> {
     Rc::new(CurvesUi {
         menu,
         load_measurement,
+        add_placement,
+        clear_placements,
         load_target,
         clear_measurement,
         clear_target,
@@ -2700,10 +2805,11 @@ fn wire_curves(
             match model.client.set_curve(&id, kind, path) {
                 Ok(curves) => {
                     update_curve_context(&model, curves);
-                    status.set_text(if path.is_empty() {
-                        "Curve cleared"
-                    } else {
-                        "Curve loaded"
+                    status.set_text(match (kind, path.is_empty()) {
+                        ("placement", true) => "Placements cleared",
+                        ("placement", false) => "Placement added",
+                        (_, true) => "Curve cleared",
+                        (_, false) => "Curve loaded",
                     });
                 }
                 Err(error) => status.set_text(&error.to_string()),
@@ -2717,7 +2823,12 @@ fn wire_curves(
             "measurement",
             "Choose headphone measurement",
         ),
-        (&ui.load_target, "target", "Choose target curve"),
+        (&ui.load_target, "target", "Choose target curve or bounds"),
+        (
+            &ui.add_placement,
+            "placement",
+            "Choose another measurement of this headphone",
+        ),
     ] {
         button.connect_clicked({
             let window = window.clone();
@@ -2747,6 +2858,7 @@ fn wire_curves(
     for (button, kind) in [
         (&ui.clear_measurement, "measurement"),
         (&ui.clear_target, "target"),
+        (&ui.clear_placements, "placement"),
     ] {
         let apply = apply.clone();
         let menu = ui.menu.clone();
