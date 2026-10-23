@@ -231,7 +231,7 @@ multichannel devices are never intercepted.
 The graph is the editor, as in plugin EQs. Click empty space to add a band
 and drag a band's node to set its frequency and gain; scroll over it to
 change Q. The selected band opens a panel beside its node: the filter type,
-drawn as its curve shape (peak, shelves, passes, band pass, notch, all-pass),
+drawn as its curve shape (low shelf, peak, or high shelf, as on Squiglink),
 left/both/right ears, frequency, gain, and Q knobs, an on/off switch, and
 delete. Knobs follow the mouse vertically (Shift is finer), take the mouse
 wheel and arrow keys, and reset on double-click. Escape closes the panel. The

@@ -3595,28 +3595,28 @@ struct BandUi {
     syncing: Rc<Cell<bool>>,
 }
 
-const BAND_KINDS: [FilterKind; 8] = [
-    FilterKind::Peaking,
+/// The band types the editor offers, as Squiglink does. Imported profiles may
+/// still hold other types; they play and show their symbol until changed.
+const BAND_KINDS: [FilterKind; 3] = [
     FilterKind::LowShelf,
+    FilterKind::Peaking,
     FilterKind::HighShelf,
-    FilterKind::LowPass,
-    FilterKind::HighPass,
-    FilterKind::BandPass,
-    FilterKind::Notch,
-    FilterKind::AllPass,
 ];
-const BAND_KIND_LABELS: [&str; 8] = ["PK", "LS", "HS", "LP", "HP", "BP", "NO", "AP"];
+const BAND_KIND_LABELS: [&str; 3] = ["LS", "PK", "HS"];
+const BAND_KIND_NAMES: [&str; 3] = ["Low shelf", "Peak", "High shelf"];
 
-const BAND_KIND_NAMES: [&str; 8] = [
-    "Peak",
-    "Low shelf",
-    "High shelf",
-    "Low pass",
-    "High pass",
-    "Band pass",
-    "Notch",
-    "All pass",
-];
+fn kind_name(kind: FilterKind) -> &'static str {
+    match kind {
+        FilterKind::Peaking => "Peak",
+        FilterKind::LowShelf => "Low shelf",
+        FilterKind::HighShelf => "High shelf",
+        FilterKind::LowPass => "Low pass",
+        FilterKind::HighPass => "High pass",
+        FilterKind::BandPass => "Band pass",
+        FilterKind::Notch => "Notch",
+        FilterKind::AllPass => "All pass",
+    }
+}
 
 /// Build the selected band's floating panel and place it on `overlay`, which
 /// holds the graph. It follows the band's node as it moves.
@@ -3635,7 +3635,7 @@ fn build_band_editor(
         .child_spacing(8)
         .line_spacing(8)
         .build();
-    let kind = Segmented::new(&BAND_KIND_LABELS, 0);
+    let kind = Segmented::new(&BAND_KIND_LABELS, 1);
     kind.root.add_css_class("kind-picker");
     for ((button, name), filter_kind) in kind.buttons.iter().zip(BAND_KIND_NAMES).zip(BAND_KINDS) {
         button.set_child(Some(&glyph::widget(filter_kind, 26, 16)));
@@ -3881,14 +3881,10 @@ fn sync_band_ui(model: &Model) {
             index + 1,
             compact_band_frequency(filter.frequency)
         ));
-        let kind = BAND_KINDS
-            .iter()
-            .position(|kind| *kind == filter.kind)
-            .unwrap_or_default();
         tile.select.set_tooltip_text(Some(&format!(
             "Band {} · {} · {} · {} dB · Q {:.2}{}",
             index + 1,
-            BAND_KIND_NAMES[kind],
+            kind_name(filter.kind),
             format_band_frequency(filter.frequency),
             signed_db(filter.gain_db, 1),
             filter.q,
@@ -3898,11 +3894,20 @@ fn sync_band_ui(model: &Model) {
     let filter = selected.and_then(|index| profile.filters.get(index));
     ui.root.set_visible(filter.is_some());
     if let Some(filter) = filter {
-        let kind = BAND_KINDS
-            .iter()
-            .position(|kind| *kind == filter.kind)
-            .unwrap_or_default();
-        ui.kind.buttons[kind].set_active(true);
+        // A type outside the three (from an imported profile) lights none.
+        match BAND_KINDS.iter().position(|kind| *kind == filter.kind) {
+            Some(kind) => ui.kind.buttons[kind].set_active(true),
+            None => {
+                for button in &ui.kind.buttons {
+                    button.set_active(false);
+                }
+            }
+        }
+        ui.kind.root.set_tooltip_text(
+            (!BAND_KINDS.contains(&filter.kind))
+                .then(|| format!("{} · choose a type to change it", kind_name(filter.kind)))
+                .as_deref(),
+        );
         ui.channels.buttons[match filter.channels {
             ChannelSelection::Left => 0,
             ChannelSelection::All => 1,
