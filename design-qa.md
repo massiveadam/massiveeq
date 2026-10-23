@@ -16,7 +16,7 @@ Faders refresh in place during autosave, graph edits, and keyboard nudges. Their
 
 - Release workspace build passed.
 - Workspace Clippy passed with `-D warnings`.
-- Workspace release tests passed: 130 passed, one ignored DSP load benchmark.
+- Workspace release tests passed: 134 passed, one ignored DSP load benchmark. This includes the four preserved idle-discovery regression tests from benji.
 - `git diff --check` passed.
 - Drove the GTK controls through AT-SPI in isolated headless Sway sessions with private D-Bus, PipeWire, and configuration directories.
 - Verified fader gain plus shared frequency/Q edits in the saved profile text, reorder, enable/disable, delete, add, gains above 12 dB, and deletion of the final band.

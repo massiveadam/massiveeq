@@ -3,6 +3,7 @@ use pipewire as pw;
 use pw::{proxy::ProxyT, types::ObjectType};
 use std::{
     cell::RefCell,
+    collections::HashSet,
     rc::Rc,
     sync::{
         Arc,
@@ -15,6 +16,30 @@ use std::{
 use tokio::sync::mpsc::Sender;
 
 type MonitoredObjects = Rc<RefCell<Vec<(u32, Box<dyn ProxyT>, Box<dyn pw::proxy::Listener>)>>>;
+
+#[derive(Default)]
+struct RegistryChanges {
+    relevant_ids: HashSet<u32>,
+}
+
+impl RegistryChanges {
+    fn added(&mut self, id: u32, kind: &ObjectType) -> bool {
+        // Discovery uses short-lived pw-dump/pw-metadata clients. Treating
+        // their connection events as device changes triggers discovery again.
+        if !matches!(
+            kind,
+            ObjectType::Device | ObjectType::Node | ObjectType::Metadata
+        ) {
+            return false;
+        }
+        self.relevant_ids.insert(id);
+        true
+    }
+
+    fn removed(&mut self, id: u32) -> bool {
+        self.relevant_ids.remove(&id)
+    }
+}
 
 pub struct DeviceMonitor {
     stop: Arc<AtomicBool>,
@@ -77,9 +102,15 @@ fn run_monitor(
         let object_store = objects.clone();
         let removal_store = objects.clone();
         let global_events = events.clone();
+        let changes = Rc::new(RefCell::new(RegistryChanges::default()));
+        let added_changes = changes.clone();
+        let removed_changes = changes;
         let _listener = registry
             .add_listener_local()
             .global(move |object| {
+                if !added_changes.borrow_mut().added(object.id, &object.type_) {
+                    return;
+                }
                 let _ = global_events.try_send(());
                 let Some(registry) = registry_weak.upgrade() else {
                     return;
@@ -132,7 +163,9 @@ fn run_monitor(
                 // Listener destruction may interact with PipeWire. Do it
                 // after releasing the RefCell borrow to avoid re-entrancy.
                 drop(removed);
-                let _ = events.try_send(());
+                if removed_changes.borrow_mut().removed(id) {
+                    let _ = events.try_send(());
+                }
             })
             .register();
         let weak = mainloop.downgrade();
@@ -157,4 +190,45 @@ fn run_monitor(
         let _ = started.send(Err(error.to_string()));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observer_clients_do_not_trigger_discovery_on_connect_or_disconnect() {
+        let mut changes = RegistryChanges::default();
+        assert!(!changes.added(10, &ObjectType::Client));
+        assert!(!changes.removed(10));
+    }
+
+    #[test]
+    fn ports_do_not_trigger_device_discovery() {
+        let mut changes = RegistryChanges::default();
+        assert!(!changes.added(11, &ObjectType::Port));
+        assert!(!changes.removed(11));
+    }
+
+    #[test]
+    fn device_node_and_metadata_changes_still_trigger_discovery() {
+        let mut changes = RegistryChanges::default();
+        for (id, kind) in [
+            (12, ObjectType::Device),
+            (13, ObjectType::Node),
+            (14, ObjectType::Metadata),
+        ] {
+            assert!(changes.added(id, &kind));
+            assert!(changes.removed(id));
+        }
+    }
+
+    #[test]
+    fn unknown_or_already_removed_globals_do_not_trigger_discovery() {
+        let mut changes = RegistryChanges::default();
+        assert!(!changes.removed(999));
+        assert!(changes.added(15, &ObjectType::Node));
+        assert!(changes.removed(15));
+        assert!(!changes.removed(15));
+    }
 }
