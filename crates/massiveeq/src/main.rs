@@ -19,6 +19,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 use client::Client;
@@ -280,6 +281,18 @@ fn build_ui(app: &adw::Application) {
     profile_menu.set_child(Some(&profile_menu_label));
     profile_menu.set_always_show_arrow(true);
     profile_menu.set_popover(Some(&profile_popover));
+    // Open on the list: focusing the name entry would rename on the first keypress.
+    profile_popover.connect_show({
+        let list = profile_list.clone();
+        move |_| {
+            let list = list.clone();
+            gtk::glib::idle_add_local_once(move || {
+                if let Some(row) = list.selected_row() {
+                    row.grab_focus();
+                }
+            });
+        }
+    });
     profile_menu.add_css_class("preset-menu");
     profile_menu.update_property(&[gtk::accessible::Property::Label("Profiles")]);
     let header_add_profile = gtk::Button::from_icon_name("list-add-symbolic");
@@ -520,15 +533,34 @@ fn build_ui(app: &adw::Application) {
     graph.set_accessible_role(gtk::AccessibleRole::Group);
     graph.add_css_class("response-graph");
     graph.set_tooltip_text(Some(
-        "Click to add a band. Drag a band to move it; scroll over it for Q. Arrows edit the selected band; Shift+Up/Down edits Q; Escape closes its panel.",
+        "Double-click to add a band. Click a band to select it; drag to move it; scroll over it for Q. Arrows edit the selected band; Shift+Up/Down edits Q; Escape closes its panel.",
     ));
     graph.update_property(&[
         gtk::accessible::Property::Label("Frequency response graph"),
         gtk::accessible::Property::Description(
-            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Click empty graph space to add a filter. Use arrow keys to edit the selected filter; hold Shift for Q or larger frequency steps.",
+            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Double-click empty graph space to add a filter. Use arrow keys to edit the selected filter; hold Shift for Q or larger frequency steps.",
         ),
     ]);
     graph.set_vexpand(true);
+    // With filters or the engine off, dim the graph: what it shows is not what plays.
+    let dim_graph = {
+        let graph = graph.clone();
+        let device_bypass = device_bypass.clone();
+        let global_bypass = global_bypass.clone();
+        move || {
+            if device_bypass.is_active() && global_bypass.is_active() {
+                graph.remove_css_class("bypassed");
+            } else {
+                graph.add_css_class("bypassed");
+            }
+        }
+    };
+    dim_graph();
+    let dim_graph = Rc::new(dim_graph);
+    for button in [&device_bypass, &global_bypass] {
+        let dim_graph = dim_graph.clone();
+        button.connect_active_notify(move |_| dim_graph());
+    }
     let graph_overlay = gtk::Overlay::new();
     graph_overlay.add_css_class("graph-stage");
     graph_overlay.set_child(Some(&graph));
@@ -1922,8 +1954,12 @@ fn wire_actions(
 
     let tone_drag = Rc::new(Cell::new(None::<f64>));
     let drag_state: Rc<RefCell<Option<(usize, f64, f64)>>> = Rc::new(RefCell::new(None));
+    // Where and when empty graph space was last pressed: a second press there
+    // soon after is a double-click, which adds a band.
+    let empty_press = Rc::new(Cell::new(None::<(Instant, f64, f64)>));
     let gesture = gtk::GestureDrag::new();
     gesture.connect_drag_begin({
+        let empty_press = empty_press.clone();
         let tone_drag = tone_drag.clone();
         let model = model.clone();
         let state = drag_state.clone();
@@ -1984,6 +2020,23 @@ fn wire_actions(
                 }
             }
 
+            let double_click = gtk::Settings::default().map_or(400, |settings| {
+                settings.gtk_double_click_time().max(1) as u64
+            });
+            let now = Instant::now();
+            let is_double = empty_press.take().is_some_and(|(at, px, py)| {
+                now.duration_since(at) <= Duration::from_millis(double_click)
+                    && (px - x).hypot(py - y) <= 8.0
+            });
+            if !is_double {
+                // A single click on empty space deselects, as in plugin EQs.
+                empty_press.set(Some((now, x, y)));
+                if model.selected_filter.replace(None).is_some() {
+                    sync_band_ui(&model);
+                    graph.queue_draw();
+                }
+                return;
+            }
             let Some((frequency, gain_db)) = graph::values_at_position(x, y, width, height) else {
                 return;
             };
@@ -2439,7 +2492,8 @@ fn show_curve_details(
 fn update_curve_context(model: &Model, curves: massiveeq_core::Curves) {
     let full = curves.context_note();
     if let Some(label) = model.curve_context.borrow().as_ref() {
-        label.set_visible(curves.measurement.is_some() || curves.target.is_some());
+        // Most curves carry no context at all; only a real conflict is worth a line.
+        label.set_visible(full.contains("contexts differ"));
         label.set_text(if full.contains("contexts differ") {
             "Measurement and target contexts differ. See curve details."
         } else if full.contains("matching user-entered") {
@@ -3640,6 +3694,8 @@ fn build_band_editor(
     for ((button, name), filter_kind) in kind.buttons.iter().zip(BAND_KIND_NAMES).zip(BAND_KINDS) {
         button.set_child(Some(&glyph::widget(filter_kind, 26, 16)));
         button.set_tooltip_text(Some(name));
+        // The text label `with_label` pointed at is gone; name the glyph button directly.
+        button.reset_relation(gtk::AccessibleRelation::LabelledBy);
         button.update_property(&[gtk::accessible::Property::Label(name)]);
     }
     top.append(&kind.root);
@@ -3651,6 +3707,8 @@ fn build_band_editor(
         .zip(["Left ear", "Both ears", "Right ear"])
     {
         button.set_tooltip_text(Some(name));
+        button.reset_relation(gtk::AccessibleRelation::LabelledBy);
+        button.update_property(&[gtk::accessible::Property::Label(name)]);
     }
     top.append(&channels.root);
     let enabled = gtk::ToggleButton::new();
@@ -4031,7 +4089,7 @@ fn rebuild_filter_list(
         list.insert(&chip, -1);
     }
     if profile.filters.is_empty() && profile.graphic_eqs.is_empty() {
-        let empty = gtk::Label::new(Some("Click the graph to add a band"));
+        let empty = gtk::Label::new(Some("Double-click the graph to add a band"));
         empty.add_css_class("level-code");
         list.insert(&empty, -1);
     }
@@ -4918,7 +4976,7 @@ fn engine_tooltip(status: &serde_json::Value) -> String {
         None => String::new(),
     };
     format!(
-        "{rate}Click empty graph space to add a band, drag points to edit, or use arrows on the selected point"
+        "{rate}Double-click the graph to add a band, drag points to edit, or use arrows on the selected point"
     )
 }
 
@@ -5079,13 +5137,14 @@ fn install_css() {
 
         /* Preset popover */
         entry.preset-name {
+            font-family: monospace;
             background: transparent;
             border: none;
             border-bottom: 1px solid #2a2a2d;
             border-radius: 0;
             box-shadow: none;
-            font-size: 17px;
-            font-weight: 600;
+            font-size: 14px;
+            font-weight: 700;
             padding: 2px 0;
         }
 
@@ -5105,8 +5164,14 @@ fn install_css() {
         }
 
         list.profile-bank > row {
-            border-radius: 12px;
-            margin-bottom: 3px;
+            border-radius: 6px;
+            margin-bottom: 2px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+
+        .graph-stage .response-graph.bypassed {
+            opacity: 0.4;
         }
 
         list.profile-bank > row:hover {

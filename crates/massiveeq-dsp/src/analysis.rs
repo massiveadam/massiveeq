@@ -115,25 +115,68 @@ pub(crate) fn analyze_compiled(
     energy_frequencies.sort_by(f64::total_cmp);
     energy_frequencies.dedup_by(|left, right| (*left - *right).abs() < 1e-9);
 
-    let transfer = |channel_index: usize, frequency: f64| {
+    let equalizer = |channel_index: usize, frequency: f64| {
         let channel = &channels[channel_index];
         let mut response =
             Complex64::from_polar(10.0_f64.powf(source_preamps[channel_index] / 20.0), 0.0);
         for coefficients in &channel.biquads {
             response *= coefficients.transfer(frequency, sample_rate as f64);
         }
+        response
+    };
+    let transfer = |channel_index: usize, frequency: f64| {
+        let mut response = equalizer(channel_index, frequency);
         for fir in &firs[channel_index] {
             response *= fir.at(frequency);
         }
         response
     };
-    // What the graph shows: the output's own path.
-    let display = |channel_index: usize, frequency: f64| {
-        let path = paths
+    // The impulse responses on the graph's path: the channel's own, then the
+    // output's own speaker for a matrix IR.
+    let direct = |channel_index: usize| {
+        paths
             .as_ref()
             .and_then(|paths| paths[channel_index].direct.as_ref())
-            .map_or(Complex64::new(1.0, 0.0), |fir| fir.at(frequency));
-        transfer(channel_index, frequency) * path
+    };
+    let bin_width = |channel_index: usize| {
+        firs[channel_index]
+            .iter()
+            .chain(direct(channel_index))
+            .map(|fir| fir.sample_rate / fir.fft_len as f64)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let has_impulse =
+        |channel_index: usize| !firs[channel_index].is_empty() || direct(channel_index).is_some();
+    let impulse = |channel_index: usize, frequency: f64| {
+        let mut response =
+            direct(channel_index).map_or(Complex64::new(1.0, 0.0), |fir| fir.at(frequency));
+        for fir in &firs[channel_index] {
+            response *= fir.at(frequency);
+        }
+        response
+    };
+    // What the graph shows: the EQ exactly, times the impulse response's
+    // magnitude power-averaged over a sixth of an octave. Room and binaural
+    // IRs are dense combs; unsmoothed they bury the EQ curve.
+    let display = |channel_index: usize, frequency: f64| {
+        let equalizer = equalizer(channel_index, frequency).norm();
+        if !has_impulse(channel_index) {
+            return equalizer;
+        }
+        // Average every FFT bin in the window, so dense detail cannot alias.
+        let low = frequency * 2.0_f64.powf(-1.0 / 12.0);
+        let high = (frequency * 2.0_f64.powf(1.0 / 12.0)).min(sample_rate as f64 * 0.499);
+        let points = ((high - low) / bin_width(channel_index))
+            .ceil()
+            .clamp(8.0, 4096.0) as usize;
+        let power = (0..points)
+            .map(|step| {
+                let at = low + (high - low) * step as f64 / (points - 1) as f64;
+                impulse(channel_index, at).norm_sqr()
+            })
+            .sum::<f64>()
+            / points as f64;
+        equalizer * power.sqrt()
     };
     // Output power for uncorrelated unit-power stereo input.
     let power = |channel_index: usize, frequency: f64| {
@@ -231,7 +274,7 @@ pub(crate) fn analyze_compiled(
                     // transfer. Source preamp, perceptual match, correction,
                     // and safety attenuation belong to the separate preamp
                     // readout and must not vertically translate the curve.
-                    gain_db: linear_to_db(display(channel_index, *frequency).norm())
+                    gain_db: linear_to_db(display(channel_index, *frequency))
                         - source_preamps[channel_index],
                 })
                 .collect(),
