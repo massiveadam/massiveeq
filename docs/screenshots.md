@@ -1,9 +1,72 @@
 # MassiveEQ screenshot gallery
 
-These screenshots are captured from the current beta on Arch Linux with Niri,
-PipeWire, WirePlumber, GTK4/libadwaita, and Noctalia 4.7.7. Noctalia 5 uses the
-same control model through its native Luau UI; it was not started for these
-captures so the running desktop's shell and theme were left untouched.
+The editor screenshots come from the current beta in a headless Arch Linux
+session (sway, PipeWire, WirePlumber, GTK4/libadwaita) driving the real app.
+The headphone measurement, target, and impulse response are synthetic
+fixtures, not real measurements. The Noctalia and tray views were captured on
+a niri desktop with Noctalia 4.7.7.
+
+## Editor
+
+![Editor with a measurement, target range, EQ curve, and the selected band's panel](screenshots/editor-overview.png)
+
+The graph is the editor. Double-click to add a band, drag it for frequency and
+gain, and scroll over it for Q. The selected band's panel floats beside its
+node: low shelf, peak, or high shelf, the ears it applies to, frequency, gain,
+and Q knobs, an on/off switch, and delete. The footer lists every band, with
+the **Bass**, **Tilt**, and **Output** knobs beside them.
+
+## LISTEN: the tone finder
+
+![LISTEN with the sweep and signal menu open](screenshots/listen-tone-finder.png)
+
+**LISTEN** plays a sine or band of pink noise through the current EQ, and a
+marker follows it on the graph. The menu beside it holds the sweep, level,
+signal, ears, and one-click corrections at the held frequency.
+
+## A/B
+
+![A/B menu with the starting sound and profile comparison](screenshots/ab-comparison.png)
+
+**A/B** auditions the starting sound against the current edit and builds
+level-matched comparison banks of two to nine profiles, with an optional dry
+candidate.
+
+## Preset bank
+
+![Preset bank](screenshots/preset-bank.png)
+
+The profile name opens the bank: rename, switch, create, import, duplicate,
+export, delete, and flatten every band. ◀ and ▶ step through profiles.
+
+## Measurement and target curves
+
+![CURVES menu](screenshots/curves-menu.png)
+
+**CURVES** loads a headphone measurement and a target or target range, and
+records where each came from.
+
+## Impulse responses
+
+![IR menu with an impulse response loaded](screenshots/convolution-ir.png)
+
+**IR** loads a convolution file; parametric filters apply on top of it, per
+ear. The graph shows the impulse response smoothed to a sixth of an octave.
+
+## Text
+
+![Equalizer APO compatible text editor](screenshots/text-editor.png)
+
+**TEXT** (`Ctrl+E`) swaps the graph for the profile's Equalizer APO-style
+text. Both edit the same draft; invalid text stays visible while the last
+valid audio chain keeps playing.
+
+## Narrow windows
+
+![The editor at 760 pixels wide](screenshots/narrow-window.png)
+
+In narrow windows the output picker and controls move into the footer and the
+band chips scroll.
 
 ## Noctalia quick controls
 
@@ -18,40 +81,6 @@ per-output Filters switch, and compact frequency, gain, and Q controls.
 
 An active comparison bank appears directly in quick controls for immediate,
 level-matched switching without opening the editor.
-
-## Full editor overview
-
-![MassiveEQ full editor overview](screenshots/full-editor-overview.png)
-
-The full editor owns profile creation, output assignment, filter editing,
-comparison-bank setup, response visualization, and diagnostics.
-
-## Visual parametric editor
-
-![Visual parametric filter editor](screenshots/parametric-visual-editor.png)
-
-Visual filter cards and the response graph edit the same live profile.
-
-## Equalizer APO text editor
-
-![Equalizer APO compatible text editor](screenshots/text-profile-editor.png)
-
-The text view supports MassiveEQ's Equalizer APO-compatible profile format and
-keeps invalid drafts visible while the last valid audio chain continues.
-
-## Convolution editor
-
-![Convolution impulse-response editor](screenshots/convolution-editor.png)
-
-The convolution page selects a portable impulse-response file and output
-channel. Parametric filters and GraphicEQ apply on top of it.
-
-## Level-matched comparison
-
-![Level-matched profile comparison controls](screenshots/comparison-bank.png)
-
-Comparison banks switch between two to nine profiles, with an optional
-level-matched dry candidate.
 
 ## Generic tray fallback
 

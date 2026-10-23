@@ -7,6 +7,14 @@ places PipeWire smart filters in front of assigned output devices.
 **Recommended installation:** `yay -S massiveeq-git` ·
 [View the AUR package](https://aur.archlinux.org/packages/massiveeq-git)
 
+<p align="center">
+  <a href="docs/screenshots/editor-overview.png">
+    <img src="docs/screenshots/editor-overview.png" alt="MassiveEQ editor: a headphone measurement, target range, and EQ curve on the graph, with the selected band's panel floating beside its node" width="100%">
+  </a>
+  <br>
+  <em>The graph is the editor: drag bands, edit the selected one beside its node, and see the corrected measurement against the target.</em>
+</p>
+
 > [!WARNING]
 > **Beta 2 software:** MassiveEQ is ready for testing, but its audio routing and
 > profile format may still change. Keep an easy way to select the original
@@ -33,59 +41,89 @@ support contract.
 
 ## Current features
 
-- Squiglink, AutoEQ, and common Equalizer APO text profile import
-- Parametric EQ, per-ear filters, GraphicEQ, preamp, includes, and convolution
-- Tone finder: sweep a sine or band of pink noise through the current EQ and
-  fix peaks and dips on your own ears with one click
+**A plugin-style editor**
+
+- The graph is the editor, as in Pro-Q and other audio plugins: double-click
+  to add a band, drag it for frequency and gain, scroll over it for Q
+- Low shelf, peak, and high shelf bands, as on Squiglink, each drawn as its
+  curve shape; the selected band's knobs float beside its node
+- Per-ear bands (left, both, right), on/off per band, and undo/redo
+- **Bass**, **Tilt**, and **Output** knobs that write ordinary shelf filters
+  and trim
+- A synchronized Equalizer APO text view (**TEXT**, `Ctrl+E`) with live
+  validation
+- Resizes down to narrow windows; controls fold into the footer
+
+**Listening and comparing**
+
+- **LISTEN**: sweep a sine or band of pink noise through the current EQ and
+  cut or boost what jumps out, by ear
+- **A/B**: audition the starting sound against your edit, or level-matched
+  comparison banks of 2–9 profiles plus dry playback
 - Headphone measurement and target (or target-range) curves behind the EQ,
-  showing the measurement as corrected by the current filters
-- A readout of whether playing audio is resampled, and how to avoid it
+  with the measurement shown as corrected by the current filters
+- Per-output **FILTERS** bypass; the graph dims while you hear unprocessed audio
+
+**Profiles and routing**
+
+- Squiglink, AutoEQ, and common Equalizer APO text profile import
+- Parametric EQ, GraphicEQ, preamp, includes, and convolution
 - Optional true-stereo (4-channel) and 7.1 virtual-surround (14-channel
-  HeSuVi) convolution for speaker and room simulation on headphones
+  HeSuVi) convolution for speaker and room simulation on headphones; the
+  graph shows impulse responses smoothed to a sixth of an octave
 - Automatic profile assignment using stable Bluetooth and ALSA identifiers
 - Unlimited saved profiles with per-output assignment or an explicit unassigned state
-- Per-output comparison banks for 2–9 profiles plus level-matched dry playback
 - Multiple simultaneous output devices, bypass, headroom, and level analysis
+- A readout of whether playing audio is resampled, and how to avoid it
+
+**Engine**
+
 - Native 32-bit floating-point DSP with allocation-free live processing
 - Eight-millisecond click-safe chain changes without removing the audio endpoint
 - Rate-aware compilation, high-quality IR resampling, and reported latency
 - Wayland-native GTK4 interface and systemd user service
-- Synchronized visual and Equalizer APO text editors with live validation
-- Direct graph editing with click-to-add, dragging, and precise keyboard controls
-- Responsive per-output and per-band filter switches for fast A/B listening
 - Optional StatusNotifier tray controls for Noctalia, Waybar, KDE Plasma, and other compatible bars
 - Optional native Noctalia 4 and 5 quick-controls panels anchored to the bar
 
 ## Screenshots
 
-<p align="center">
-  <a href="docs/screenshots/full-editor-overview.png">
-    <img src="docs/screenshots/full-editor-overview.png" alt="MassiveEQ full editor with the Noctalia quick-controls panel" width="100%">
-  </a>
-  <br>
-  <em>Full parametric editor and the optional Noctalia quick-controls panel</em>
-</p>
-
 <table>
   <tr>
     <td width="50%">
-      <a href="docs/screenshots/comparison-bank.png">
-        <img src="docs/screenshots/comparison-bank.png" alt="Level-matched profile comparison in MassiveEQ" width="100%">
+      <a href="docs/screenshots/listen-tone-finder.png">
+        <img src="docs/screenshots/listen-tone-finder.png" alt="LISTEN tone finder with its sweep and signal menu open and a tone marker on the graph" width="100%">
       </a>
     </td>
     <td width="50%">
-      <a href="docs/screenshots/convolution-editor.png">
-        <img src="docs/screenshots/convolution-editor.png" alt="MassiveEQ convolution impulse-response editor" width="100%">
+      <a href="docs/screenshots/ab-comparison.png">
+        <img src="docs/screenshots/ab-comparison.png" alt="A/B menu with the starting-sound audition and level-matched profile comparison" width="100%">
       </a>
     </td>
   </tr>
   <tr>
-    <td align="center"><em>Level-matched profile comparison</em></td>
-    <td align="center"><em>Convolution impulse-response editor</em></td>
+    <td align="center"><em>LISTEN: tune by ear with a sweep or tone</em></td>
+    <td align="center"><em>A/B: starting sound and level-matched banks</em></td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <a href="docs/screenshots/convolution-ir.png">
+        <img src="docs/screenshots/convolution-ir.png" alt="IR menu with a loaded impulse response, its smoothed response on the graph" width="100%">
+      </a>
+    </td>
+    <td width="50%">
+      <a href="docs/screenshots/preset-bank.png">
+        <img src="docs/screenshots/preset-bank.png" alt="Preset bank listing saved profiles and which output each plays on" width="100%">
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><em>IR: convolution with EQ on top</em></td>
+    <td align="center"><em>The preset bank</em></td>
   </tr>
 </table>
 
-More views are available in the [complete screenshot gallery](docs/screenshots.md).
+More views, including the text editor, curves, narrow windows, and the
+Noctalia panel, are in the [screenshot gallery](docs/screenshots.md).
 
 ## Install
 
@@ -141,6 +179,12 @@ When one is available, a compact **Update** button appears in the header and
 offers to copy the recommended `yay -S massiveeq-git` command or open the AUR
 package page. The app never runs an AUR helper or requests administrator
 privileges by itself.
+
+If an update installs but the old interface still opens, an earlier manual
+install is probably shadowing the package. `which -a massiveeq massiveeqd`
+should list only `/usr/bin`; move aside any copies in `~/.local/bin` and any
+`massiveeq*.service` files in `~/.config/systemd/user`, then run
+`systemctl --user daemon-reload` and `systemctl --user restart massiveeq`.
 
 ## Build from source
 
@@ -228,19 +272,23 @@ multichannel devices are never intercepted.
 
 ## Editing bands
 
-The graph is the editor, as in plugin EQs. Click empty space to add a band
-and drag a band's node to set its frequency and gain; scroll over it to
-change Q. The selected band opens a panel beside its node: the filter type,
+The graph is the editor, as in plugin EQs. Double-click empty space to add a
+band and drag a band's node to set its frequency and gain; scroll over it to
+change Q. A single click on empty space closes the band panel. The selected band opens a panel beside its node: the filter type,
 drawn as its curve shape (low shelf, peak, or high shelf, as on Squiglink),
 left/both/right ears, frequency, gain, and Q knobs, an on/off switch, and
 delete. Knobs follow the mouse vertically (Shift is finer), take the mouse
 wheel and arrow keys, and reset on double-click. Escape closes the panel. The
 chips along the footer list every band and select it; **＋** adds one.
+Profiles with other filter types (high-pass, notch, and so on) still load and
+play; their bands show their type and can be switched to one of the three.
 
 The header holds the profile bank (◀ ▾ ▶), undo and redo, **A/B**, the
 output picker with its assign action, and the engine switch. The footer
 holds **FILTERS**, **LISTEN**, the bands, the **Bass**, **Tilt**, and
-**Output** knobs, and **TEXT**, **IR**, and **CURVES**.
+**Output** knobs, and **TEXT**, **IR**, and **CURVES**. While **FILTERS** or
+the engine is off, the graph dims: it shows the EQ you would hear, not what
+is playing.
 
 ## Tuning by ear: the tone finder
 
@@ -249,12 +297,14 @@ selected output's current EQ: a sine, or pink noise across the full range,
 one octave, or a third of an octave around the chosen frequency, to the left
 ear, right ear, or both; the menu beside it chooses which, and holds the
 sweep. Sweep the frequency (a marker follows on the graph)
-and listen for spots that jump out or vanish. **Cut** or **Boost** by 1 or
-3 dB adds a peak filter there, as wide as what you were hearing, or adjusts
+and listen for spots that jump out or vanish. **−3**, **−1**, **+1**, or
+**+3 dB** adds a peak filter there, as wide as what you were hearing, or adjusts
 the filter already within a twelfth of an octave. Every signal plays at the
 same RMS level, capped at −12 dBFS; start quiet. The tone stops when you
 turn LISTEN off, open the text editor, close the window, or within five
-seconds if the editor goes away.
+seconds if the editor goes away. [Listening workflow and implementation
+notes](docs/listening-workflow.md) describe the controls and credit the
+research that informed them.
 
 ## Measurement and target curves
 
@@ -350,6 +400,10 @@ programme takes; full-scale content on every surround channel at once can
 still exceed them. Matrix routes use uniformly partitioned convolution sized
 to the PipeWire quantum, which keeps per-callback cost steady.
 
+On the graph, an impulse response's contribution is power-averaged over a
+sixth of an octave, as measurement tools show room responses; EQ bands are
+drawn exactly. Headroom and level matching use the unsmoothed response.
+
 A profile can combine an impulse response with parametric filters and
 GraphicEQ: the EQ applies on top, per ear (for a multichannel IR, after its
 speakers are folded into the two ears), so a room or speaker IR and headphone
@@ -370,9 +424,3 @@ PipeWire is allowed only one rate, which `default.clock.allowed-rates` fixes.
 specific PipeWire sink and reports buffer and processing statistics. The D-Bus
 `Status` method reports active rates, latency, CPU deadline use, buffer health,
 and any candidate activation error.
-
-### Tune while listening
-
-The response graph includes a sine sweep, a draggable tone cursor, and small corrections at the frequency you are hearing. Live EQ previews run independently of profile saving. Bass and tilt controls create normal shelf filters, with undo/redo and a level-matched comparison against your starting sound.
-
-Imported measurement and target curves can include source, fixture, and compensation details. The corrected overlay is a prediction, and target ranges are optional references. [Listening workflow and implementation notes](docs/listening-workflow.md) describe the controls and credit the research that informed their use.

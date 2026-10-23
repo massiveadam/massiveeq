@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+
+- Double-click empty graph space to add a band; a single click there now
+  closes the band panel instead of adding a stray band.
+- Dim the graph while an output's Filters or the engine is off.
+- Draw impulse responses on the graph smoothed to a sixth of an octave, so a
+  room or binaural IR no longer buries the EQ curve. Headroom and level
+  matching still use the exact response.
+- Open the preset menu on the profile list rather than the selected name,
+  so a stray keypress cannot rename the profile.
+- Show the curve-context note only when measurement and target contexts
+  conflict.
+
 ### Added
 
 - Add `massiveeqctl` for versioned JSON status, live D-Bus change streaming,
@@ -54,6 +67,11 @@
 
 ### Fixed
 
+- Keep band numbers stable when a band is set to one ear: profile text now
+  keeps bands in order and switches `Channel:` as needed, so the graph, band
+  chips, and text no longer disagree and the band panel opens on the right
+  node.
+- Name the filter-type and ear buttons for screen readers.
 - Apply the narrow (under 720 px) layout. It never took effect because the
   wider route breakpoint, added later, always won; narrow windows were
   clipped on the right instead of reflowing.

@@ -515,6 +515,31 @@ mod tests {
     }
 
     #[test]
+    fn graph_smooths_an_impulse_response_comb() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("assets")).unwrap();
+        // A direct sound and a half-level echo 5 ms later: a comb rippling
+        // between +3.5 and -6 dB every 200 Hz, with mean power +0.97 dB.
+        let mut impulse = vec![0.0_f32; 241];
+        impulse[0] = 1.0;
+        impulse[240] = 0.5;
+        write_float_wav(&temp.path().join("assets/room.wav"), 48_000, 1, &impulse);
+        let profile = parse_text("test", "Convolution: assets/room.wav");
+        let compiled =
+            compile_profile(&profile, &CompileOptions::stereo(48_000, 64, temp.path())).unwrap();
+        for point in &compiled.analysis.channels[0].response {
+            if (3_000.0..15_000.0).contains(&point.frequency) {
+                assert!(
+                    (point.gain_db - 0.97).abs() < 1.0,
+                    "{} Hz: {} dB",
+                    point.frequency,
+                    point.gain_db
+                );
+            }
+        }
+    }
+
+    #[test]
     fn narrow_high_gain_filter_still_receives_safety_attenuation() {
         let profile = parse_text("test", "Filter: ON PK Fc 1000 Hz Gain 60 dB Q 1000");
         let compiled =

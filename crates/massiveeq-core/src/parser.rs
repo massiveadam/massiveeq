@@ -436,60 +436,51 @@ fn enforce_limits(profile: &mut ProfileDocument) {
 }
 
 pub fn serialize_profile(profile: &ProfileDocument) -> String {
+    // Filters keep their document order, so band numbers in the editor, the
+    // graph, and this text agree; a Channel: line is written whenever the
+    // channel changes.
     let mut out = format!("# MassiveEQ profile: {}\n", profile.name);
-    for channel in [
-        ChannelSelection::All,
-        ChannelSelection::Left,
-        ChannelSelection::Right,
-    ] {
-        let channel_name = match channel {
-            ChannelSelection::All => "ALL",
-            ChannelSelection::Left => "L",
-            ChannelSelection::Right => "R",
-        };
-        let has_content = profile.preamps.iter().any(|v| v.channels == channel)
-            || profile.filters.iter().any(|v| v.channels == channel)
-            || profile.graphic_eqs.iter().any(|v| v.channels == channel)
-            || profile.convolutions.iter().any(|v| v.channels == channel);
-        if !has_content {
-            continue;
+    let mut current = None;
+    let mut switch = |out: &mut String, channel: ChannelSelection| {
+        if current != Some(channel) {
+            current = Some(channel);
+            let name = match channel {
+                ChannelSelection::All => "ALL",
+                ChannelSelection::Left => "L",
+                ChannelSelection::Right => "R",
+            };
+            out.push_str(&format!("\nChannel: {name}\n"));
         }
-        out.push_str(&format!("\nChannel: {channel_name}\n"));
-        for gain in profile.preamps.iter().filter(|v| v.channels == channel) {
-            out.push_str(&format!("Preamp: {:.2} dB\n", gain.gain_db));
-        }
-        for (index, filter) in profile
-            .filters
+    };
+    for gain in &profile.preamps {
+        switch(&mut out, gain.channels);
+        out.push_str(&format!("Preamp: {:.2} dB\n", gain.gain_db));
+    }
+    for (index, filter) in profile.filters.iter().enumerate() {
+        switch(&mut out, filter.channels);
+        out.push_str(&format!(
+            "Filter {}: {} {} Fc {:.2} Hz Gain {:.2} dB Q {:.4}\n",
+            index + 1,
+            if filter.enabled { "ON" } else { "OFF" },
+            filter.kind.apo_name(),
+            filter.frequency,
+            filter.gain_db,
+            filter.q
+        ));
+    }
+    for eq in &profile.graphic_eqs {
+        switch(&mut out, eq.channels);
+        let points = eq
+            .points
             .iter()
-            .filter(|v| v.channels == channel)
-            .enumerate()
-        {
-            out.push_str(&format!(
-                "Filter {}: {} {} Fc {:.2} Hz Gain {:.2} dB Q {:.4}\n",
-                index + 1,
-                if filter.enabled { "ON" } else { "OFF" },
-                filter.kind.apo_name(),
-                filter.frequency,
-                filter.gain_db,
-                filter.q
-            ));
-        }
-        for eq in profile.graphic_eqs.iter().filter(|v| v.channels == channel) {
-            let points = eq
-                .points
-                .iter()
-                .map(|p| format!("{:.2} {:.2}", p.frequency, p.gain_db))
-                .collect::<Vec<_>>()
-                .join("; ");
-            out.push_str(&format!("GraphicEQ: {points}\n"));
-        }
-        for convolution in profile
-            .convolutions
-            .iter()
-            .filter(|v| v.channels == channel)
-        {
-            out.push_str(&format!("Convolution: {}\n", convolution.path.display()));
-        }
+            .map(|p| format!("{:.2} {:.2}", p.frequency, p.gain_db))
+            .collect::<Vec<_>>()
+            .join("; ");
+        out.push_str(&format!("GraphicEQ: {points}\n"));
+    }
+    for convolution in &profile.convolutions {
+        switch(&mut out, convolution.channels);
+        out.push_str(&format!("Convolution: {}\n", convolution.path.display()));
     }
     out
 }
@@ -516,6 +507,21 @@ Filter 3: OFF HSC Fc 8000 Hz Gain -1.5 dB Q 0.8
         assert_eq!(profile.preamp_for(Channel::Left), -6.8);
         assert_eq!(profile.filters_for(Channel::Left).count(), 2);
         assert_eq!(profile.filters_for(Channel::Right).count(), 2);
+    }
+
+    #[test]
+    fn serializing_keeps_band_order_across_channels() {
+        let profile = parse_text(
+            "fixture",
+            "Preamp: -3 dB\nFilter 1: ON LSC Fc 105 Hz Gain 4 dB Q 0.7\nChannel: L\n\
+             Filter 2: ON PK Fc 220 Hz Gain -2 dB Q 1.2\nChannel: ALL\n\
+             Filter 3: ON PK Fc 1450 Hz Gain 1.5 dB Q 1.8",
+        );
+        let round = parse_text("fixture", &serialize_profile(&profile));
+        assert!(round.is_activatable(), "{:?}", round.diagnostics);
+        assert_eq!(round.filters, profile.filters);
+        assert_eq!(round.preamp_for(Channel::Left), -3.0);
+        assert_eq!(round.preamp_for(Channel::Right), -3.0);
     }
 
     #[test]
