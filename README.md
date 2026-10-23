@@ -278,7 +278,12 @@ change Q. A single click on empty space closes the band panel. The selected band
 drawn as its curve shape (low shelf, peak, or high shelf, as on Squiglink),
 left/both/right ears, frequency, gain, and Q knobs, an on/off switch, and
 delete. Knobs follow the mouse vertically (Shift is finer), take the mouse
-wheel and arrow keys, and reset on double-click. Escape closes the panel. The
+wheel, and reset on double-click; the panel holds still while you work in it.
+Escape closes the panel.
+
+With a band selected, **Up**/**Down** change its gain by 0.1 dB and
+**Shift+Up**/**Down** by 1 dB; **Left**/**Right** move its frequency and
+**Shift+Left**/**Right** change its Q. Hold a key to go faster. The
 chips along the footer list every band and select it; **＋** adds one.
 Profiles with other filter types (high-pass, notch, and so on) still load and
 play; their bands show their type and can be switched to one of the three.

@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Arrow keys on the selected band: Up/Down change gain by 0.1 dB, Shift+Up/Down
+  by 1 dB, Left/Right move frequency, and Shift+Left/Right change Q. Held keys
+  speed up. Clicking a band chip or a panel knob keeps these keys on the band.
 - Double-click empty graph space to add a band; a single click there now
   closes the band panel instead of adding a stray band.
 - Dim the graph while an output's Filters or the engine is off.
@@ -67,6 +70,10 @@
 
 ### Fixed
 
+- Dragging a band knob quickly no longer glitches: the panel moved with its
+  node under the pointer and fed that movement back into the knob. The panel
+  now holds still while the pointer is on it or a knob is dragged, and knob
+  travel is measured in window coordinates.
 - Keep band numbers stable when a band is set to one ear: profile text now
   keeps bands in order and switches `Channel:` as needed, so the graph, band
   chips, and text no longer disagree and the band panel opens on the right
