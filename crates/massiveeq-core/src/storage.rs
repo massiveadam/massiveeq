@@ -367,7 +367,9 @@ impl Storage {
     }
 
     /// Save (or with `None`, remove) a measurement or target curve shown
-    /// behind this profile's EQ. Returns the profile's curves afterwards.
+    /// behind this profile's EQ. Replacing a curve also clears its provenance
+    /// metadata, since it was declared for the old data. Returns the
+    /// profile's curves afterwards.
     pub fn set_curve(
         &self,
         library: &Library,
@@ -385,26 +387,71 @@ impl Storage {
                 let text = fs::read_to_string(source)?;
                 crate::parse_curve(&text, kind).map_err(StorageError::InvalidProfile)?;
                 fs::create_dir_all(&directory)?;
+                let sidecar = directory.join(kind.metadata_file_name());
+                if sidecar.exists() {
+                    fs::remove_file(sidecar)?;
+                }
                 atomic_write(&destination, text.as_bytes())?;
             }
             None => {
                 if destination.exists() {
                     fs::remove_file(&destination)?;
                 }
+                let sidecar = directory.join(kind.metadata_file_name());
+                if sidecar.exists() {
+                    fs::remove_file(sidecar)?;
+                }
             }
         }
         Ok(self.curves(id))
     }
 
-    /// The curves saved with a profile; unreadable files are left out.
+    /// Replace the user-declared provenance of an existing curve. The curve
+    /// must already be stored; metadata for a missing curve would be
+    /// orphaned. Strings are trimmed and length-limited before saving.
+    pub fn set_curve_metadata(
+        &self,
+        library: &Library,
+        id: &str,
+        kind: crate::CurveKind,
+        metadata: crate::CurveMetadata,
+    ) -> Result<crate::Curves, StorageError> {
+        if !library.profiles.contains_key(id) {
+            return Err(StorageError::MissingProfile(id.into()));
+        }
+        let directory = self.profile_dir(id).join("curves");
+        if !directory.join(kind.file_name()).exists() {
+            return Err(StorageError::InvalidProfile(format!(
+                "no {kind:?} curve is stored for this profile"
+            )));
+        }
+        let metadata = validate_curve_metadata(metadata)?;
+        atomic_write(
+            &directory.join(kind.metadata_file_name()),
+            &serde_json::to_vec_pretty(&metadata)?,
+        )?;
+        Ok(self.curves(id))
+    }
+
+    /// The curves saved with a profile; unreadable files are left out. A
+    /// missing or malformed metadata sidecar never hides a valid curve.
     pub fn curves(&self, id: &str) -> crate::Curves {
+        let directory = self.profile_dir(id).join("curves");
         let read = |kind: crate::CurveKind| {
-            let path = self.profile_dir(id).join("curves").join(kind.file_name());
-            crate::parse_curve(&fs::read_to_string(path).ok()?, kind).ok()
+            crate::parse_curve(
+                &fs::read_to_string(directory.join(kind.file_name())).ok()?,
+                kind,
+            )
+            .ok()
+        };
+        let read_metadata = |kind: crate::CurveKind| {
+            serde_json::from_slice(&fs::read(directory.join(kind.metadata_file_name())).ok()?).ok()
         };
         crate::Curves {
             measurement: read(crate::CurveKind::Measurement),
             target: read(crate::CurveKind::Target),
+            measurement_metadata: read_metadata(crate::CurveKind::Measurement),
+            target_metadata: read_metadata(crate::CurveKind::Target),
         }
     }
 
@@ -507,6 +554,34 @@ impl Storage {
     }
 }
 
+const MAX_METADATA_SOURCE_LEN: usize = 2048;
+const MAX_METADATA_FIELD_LEN: usize = 256;
+
+/// Trim metadata strings and enforce their length bounds.
+fn validate_curve_metadata(
+    metadata: crate::CurveMetadata,
+) -> Result<crate::CurveMetadata, StorageError> {
+    let metadata = crate::CurveMetadata {
+        source: metadata.source.trim().to_owned(),
+        fixture: metadata.fixture.trim().to_owned(),
+        baseline: metadata.baseline.trim().to_owned(),
+        ..metadata
+    };
+    let check = |field: &str, value: &str, limit: usize| {
+        if value.chars().count() > limit {
+            Err(StorageError::InvalidProfile(format!(
+                "curve metadata {field} is limited to {limit} characters"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    check("source", &metadata.source, MAX_METADATA_SOURCE_LEN)?;
+    check("fixture", &metadata.fixture, MAX_METADATA_FIELD_LEN)?;
+    check("baseline", &metadata.baseline, MAX_METADATA_FIELD_LEN)?;
+    Ok(metadata)
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -586,6 +661,242 @@ mod tests {
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_test_curve_source(path: &Path) {
+        let text = (0..30)
+            .map(|i| format!("{},{}\n", 20 * (i + 1) * (i + 1), i))
+            .collect::<String>();
+        std::fs::write(path, format!("frequency,raw\n{text}")).unwrap();
+    }
+
+    fn declared_metadata() -> crate::CurveMetadata {
+        crate::CurveMetadata {
+            source: "  AutoEq export  ".into(),
+            fixture: "B&K 5128".into(),
+            compensation: crate::CurveCompensation::DiffuseField,
+            baseline: "Harman 2018".into(),
+            transducer: crate::CurveTransducer::OverEar,
+        }
+    }
+
+    #[test]
+    fn curve_metadata_roundtrips_and_is_trimmed() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "HD 650").unwrap();
+        let source = temp.path().join("hd650.csv");
+        write_test_curve_source(&source);
+        storage
+            .set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                Some(&source),
+            )
+            .unwrap();
+
+        let curves = storage
+            .set_curve_metadata(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                declared_metadata(),
+            )
+            .unwrap();
+        let metadata = curves.measurement_metadata.unwrap();
+        assert_eq!(metadata.source, "AutoEq export");
+        assert_eq!(
+            metadata.compensation,
+            crate::CurveCompensation::DiffuseField
+        );
+        assert_eq!(metadata.transducer, crate::CurveTransducer::OverEar);
+
+        let reloaded = storage.curves(&profile.id);
+        assert_eq!(reloaded.measurement_metadata, Some(metadata));
+        assert!(reloaded.target_metadata.is_none());
+    }
+
+    #[test]
+    fn curves_without_metadata_sidecars_stay_loadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "HD 650").unwrap();
+        let source = temp.path().join("hd650.csv");
+        write_test_curve_source(&source);
+        let curves = storage
+            .set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                Some(&source),
+            )
+            .unwrap();
+        assert!(curves.measurement.is_some());
+        assert!(curves.measurement_metadata.is_none());
+    }
+
+    #[test]
+    fn malformed_metadata_sidecar_does_not_hide_the_curve() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "HD 650").unwrap();
+        let source = temp.path().join("hd650.csv");
+        write_test_curve_source(&source);
+        storage
+            .set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                Some(&source),
+            )
+            .unwrap();
+        std::fs::write(
+            storage
+                .profile_dir(&profile.id)
+                .join("curves")
+                .join(crate::CurveKind::Measurement.metadata_file_name()),
+            "{ not valid json",
+        )
+        .unwrap();
+        let curves = storage.curves(&profile.id);
+        assert_eq!(curves.measurement.unwrap().len(), 30);
+        assert!(curves.measurement_metadata.is_none());
+    }
+
+    #[test]
+    fn replacing_or_removing_a_curve_clears_its_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "HD 650").unwrap();
+        let source = temp.path().join("hd650.csv");
+        write_test_curve_source(&source);
+        storage
+            .set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                Some(&source),
+            )
+            .unwrap();
+        storage
+            .set_curve_metadata(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                declared_metadata(),
+            )
+            .unwrap();
+        let sidecar = storage
+            .profile_dir(&profile.id)
+            .join("curves")
+            .join(crate::CurveKind::Measurement.metadata_file_name());
+        assert!(sidecar.exists());
+
+        // Replacing the curve drops the old provenance.
+        let replacement = temp.path().join("other.csv");
+        write_test_curve_source(&replacement);
+        let curves = storage
+            .set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                Some(&replacement),
+            )
+            .unwrap();
+        assert!(curves.measurement.is_some());
+        assert!(curves.measurement_metadata.is_none());
+        assert!(!sidecar.exists());
+
+        // Removing the curve removes the sidecar too.
+        storage
+            .set_curve_metadata(
+                &library,
+                &profile.id,
+                crate::CurveKind::Measurement,
+                declared_metadata(),
+            )
+            .unwrap();
+        assert!(sidecar.exists());
+        let curves = storage
+            .set_curve(&library, &profile.id, crate::CurveKind::Measurement, None)
+            .unwrap();
+        assert!(curves.measurement.is_none());
+        assert!(curves.measurement_metadata.is_none());
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn curve_metadata_requires_a_known_profile_an_existing_curve_and_bounded_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "HD 650").unwrap();
+
+        assert!(matches!(
+            storage.set_curve_metadata(
+                &library,
+                "no-such-profile",
+                crate::CurveKind::Measurement,
+                declared_metadata()
+            ),
+            Err(StorageError::MissingProfile(_))
+        ));
+        // No curve stored yet.
+        assert!(matches!(
+            storage.set_curve_metadata(
+                &library,
+                &profile.id,
+                crate::CurveKind::Target,
+                declared_metadata()
+            ),
+            Err(StorageError::InvalidProfile(_))
+        ));
+
+        let source = temp.path().join("hd650.csv");
+        write_test_curve_source(&source);
+        storage
+            .set_curve(
+                &library,
+                &profile.id,
+                crate::CurveKind::Target,
+                Some(&source),
+            )
+            .unwrap();
+        let mut long_source = declared_metadata();
+        long_source.source = "x".repeat(2049);
+        assert!(matches!(
+            storage.set_curve_metadata(
+                &library,
+                &profile.id,
+                crate::CurveKind::Target,
+                long_source
+            ),
+            Err(StorageError::InvalidProfile(_))
+        ));
+        let mut long_fixture = declared_metadata();
+        long_fixture.fixture = "y".repeat(257);
+        assert!(matches!(
+            storage.set_curve_metadata(
+                &library,
+                &profile.id,
+                crate::CurveKind::Target,
+                long_fixture
+            ),
+            Err(StorageError::InvalidProfile(_))
+        ));
+        // Bounds are inclusive.
+        let mut at_bounds = declared_metadata();
+        at_bounds.source = "x".repeat(2048);
+        at_bounds.fixture = "y".repeat(256);
+        at_bounds.baseline = "z".repeat(256);
+        storage
+            .set_curve_metadata(&library, &profile.id, crate::CurveKind::Target, at_bounds)
+            .unwrap();
     }
 
     #[test]

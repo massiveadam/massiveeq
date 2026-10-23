@@ -3,6 +3,8 @@ mod audio_engine;
 mod device;
 mod device_monitor;
 mod filter_host;
+mod latest_processor;
+mod live_edit;
 mod native_filter;
 mod tone;
 
@@ -26,6 +28,7 @@ pub struct AppState {
     host: FilterHost,
     /// Test tone for the editor's tone finder, renewed while it is open.
     tone: Option<tone::Tone>,
+    live_edits: live_edit::Sessions,
 }
 
 pub async fn refresh_locked(state: &mut AppState, force_restart: bool) -> Result<()> {
@@ -37,7 +40,13 @@ pub async fn refresh_locked(state: &mut AppState, force_restart: bool) -> Result
     }
     state
         .host
-        .reconcile(&state.storage, &state.library, &devices, force_restart)
+        .reconcile(
+            &state.storage,
+            &state.library,
+            &devices,
+            force_restart,
+            &state.live_edits,
+        )
         .await?;
     state.devices = devices;
     Ok(())
@@ -90,6 +99,7 @@ async fn main() -> Result<()> {
         devices: Vec::new(),
         graph: device::GraphInfo::default(),
         tone: None,
+        live_edits: live_edit::Sessions::new(),
         host,
     }));
     // Own the control name before creating any PipeWire filters. A second
@@ -142,6 +152,23 @@ async fn main() -> Result<()> {
         loop {
             timer.tick().await;
             let mut guard = tone_state.lock().await;
+            let before = guard.live_edits.len();
+            guard
+                .live_edits
+                .retain(|_, edit| !edit.expired(std::time::Instant::now()));
+            if before != guard.live_edits.len() {
+                let AppState {
+                    storage,
+                    library,
+                    host,
+                    devices,
+                    live_edits,
+                    ..
+                } = &mut *guard;
+                let _ = host
+                    .reconcile(storage, library, devices, false, live_edits)
+                    .await;
+            }
             if guard.tone.as_ref().is_some_and(tone::Tone::expired)
                 && let Some(tone) = guard.tone.take()
             {

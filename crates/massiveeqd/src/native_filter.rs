@@ -1,4 +1,4 @@
-use crate::audio_engine::AudioEngine;
+use crate::{audio_engine::AudioEngine, latest_processor::LatestProcessor};
 use anyhow::{Context, Result};
 use massiveeq_core::DeviceInfo;
 use massiveeq_dsp::ProfileProcessor;
@@ -28,7 +28,7 @@ pub struct NativeStats {
 }
 
 pub struct NativeFilter {
-    updates: Producer<Box<ProfileProcessor>>,
+    updates: Arc<LatestProcessor>,
     retired: Consumer<Box<ProfileProcessor>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<()>>>,
@@ -44,7 +44,8 @@ impl NativeFilter {
         quantum: u32,
         latency_frames: u32,
     ) -> Result<Self> {
-        let (updates, update_consumer) = RingBuffer::new(2);
+        let updates = Arc::new(LatestProcessor::default());
+        let update_consumer = updates.clone();
         let (retire_producer, retired) = RingBuffer::new(4);
         let audio_capacity = quantum as usize * device.channels as usize * 16;
         let (audio_producer, audio_consumer) = RingBuffer::new(audio_capacity.max(1024));
@@ -99,9 +100,8 @@ impl NativeFilter {
 
     pub fn update(&mut self, processor: Box<ProfileProcessor>) -> Result<()> {
         self.reap();
-        self.updates
-            .push(processor)
-            .map_err(|_| anyhow::anyhow!("a previous DSP update is still pending"))
+        self.updates.publish(processor);
+        Ok(())
     }
 
     pub fn reap(&mut self) {
@@ -125,6 +125,9 @@ impl NativeFilter {
 impl Drop for NativeFilter {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -132,7 +135,7 @@ impl Drop for NativeFilter {
 fn run_filter_pair(
     device: &DeviceInfo,
     initial: Box<ProfileProcessor>,
-    updates: Consumer<Box<ProfileProcessor>>,
+    updates: Arc<LatestProcessor>,
     retired: Producer<Box<ProfileProcessor>>,
     mut audio_producer: Producer<f32>,
     mut audio_consumer: Consumer<f32>,

@@ -352,3 +352,9 @@ PipeWire is allowed only one rate, which `default.clock.allowed-rates` fixes.
 specific PipeWire sink and reports buffer and processing statistics. The D-Bus
 `Status` method reports active rates, latency, CPU deadline use, buffer health,
 and any candidate activation error.
+
+### Tune while listening
+
+The response graph includes a sine sweep, a draggable tone cursor, and small corrections at the frequency you are hearing. Live EQ previews run independently of profile saving. Bass and tilt controls create normal shelf filters, with undo/redo and a level-matched comparison against your starting sound.
+
+Imported measurement and target curves can include source, fixture, and compensation details. The corrected overlay is a prediction, and target ranges are optional references. [Listening workflow and implementation notes](docs/listening-workflow.md) describe the controls and credit the research that informed their use.

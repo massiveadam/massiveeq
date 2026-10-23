@@ -1,5 +1,7 @@
 mod client;
+mod editing;
 mod graph;
+mod live_client;
 mod update;
 
 use adw::prelude::*;
@@ -28,6 +30,23 @@ struct Model {
     document: Rc<RefCell<Option<ProfileDocument>>>,
     analysis: Rc<RefCell<Option<ProfileAnalysis>>>,
     selected_filter: Rc<Cell<Option<usize>>>,
+    bands: RefCell<Option<BandUi>>,
+    listening: RefCell<Option<ListeningUi>>,
+    graph_tone: RefCell<Option<GraphToneUi>>,
+    curves: RefCell<massiveeq_core::Curves>,
+    curve_context: RefCell<Option<gtk::Label>>,
+    history: RefCell<editing::History>,
+    reference: RefCell<Option<editing::Snapshot>>,
+    restoring_history: Cell<bool>,
+    syncing_text: Cell<bool>,
+    last_submitted: RefCell<Option<String>>,
+    bank_names_dirty: Cell<bool>,
+    unsaved: Cell<bool>,
+    hear_reference: Cell<bool>,
+    live_worker: live_client::LiveClient,
+    live_revision: Cell<u64>,
+    pending_live: RefCell<Option<gtk::glib::SourceId>>,
+    graph_dragging: Cell<bool>,
     manual_trim: Cell<f64>,
     sample_rate: Cell<f64>,
     loading: Cell<bool>,
@@ -61,6 +80,8 @@ struct LiveIndicators {
     output_status: gtk::Label,
     profile_list: gtk::ListBox,
     device_drop: gtk::DropDown,
+    /// Turns light while the open profile is playing.
+    profile_tile: gtk::Box,
     /// Open menus hold off focus changes from newly connected outputs.
     menus: Vec<gtk::MenuButton>,
 }
@@ -82,8 +103,8 @@ struct ConvolutionUi {
     syncing: Rc<Cell<bool>>,
     /// Layout of the open profile's impulse response, as reported by the service.
     layout: Rc<Cell<Option<ImpulseLayout>>>,
-    parametric_mode: gtk::ToggleButton,
-    convolution_mode: gtk::ToggleButton,
+    /// Mark the editor tab for the visible page.
+    sync_tabs: Rc<dyn Fn()>,
 }
 
 struct ComparisonUi {
@@ -98,7 +119,7 @@ struct ComparisonUi {
     status: gtk::Label,
     device_state: gtk::Label,
     assign: gtk::Button,
-    bypass: gtk::Switch,
+    bypass: gtk::ToggleButton,
 }
 
 fn main() {
@@ -155,11 +176,28 @@ fn build_ui(app: &adw::Application) {
         profiles: RefCell::new(profiles),
         devices: RefCell::new(devices),
         comparisons: RefCell::new(comparisons),
-        client,
+        client: client.clone(),
         current_id: RefCell::new(None),
         document: Rc::new(RefCell::new(None)),
         analysis: Rc::new(RefCell::new(None)),
         selected_filter: Rc::new(Cell::new(None)),
+        bands: RefCell::new(None),
+        listening: RefCell::new(None),
+        graph_tone: RefCell::new(None),
+        curves: RefCell::new(massiveeq_core::Curves::default()),
+        curve_context: RefCell::new(None),
+        history: RefCell::new(editing::History::default()),
+        reference: RefCell::new(None),
+        restoring_history: Cell::new(false),
+        syncing_text: Cell::new(false),
+        last_submitted: RefCell::new(None),
+        bank_names_dirty: Cell::new(false),
+        unsaved: Cell::new(false),
+        hear_reference: Cell::new(false),
+        live_worker: live_client::LiveClient::new(client.clone()),
+        live_revision: Cell::new(0),
+        pending_live: RefCell::new(None),
+        graph_dragging: Cell::new(false),
         manual_trim: Cell::new(0.0),
         sample_rate: Cell::new(active_sample_rate),
         loading: Cell::new(false),
@@ -187,9 +225,28 @@ fn build_ui(app: &adw::Application) {
     toolbar.add_css_class("instrument-root");
     let header = adw::HeaderBar::new();
     header.add_css_class("instrument-header");
-    let title = adw::WindowTitle::new("MASSIVE / EQ", "");
-    title.add_css_class("brand-title");
-    header.set_title_widget(Some(&title));
+    let brand = gtk::Label::new(Some("MASSIVE/EQ"));
+    brand.add_css_class("brand");
+    header.pack_start(&brand);
+    let rail_menu = gtk::MenuButton::new();
+    rail_menu.set_icon_name("sidebar-show-symbolic");
+    rail_menu.set_tooltip_text(Some("Profiles and tools"));
+    rail_menu.update_property(&[gtk::accessible::Property::Label("Profiles and tools")]);
+    rail_menu.set_visible(false);
+    let rail_popover = gtk::Popover::new();
+    let rail_popup_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(640)
+        .build();
+    rail_popover.set_child(Some(&rail_popup_scroll));
+    rail_menu.set_popover(Some(&rail_popover));
+    header.pack_start(&rail_menu);
+    // What plays where, and the engine's numbers, as one status strip.
+    let header_status = gtk::Label::new(None);
+    header_status.add_css_class("header-status");
+    header_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    header.set_title_widget(Some(&header_status));
 
     let profile_popover = gtk::Popover::new();
     let profile_popover_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
@@ -198,19 +255,16 @@ fn build_ui(app: &adw::Application) {
     profile_popover_box.set_margin_start(12);
     profile_popover_box.set_margin_end(12);
     profile_popover_box.set_size_request(330, 360);
-    let profile_heading = gtk::Label::new(Some("PROFILE BANK"));
-    profile_heading.set_xalign(0.0);
-    profile_heading.add_css_class("section-label");
-    profile_popover_box.append(&profile_heading);
     let profile_list = gtk::ListBox::new();
-    profile_list.add_css_class("boxed-list");
+    profile_list.add_css_class("profile-bank");
     profile_list.set_selection_mode(gtk::SelectionMode::Single);
     let profile_scroll = gtk::ScrolledWindow::builder()
-        .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .min_content_height(110)
+        .max_content_height(330)
         .child(&profile_list)
         .build();
-    profile_popover_box.append(&profile_scroll);
 
     let profile_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     profile_buttons.set_homogeneous(true);
@@ -229,7 +283,6 @@ fn build_ui(app: &adw::Application) {
     profile_buttons.append(&duplicate_button);
     profile_buttons.append(&export_button);
     profile_buttons.append(&delete_button);
-    profile_popover_box.append(&profile_buttons);
     profile_popover.set_child(Some(&profile_popover_box));
 
     let profile_menu = gtk::MenuButton::new();
@@ -244,13 +297,14 @@ fn build_ui(app: &adw::Application) {
     profile_menu.set_margin_bottom(3);
     profile_menu.set_popover(Some(&profile_popover));
     profile_menu.add_css_class("profile-menu");
-    header.pack_start(&profile_menu);
-    let header_add_profile = gtk::Button::with_label("+ NEW PROFILE");
+    let header_add_profile = gtk::Button::from_icon_name("list-add-symbolic");
     header_add_profile.add_css_class("profile-add");
-    header_add_profile.set_tooltip_text(Some("Create and select a new profile"));
-    header.pack_start(&header_add_profile);
+    header_add_profile.set_valign(gtk::Align::Center);
+    header_add_profile.set_tooltip_text(Some("New profile"));
 
-    let global_bypass = gtk::Switch::new();
+    let global_bypass = gtk::ToggleButton::new();
+    global_bypass.set_icon_name("system-shutdown-symbolic");
+    global_bypass.add_css_class("power");
     global_bypass.set_valign(gtk::Align::Center);
     global_bypass.set_active(
         !model
@@ -273,7 +327,6 @@ fn build_ui(app: &adw::Application) {
     header.pack_end(&global_bypass);
     let global_bypass_label = gtk::Label::new(Some("ENGINE"));
     global_bypass_label.add_css_class("header-data");
-    header.pack_end(&global_bypass_label);
     update::add_update_button(&header, &window);
     toolbar.add_top_bar(&header);
 
@@ -283,57 +336,19 @@ fn build_ui(app: &adw::Application) {
     content.set_margin_start(18);
     content.set_margin_end(18);
 
-    let dashboard = gtk::Box::new(gtk::Orientation::Vertical, 12);
-
-    let controls_card = gtk::Box::new(gtk::Orientation::Horizontal, 16);
-    controls_card.add_css_class("control-card");
-    let route_heading = gtk::Label::new(Some("SIGNAL ROUTE"));
-    route_heading.set_xalign(0.0);
-    route_heading.add_css_class("panel-title");
-    route_heading.set_valign(gtk::Align::Center);
-    controls_card.append(&route_heading);
-    let route_rule = gtk::Separator::new(gtk::Orientation::Vertical);
-    controls_card.append(&route_rule);
-    let identity_row = gtk::Box::new(gtk::Orientation::Horizontal, 14);
-    identity_row.set_hexpand(true);
-    // Equal columns keep the fields still while the status text changes.
-    identity_row.set_homogeneous(true);
-    let profile_column = gtk::Box::new(gtk::Orientation::Vertical, 5);
-    profile_column.set_hexpand(true);
-    let profile_name_label = gtk::Label::new(Some("PROFILE NAME"));
-    profile_name_label.set_xalign(0.0);
-    profile_name_label.set_hexpand(true);
-    profile_name_label.add_css_class("section-label");
     let profile_status = gtk::Label::new(None);
-    profile_status.add_css_class("route-status");
+    profile_status.add_css_class("tile-subtitle");
     profile_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    profile_status.set_xalign(1.0);
-    let profile_name_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    profile_name_row.append(&profile_name_label);
-    profile_name_row.append(&profile_status);
-    profile_column.append(&profile_name_row);
+    profile_status.set_xalign(0.0);
     let name_entry = gtk::Entry::builder()
         .placeholder_text("Profile name")
         .hexpand(true)
         .build();
-    name_entry.add_css_class("profile-name");
-    profile_column.append(&name_entry);
-    identity_row.append(&profile_column);
-
-    let device_column = gtk::Box::new(gtk::Orientation::Vertical, 5);
-    device_column.set_hexpand(true);
-    let device_heading = gtk::Label::new(Some("OUTPUT DEVICE"));
-    device_heading.set_xalign(0.0);
-    device_heading.set_hexpand(true);
-    device_heading.add_css_class("section-label");
+    name_entry.add_css_class("tile-title");
     let output_status = gtk::Label::new(None);
-    output_status.add_css_class("route-status");
+    output_status.add_css_class("tile-subtitle");
     output_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    output_status.set_xalign(1.0);
-    let device_heading_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    device_heading_row.append(&device_heading);
-    device_heading_row.append(&output_status);
-    device_column.append(&device_heading_row);
+    output_status.set_xalign(0.0);
     let device_strings = gtk::StringList::new(
         &model
             .devices
@@ -345,27 +360,20 @@ fn build_ui(app: &adw::Application) {
     let device_drop = gtk::DropDown::new(Some(device_strings.clone()), gtk::Expression::NONE);
     device_drop.set_hexpand(true);
     device_drop.set_size_request(1, -1);
-    device_drop.add_css_class("device-dropdown");
+    device_drop.add_css_class("tile-dropdown");
     device_drop.set_factory(Some(&ellipsized_string_factory(32)));
     device_drop.set_list_factory(Some(&ellipsized_string_factory(48)));
-    device_column.set_size_request(1, -1);
-    device_column.append(&device_drop);
     let device_state = gtk::Label::new(Some("Not applied"));
     device_state.set_xalign(0.0);
     device_state.add_css_class("dim-label");
     device_state.add_css_class("device-state");
     device_state.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    device_column.append(&device_state);
-    identity_row.append(&device_column);
-    controls_card.append(&identity_row);
-
-    let device_actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    device_actions.set_valign(gtk::Align::Center);
-    device_actions.set_halign(gtk::Align::Fill);
     let assign_button = gtk::Button::with_label("Apply to output");
-    assign_button.add_css_class("suggested-action");
+    assign_button.add_css_class("tile-action");
     assign_button.set_hexpand(true);
-    let device_bypass = gtk::Switch::new();
+    // The round accent control: lit while this output's filters run.
+    let device_bypass = gtk::ToggleButton::new();
+    device_bypass.add_css_class("filters-dot");
     device_bypass.set_valign(gtk::Align::Center);
     device_bypass.set_active(
         model
@@ -383,11 +391,6 @@ fn build_ui(app: &adw::Application) {
             "Turning filters off retains level matching for a fair comparison.",
         ),
     ]);
-    let bypass_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    bypass_row.set_halign(gtk::Align::Center);
-    bypass_row.append(&gtk::Label::new(Some("FILTERS")));
-    bypass_row.append(&device_bypass);
-    device_actions.append(&bypass_row);
     let comparison_popover = gtk::Popover::new();
     let comparison_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
     comparison_box.set_margin_top(14);
@@ -471,27 +474,93 @@ fn build_ui(app: &adw::Application) {
         assign: assign_button.clone(),
         bypass: device_bypass.clone(),
     });
-    device_actions.append(&comparison_ui.menu);
-    device_actions.append(&assign_button);
-    controls_card.append(&device_actions);
-    dashboard.append(&controls_card);
-
-    let graph_card = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    graph_card.add_css_class("graph-card");
-    graph_card.set_hexpand(true);
-    let graph_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let graph_title = gtk::Label::new(Some("FREQUENCY RESPONSE"));
-    graph_title.set_xalign(0.0);
-    graph_title.add_css_class("panel-title");
-    graph_title.set_hexpand(true);
-    graph_header.append(&graph_title);
-    let graph_hint = gtk::Label::new(Some(&engine_summary(&engine_status)));
-    graph_hint.add_css_class("level-code");
-    graph_hint.set_tooltip_text(Some(&engine_tooltip(&engine_status)));
-    graph_header.append(&graph_hint);
     let curves_ui = build_curves_menu();
-    graph_header.append(&curves_ui.menu);
-    graph_card.append(&graph_header);
+
+    // Left rail: the open profile and its output as tiles, the profile bank,
+    // and the tools.
+    let rail = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    rail.add_css_class("rail");
+    rail.set_size_request(292, -1);
+
+    let profile_tile = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    profile_tile.add_css_class("rail-tile");
+    let profile_head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    profile_head.append(&tile_icon("audio-headphones-symbolic"));
+    let profile_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    profile_text.set_hexpand(true);
+    profile_text.set_valign(gtk::Align::Center);
+    profile_text.append(&name_entry);
+    profile_text.append(&profile_status);
+    profile_head.append(&profile_text);
+    profile_tile.append(&profile_head);
+    let profile_controls = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let preamp_tile = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    preamp_tile.add_css_class("tile-value");
+    preamp_tile.set_hexpand(true);
+    preamp_tile.set_valign(gtk::Align::Center);
+    let preamp_value = gtk::Label::new(Some("—"));
+    preamp_value.add_css_class("tile-value-number");
+    let preamp_caption = gtk::Label::new(Some("Preamp"));
+    preamp_caption.add_css_class("tile-value-caption");
+    preamp_tile.append(&preamp_value);
+    preamp_tile.append(&preamp_caption);
+    PREAMP_READOUT.with(|readout| *readout.borrow_mut() = Some(preamp_value));
+    profile_controls.append(&preamp_tile);
+    profile_controls.append(&device_bypass);
+    profile_tile.append(&profile_controls);
+    rail.append(&profile_tile);
+
+    let output_tile = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    output_tile.add_css_class("rail-tile");
+    let output_head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    output_head.append(&tile_icon("audio-speakers-symbolic"));
+    let output_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    output_text.set_hexpand(true);
+    output_text.set_valign(gtk::Align::Center);
+    output_text.set_size_request(1, -1);
+    output_text.append(&device_drop);
+    output_text.append(&output_status);
+    output_head.append(&output_text);
+    output_tile.append(&output_head);
+    output_tile.append(&device_state);
+    output_tile.append(&assign_button);
+    rail.append(&output_tile);
+
+    rail.append(&rail_label("PROFILES"));
+    rail.append(&profile_scroll);
+    profile_buttons.add_css_class("bank-actions");
+    rail.append(&profile_buttons);
+
+    rail.append(&rail_label("TOOLS"));
+    let tools = gtk::Grid::new();
+    tools.set_column_spacing(8);
+    tools.set_row_spacing(8);
+    tools.set_column_homogeneous(true);
+    comparison_ui.menu.add_css_class("tool-tile");
+    tools.attach(&comparison_ui.menu, 0, 0, 2, 1);
+    let tone_tool = gtk::Button::with_label("Tone");
+    tone_tool.add_css_class("tool-tile");
+    tone_tool.add_css_class("round");
+    tone_tool.set_halign(gtk::Align::Center);
+    tone_tool.set_valign(gtk::Align::Center);
+    tools.attach(&tone_tool, 2, 0, 1, 1);
+    let ir_tool = gtk::Button::with_label("IR");
+    ir_tool.add_css_class("tool-tile");
+    ir_tool.add_css_class("round");
+    ir_tool.set_halign(gtk::Align::Center);
+    ir_tool.set_valign(gtk::Align::Center);
+    ir_tool.set_tooltip_text(Some("Impulse response"));
+    tools.attach(&ir_tool, 0, 1, 1, 1);
+    curves_ui.menu.add_css_class("tool-tile");
+    tools.attach(&curves_ui.menu, 1, 1, 2, 1);
+    rail.append(&tools);
+
+    let main_column = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    main_column.set_hexpand(true);
+    let body = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    body.append(&rail);
+    body.append(&main_column);
+
     let graph = graph::response_graph(
         model.analysis.clone(),
         model.document.clone(),
@@ -514,9 +583,9 @@ fn build_ui(app: &adw::Application) {
     let analysis_label = gtk::Label::new(Some("AUTO PREAMP —"));
     analysis_label.set_xalign(0.0);
     analysis_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    analysis_label.add_css_class("level-code");
+    analysis_label.add_css_class("readouts");
     let level_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    level_row.add_css_class("level-readout");
+    level_row.add_css_class("readout-row");
     analysis_label.set_hexpand(true);
     level_row.append(&analysis_label);
     let trim = gtk::SpinButton::with_range(-24.0, 24.0, 0.1);
@@ -526,7 +595,7 @@ fn build_ui(app: &adw::Application) {
         "Fine-tune the perceptually matched preamp; safety attenuation still prevents clipping",
     ));
     let trim_label = gtk::Label::new(Some("ADJUST"));
-    trim_label.add_css_class("section-label");
+    trim_label.add_css_class("readout-key");
     let trim_unit = gtk::Label::new(Some("dB"));
     trim_unit.add_css_class("level-code");
     let trim_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -535,84 +604,94 @@ fn build_ui(app: &adw::Application) {
     trim_controls.append(&trim);
     trim_controls.append(&trim_unit);
     level_row.append(&trim_controls);
-    graph_card.append(&level_row);
-    graph_card.append(&graph);
-    dashboard.append(&graph_card);
-    content.append(&dashboard);
+    header_status.set_markup(&header_markup(&engine_status, &model));
+    header_status.set_tooltip_text(Some(&engine_tooltip(&engine_status)));
+    let (tone_page, tone_ui) = build_tone_page();
+    let (graph_listen, graph_tone) = build_graph_tone(&tone_ui);
+    *model.graph_tone.borrow_mut() = Some(graph_tone);
+    let response_body = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    response_body.append(&graph);
+    response_body.append(&level_row);
+    response_body.append(&graph_listen);
+    let curve_context = gtk::Label::new(None);
+    curve_context.set_wrap(true);
+    curve_context.set_xalign(0.0);
+    curve_context.add_css_class("level-code");
+    curve_context.set_visible(false);
+    response_body.append(&curve_context);
+    *model.curve_context.borrow_mut() = Some(curve_context);
+    main_column.append(&titled_frame(1, "response", &response_body, None));
+    content.append(&body);
 
     let view_stack = adw::ViewStack::new();
+    view_stack.set_vhomogeneous(false);
     let filter_list = gtk::FlowBox::new();
     filter_list.set_selection_mode(gtk::SelectionMode::None);
-    filter_list.set_min_children_per_line(2);
-    filter_list.set_max_children_per_line(2);
-    filter_list.set_column_spacing(12);
-    filter_list.set_row_spacing(12);
+    filter_list.set_min_children_per_line(1);
+    filter_list.set_max_children_per_line(64);
+    filter_list.set_column_spacing(10);
+    filter_list.set_row_spacing(10);
     filter_list.set_homogeneous(true);
     filter_list.set_activate_on_single_click(false);
     filter_list.set_valign(gtk::Align::Start);
+    filter_list.set_halign(gtk::Align::Start);
     filter_list.add_css_class("filter-list");
     let narrow_filters = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
         adw::BreakpointConditionLengthType::MaxWidth,
         720.0,
         adw::LengthUnit::Px,
     ));
-    narrow_filters.add_setter(
-        &filter_list,
-        "min-children-per-line",
-        Some(&1_u32.to_value()),
-    );
+    // The rail sits above the editor once both no longer fit side by side.
     let narrow_route = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
         adw::BreakpointConditionLengthType::MaxWidth,
-        1040.0,
+        880.0,
         adw::LengthUnit::Px,
     ));
-    narrow_route.add_setter(
-        &controls_card,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
-    narrow_route.add_setter(
-        &route_rule,
-        "orientation",
-        Some(&gtk::Orientation::Horizontal.to_value()),
-    );
-    // Only one breakpoint applies at a time (the last matching one), so the
-    // narrow layout repeats the route changes.
-    narrow_filters.add_setter(
-        &controls_card,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
-    narrow_filters.add_setter(
-        &route_rule,
-        "orientation",
-        Some(&gtk::Orientation::Horizontal.to_value()),
-    );
-    narrow_filters.add_setter(
-        &identity_row,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
-    narrow_filters.add_setter(
-        &device_actions,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
-    narrow_filters.add_setter(
-        &graph_header,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
+    // Only the last matching breakpoint applies. Each narrow rule moves the
+    // same live rail into a header popover, preserving its controls and state.
+    for breakpoint in [&narrow_route, &narrow_filters] {
+        breakpoint.add_setter(&rail_menu, "visible", Some(&true.to_value()));
+        breakpoint.add_setter(&header_status, "visible", Some(&false.to_value()));
+        breakpoint.connect_apply({
+            let body = body.clone();
+            let rail = rail.clone();
+            let scroll = rail_popup_scroll.clone();
+            move |_| {
+                body.remove(&rail);
+                scroll.set_child(Some(&rail));
+            }
+        });
+        breakpoint.connect_unapply({
+            let body = body.clone();
+            let rail = rail.clone();
+            let popover = rail_popover.clone();
+            let scroll = rail_popup_scroll.clone();
+            move |_| {
+                popover.popdown();
+                scroll.set_child(gtk::Widget::NONE);
+                body.prepend(&rail);
+            }
+        });
+    }
     narrow_filters.add_setter(
         &level_row,
         "orientation",
         Some(&gtk::Orientation::Vertical.to_value()),
     );
-    narrow_filters.add_setter(&title, "visible", Some(&false.to_value()));
-    narrow_filters.add_setter(&global_bypass_label, "visible", Some(&false.to_value()));
+    narrow_filters.add_setter(&header_status, "visible", Some(&false.to_value()));
+    narrow_filters.add_setter(&analysis_label, "wrap", Some(&true.to_value()));
+    narrow_filters.add_setter(
+        &analysis_label,
+        "ellipsize",
+        Some(&gtk::pango::EllipsizeMode::None.to_value()),
+    );
     let parametric_stack = gtk::Stack::new();
+    parametric_stack.set_vhomogeneous(false);
     parametric_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-    parametric_stack.add_named(&filter_list, Some("visual"));
+    parametric_stack.set_transition_duration(120);
+    let visual_page = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    visual_page.append(&filter_list);
+    parametric_stack.add_named(&visual_page, Some("visual"));
     view_stack.set_valign(gtk::Align::Start);
 
     let convolution_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -625,6 +704,7 @@ fn build_ui(app: &adw::Application) {
     convolution_card.append(&convolution_heading);
     let convolution_file_name = gtk::Label::new(Some("No impulse response selected"));
     convolution_file_name.set_xalign(0.0);
+    convolution_file_name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
     convolution_file_name.add_css_class("convolution-name");
     convolution_card.append(&convolution_file_name);
     let convolution_file_path = gtk::Label::new(Some("WAV, FLAC, AIFF, or OGG · up to 10 seconds"));
@@ -652,6 +732,16 @@ fn build_ui(app: &adw::Application) {
     convolution_actions.append(&choose_convolution);
     convolution_actions.append(&remove_convolution);
     convolution_card.append(&convolution_actions);
+    narrow_filters.add_setter(
+        &convolution_options,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    narrow_filters.add_setter(
+        &convolution_actions,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
     let convolution_note = gtk::Label::new(Some(
         "Parametric filters and GraphicEQ apply on top of the impulse response, per ear.",
     ));
@@ -674,106 +764,81 @@ fn build_ui(app: &adw::Application) {
         .build();
     text_scroll.add_css_class("code-editor");
     parametric_stack.add_named(&text_scroll, Some("text"));
-    let (tone_page, tone_ui) = build_tone_page();
+    let band_editor = build_band_editor(&model, &text_view.buffer(), &graph, &filter_list);
+    visual_page.append(&band_editor);
     parametric_stack.add_named(&tone_page, Some("tone"));
     view_stack.add_titled(&parametric_stack, Some("filters"), "Parametric");
-    let switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    switcher.set_halign(gtk::Align::Center);
-    switcher.add_css_class("mode-switcher");
-    let parametric_mode = gtk::ToggleButton::with_label("PARAMETRIC");
-    parametric_mode.set_active(true);
-    let convolution_mode = gtk::ToggleButton::with_label("CONVOLUTION");
-    convolution_mode.set_group(Some(&parametric_mode));
-    parametric_mode.connect_clicked({
-        let stack = view_stack.clone();
-        move |button| {
-            button.set_active(true);
-            stack.set_visible_child_name("filters");
-        }
-    });
-    convolution_mode.connect_clicked({
-        let stack = view_stack.clone();
-        move |button| {
-            button.set_active(true);
-            stack.set_visible_child_name("convolution");
-        }
-    });
-    view_stack.connect_visible_child_name_notify({
-        let parametric_mode = parametric_mode.clone();
-        let convolution_mode = convolution_mode.clone();
-        move |stack| {
-            let convolution = stack.visible_child_name().as_deref() == Some("convolution");
-            parametric_mode.set_active(!convolution);
-            convolution_mode.set_active(convolution);
-        }
-    });
-    switcher.append(&parametric_mode);
-    switcher.append(&convolution_mode);
+    // One row of editor pages: the bands as cards or text, the impulse
+    // response, and the tone finder. Two stacks sit behind it.
     let editor_switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     editor_switcher.add_css_class("editor-switcher");
-    let visual_mode = gtk::ToggleButton::with_label("VISUAL");
-    visual_mode.set_active(true);
+    let visual_mode = gtk::ToggleButton::with_label("BANDS");
     let text_mode = gtk::ToggleButton::with_label("TEXT");
-    text_mode.set_group(Some(&visual_mode));
+    let convolution_mode = gtk::ToggleButton::with_label("IR");
     let tone_mode = gtk::ToggleButton::with_label("TONE");
-    tone_mode.set_group(Some(&visual_mode));
     tone_mode.set_tooltip_text(Some(
         "Find peaks and dips on your own ears with a test tone",
     ));
-    tone_mode.connect_clicked({
-        let stack = parametric_stack.clone();
-        move |button| {
+    for (button, view, editor) in [
+        (&visual_mode, "filters", Some("visual")),
+        (&text_mode, "filters", Some("text")),
+        (&convolution_mode, "convolution", None),
+        (&tone_mode, "filters", Some("tone")),
+    ] {
+        if button != &visual_mode {
+            button.set_group(Some(&visual_mode));
+        }
+        editor_switcher.append(button);
+        let view_stack = view_stack.clone();
+        let parametric_stack = parametric_stack.clone();
+        button.connect_clicked(move |button| {
             button.set_active(true);
-            stack.set_visible_child_name("tone");
+            if let Some(editor) = editor {
+                parametric_stack.set_visible_child_name(editor);
+            }
+            view_stack.set_visible_child_name(view);
+        });
+    }
+    // Mark the tab for whatever page the stacks show.
+    let sync_tabs: Rc<dyn Fn()> = Rc::new({
+        let view_stack = view_stack.clone();
+        let parametric_stack = parametric_stack.clone();
+        let tabs = [
+            visual_mode.clone(),
+            text_mode.clone(),
+            convolution_mode.clone(),
+            tone_mode.clone(),
+        ];
+        move || {
+            let index = if view_stack.visible_child_name().as_deref() == Some("convolution") {
+                2
+            } else {
+                match parametric_stack.visible_child_name().as_deref() {
+                    Some("text") => 1,
+                    Some("tone") => 3,
+                    _ => 0,
+                }
+            };
+            tabs[index].set_active(true);
         }
     });
-    visual_mode.connect_clicked({
-        let stack = parametric_stack.clone();
-        move |button| {
-            button.set_active(true);
-            stack.set_visible_child_name("visual");
-        }
-    });
-    text_mode.connect_clicked({
-        let stack = parametric_stack.clone();
-        move |button| {
-            button.set_active(true);
-            stack.set_visible_child_name("text");
-        }
-    });
-    parametric_stack.connect_visible_child_name_notify({
-        let visual_mode = visual_mode.clone();
-        let text_mode = text_mode.clone();
-        let tone_mode = tone_mode.clone();
-        move |stack| match stack.visible_child_name().as_deref() {
-            Some("text") => text_mode.set_active(true),
-            Some("tone") => tone_mode.set_active(true),
-            _ => visual_mode.set_active(true),
-        }
-    });
-    editor_switcher.append(&visual_mode);
-    editor_switcher.append(&text_mode);
-    editor_switcher.append(&tone_mode);
+    {
+        let sync = sync_tabs.clone();
+        view_stack.connect_visible_child_name_notify(move |_| sync());
+        let sync = sync_tabs.clone();
+        parametric_stack.connect_visible_child_name_notify(move |_| sync());
+    }
+    visual_mode.set_active(true);
     let reset_filters_button = gtk::Button::with_label("RESET FILTERS");
     reset_filters_button.add_css_class("reset-filters");
     reset_filters_button.set_tooltip_text(Some(
         "Flatten every parametric band to 0 dB without changing its frequency or Q",
     ));
-    let filter_toolbar = gtk::CenterBox::new();
-    filter_toolbar.set_hexpand(true);
-    filter_toolbar.set_start_widget(Some(&editor_switcher));
-    filter_toolbar.set_center_widget(Some(&switcher));
-    filter_toolbar.set_end_widget(Some(&reset_filters_button));
-    narrow_filters.add_setter(
-        &filter_toolbar,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
     window.add_breakpoint(narrow_route);
     window.add_breakpoint(narrow_filters);
-    let add_filter_button = gtk::Button::with_label("＋  ADD PARAMETRIC BAND");
+    let add_filter_button = gtk::Button::with_label("＋ Add band");
     add_filter_button.add_css_class("band-add");
-    add_filter_button.set_hexpand(true);
+    add_filter_button.set_halign(gtk::Align::Start);
     let convolution_ui = ConvolutionUi {
         stack: view_stack.clone(),
         file_name: convolution_file_name,
@@ -783,18 +848,15 @@ fn build_ui(app: &adw::Application) {
         remove: remove_convolution,
         syncing: Rc::new(Cell::new(false)),
         layout: Rc::new(Cell::new(None)),
-        parametric_mode: parametric_mode.clone(),
-        convolution_mode: convolution_mode.clone(),
+        sync_tabs: sync_tabs.clone(),
     };
     view_stack.connect_visible_child_name_notify({
         let add_filter = add_filter_button.clone();
         let reset_filters = reset_filters_button.clone();
-        let editor_switcher = editor_switcher.clone();
         let parametric_stack = parametric_stack.clone();
         move |stack| {
             let parametric = stack.visible_child_name().as_deref() == Some("filters");
             let visual = parametric_stack.visible_child_name().as_deref() == Some("visual");
-            editor_switcher.set_visible(parametric);
             add_filter.set_visible(parametric && visual);
             reset_filters.set_visible(true);
             reset_filters.set_sensitive(parametric && visual);
@@ -813,12 +875,47 @@ fn build_ui(app: &adw::Application) {
             reset_filters.set_opacity(if parametric && visual { 1.0 } else { 0.0 });
         }
     });
-    content.append(&filter_toolbar);
-    content.append(&add_filter_button);
-    content.append(&view_stack);
+    let bands_body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let band_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    band_actions.append(&add_filter_button);
+    reset_filters_button.set_hexpand(true);
+    reset_filters_button.set_halign(gtk::Align::End);
+    band_actions.append(&reset_filters_button);
+    bands_body.append(&band_actions);
+    bands_body.append(&view_stack);
+    main_column.append(&titled_frame(
+        2,
+        "bands",
+        &bands_body,
+        Some(editor_switcher.upcast_ref()),
+    ));
+    // Tools that open editor pages.
+    tone_tool.connect_clicked({
+        let popover = rail_popover.clone();
+        let view_stack = view_stack.clone();
+        let parametric_stack = parametric_stack.clone();
+        move |_| {
+            parametric_stack.set_visible_child_name("tone");
+            view_stack.set_visible_child_name("filters");
+            popover.popdown();
+        }
+    });
+    ir_tool.connect_clicked({
+        let view_stack = view_stack.clone();
+        let popover = rail_popover.clone();
+        move |_| {
+            view_stack.set_visible_child_name("convolution");
+            popover.popdown();
+        }
+    });
+    profile_list.connect_row_activated({
+        let popover = rail_popover.clone();
+        move |_, _| popover.popdown()
+    });
 
     let status = gtk::Label::new(Some("Ready"));
     status.set_xalign(0.0);
+    status.set_wrap(true);
     status.add_css_class("dim-label");
     status.add_css_class("console-status");
     content.append(&status);
@@ -836,12 +933,120 @@ fn build_ui(app: &adw::Application) {
     toolbar.set_content(Some(&page_scroll));
     window.set_content(Some(&toolbar));
 
+    let listening_controls = build_listening_controls(
+        &window,
+        &model,
+        &text_view.buffer(),
+        &filter_list,
+        &graph,
+        &trim,
+        &status,
+    );
+    response_body.append(&listening_controls);
+    gtk::glib::timeout_add_local(std::time::Duration::from_millis(20), {
+        let model = model.clone();
+        let graph = graph.clone();
+        let analysis_label = analysis_label.clone();
+        let status = status.clone();
+        move || {
+            for result in model.live_worker.completions() {
+                if result.id.is_empty() {
+                    if let Some(listener) = model.graph_tone.borrow().as_ref() {
+                        listener.tone.play.set_active(false);
+                    }
+                    if let Some(error) = result.error {
+                        status.set_text(&error);
+                    }
+                    continue;
+                }
+                let current = model.current_id.borrow().as_deref() == Some(&result.id)
+                    && result.revision == model.live_revision.get();
+                if current {
+                    if result.saved.is_some() {
+                        model.unsaved.set(false);
+                    }
+                    if result.saved.is_some() && model.bank_names_dirty.replace(false) {
+                        resort_profiles(&model);
+                    }
+                    if let Some(error) = result.error {
+                        status.set_text(&error);
+                    } else if result.saved.is_some() {
+                        status.set_text("Saved and applied · comparison level matched");
+                    }
+                    if let Some(analysis) = result.analysis {
+                        set_analysis_label(&analysis_label, &analysis);
+                        store_service_analysis(&model, analysis);
+                        graph.queue_draw();
+                    }
+                }
+            }
+            gtk::glib::ControlFlow::Continue
+        }
+    });
+    gtk::glib::timeout_add_seconds_local(2, {
+        let model = model.clone();
+        move || {
+            if model.current_id.borrow().is_some() {
+                let save = model.unsaved.get()
+                    && model.pending_save.borrow().is_none()
+                    && !model.graph_dragging.get();
+                submit_live(&model, save);
+            }
+            gtk::glib::ControlFlow::Continue
+        }
+    });
+    window.connect_close_request({
+        let model = model.clone();
+        let status = status.clone();
+        move |_| {
+            if let Some(timer) = model.pending_save.borrow_mut().take() {
+                timer.remove();
+            }
+            if let Some(timer) = model.pending_live.borrow_mut().take() {
+                timer.remove();
+            }
+            submit_live(&model, true);
+            model.live_worker.stop_tone();
+            if !model.live_worker.flush() {
+                status.set_text("Changes are still waiting to save. Try closing again when the audio service is ready.");
+                return gtk::glib::Propagation::Stop;
+            }
+            let mut save_error = None;
+            for result in model.live_worker.completions() {
+                if model.current_id.borrow().as_deref() == Some(&result.id)
+                    && result.revision == model.live_revision.get()
+                {
+                    if result.saved.is_some() {
+                        model.unsaved.set(false);
+                    }
+                    save_error = result.error;
+                }
+            }
+            if model.unsaved.get() {
+                status.set_text(&format!(
+                    "Changes could not be saved. {}",
+                    save_error.as_deref().unwrap_or("Correct the profile before closing.")
+                ));
+                return gtk::glib::Propagation::Stop;
+            }
+            if let Some(id) = model.current_id.borrow().as_ref() {
+                let _ = model.client.end_preview(id);
+            }
+            gtk::glib::Propagation::Proceed
+        }
+    });
+
     *model.live.borrow_mut() = Some(LiveIndicators {
         profile_status,
         output_status,
         profile_list: profile_list.clone(),
         device_drop: device_drop.clone(),
-        menus: vec![profile_menu.clone(), comparison_ui.menu.clone()],
+        profile_tile: profile_tile.clone(),
+        menus: vec![
+            profile_menu.clone(),
+            rail_menu.clone(),
+            comparison_ui.menu.clone(),
+        ],
     });
     // Seen in the capture phase, before any widget can consume the event.
     let input_watch = gtk::EventControllerLegacy::new();
@@ -904,6 +1109,31 @@ fn build_ui(app: &adw::Application) {
         &graph,
         &status,
     );
+    let stop_hidden_listener = Rc::new({
+        let views = view_stack.clone();
+        let editors = parametric_stack.clone();
+        let tone = tone_ui.clone();
+        let bar = graph_listen.clone();
+        move || {
+            let visible = views.visible_child_name().as_deref() == Some("filters")
+                && matches!(
+                    editors.visible_child_name().as_deref(),
+                    Some("visual" | "tone")
+                );
+            bar.set_visible(visible);
+            if !visible {
+                tone.play.set_active(false);
+            }
+        }
+    });
+    view_stack.connect_visible_child_name_notify({
+        let sync = stop_hidden_listener.clone();
+        move |_| sync()
+    });
+    parametric_stack.connect_visible_child_name_notify({
+        let sync = stop_hidden_listener.clone();
+        move |_| sync()
+    });
     gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), {
         let model = model.clone();
         let strings = device_strings.clone();
@@ -912,11 +1142,24 @@ fn build_ui(app: &adw::Application) {
         let assign = assign_button.clone();
         let bypass = device_bypass.clone();
         let engine = global_bypass.clone();
-        let engine_readout = graph_hint.clone();
+        let engine_readout = header_status.clone();
         let comparison_ui = comparison_ui.clone();
         let profile_list = profile_list.clone();
         move || {
-            if let Ok(devices) = model.client.devices() {
+            let Some(poll) = model.live_worker.take_poll() else {
+                return gtk::glib::ControlFlow::Continue;
+            };
+            let poll = match poll {
+                Ok(poll) => poll,
+                Err(error) => {
+                    engine_readout.set_text("Audio service unavailable");
+                    engine_readout.set_tooltip_text(Some(&error));
+                    engine.set_sensitive(false);
+                    return gtk::glib::ControlFlow::Continue;
+                }
+            };
+            {
+                let devices = poll.devices;
                 if let Some(index) = device_focus_target(&model.devices.borrow(), &devices) {
                     *model.pending_focus.borrow_mut() = Some(devices[index].key.as_storage_key());
                 }
@@ -956,9 +1199,7 @@ fn build_ui(app: &adw::Application) {
                         model.restoring_device.set(false);
                     }
                 }
-                if let Ok(comparisons) = model.client.comparisons() {
-                    *model.comparisons.borrow_mut() = comparisons;
-                }
+                *model.comparisons.borrow_mut() = poll.comparisons;
                 apply_pending_focus(&model, &drop, &profile_list, true);
                 update_device_controls(&model, &drop, &state, &assign, &bypass);
                 // The candidate rows are an unsaved draft while this popover
@@ -968,12 +1209,12 @@ fn build_ui(app: &adw::Application) {
                     refresh_comparison_ui(&model, &drop, &comparison_ui);
                 }
             }
-            if let Ok(service_status) = model.client.status()
-                && let Some(engine_off) = service_status
-                    .get("global_bypass")
-                    .and_then(serde_json::Value::as_bool)
+            let service_status = poll.status;
+            if let Some(engine_off) = service_status
+                .get("global_bypass")
+                .and_then(serde_json::Value::as_bool)
             {
-                engine_readout.set_text(&engine_summary(&service_status));
+                engine_readout.set_markup(&header_markup(&service_status, &model));
                 engine_readout.set_tooltip_text(Some(&engine_tooltip(&service_status)));
                 engine.set_sensitive(true);
                 model.syncing_engine.set(true);
@@ -983,7 +1224,8 @@ fn build_ui(app: &adw::Application) {
                     update_live_indicators(&model);
                 }
             } else {
-                engine_readout.set_text("AUDIO SERVICE UNAVAILABLE");
+                engine_readout
+                    .set_markup("<span foreground='#ff7a1a'>AUDIO SERVICE UNAVAILABLE</span>");
                 engine.set_sensitive(false);
             }
             gtk::glib::ControlFlow::Continue
@@ -1017,6 +1259,7 @@ fn build_ui(app: &adw::Application) {
     );
     install_editor_shortcut(&window, &view_stack, &parametric_stack);
     window.present();
+    graph.grab_focus();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1044,8 +1287,8 @@ fn wire_actions(
     export: &gtk::Button,
     delete: &gtk::Button,
     assign: &gtk::Button,
-    device_bypass: &gtk::Switch,
-    global_bypass: &gtk::Switch,
+    device_bypass: &gtk::ToggleButton,
+    global_bypass: &gtk::ToggleButton,
     comparison_ui: &Rc<ComparisonUi>,
     trim: &gtk::SpinButton,
 ) {
@@ -1079,7 +1322,7 @@ fn wire_actions(
                 model.selected_filter.set(Some(document.filters.len() - 1));
                 (serialize_profile(document), document.clone())
             };
-            buffer.set_text(&text);
+            set_editor_text(&model, &buffer, &text);
             rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
             update_convolution_ui(&convolution_ui, &snapshot);
             graph.queue_draw();
@@ -1103,7 +1346,7 @@ fn wire_actions(
                 }
                 (serialize_profile(document), document.clone())
             };
-            buffer.set_text(&text);
+            set_editor_text(&model, &buffer, &text);
             rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
             update_convolution_ui(&convolution_ui, &snapshot);
             graph.queue_draw();
@@ -1169,9 +1412,17 @@ fn wire_actions(
                         let document = parse_text(&profile.name, &profile.text);
                         ui.layout.set(profile.impulse_layout);
                         model.loading.set(true);
-                        buffer.set_text(&profile.text);
+                        set_editor_text(&model, &buffer, &profile.text);
                         model.loading.set(false);
                         *model.document.borrow_mut() = Some(document.clone());
+                        let initial = editing::Snapshot {
+                            text: serialize_profile(&document),
+                            trim: model.manual_trim.get(),
+                        };
+                        model.history.borrow_mut().reset(initial.clone());
+                        *model.reference.borrow_mut() = Some(initial);
+                        model.hear_reference.set(false);
+                        sync_listening(&model);
                         model.selected_filter.set(None);
                         rebuild_filter_list(&list, &document, &model, &buffer, &graph);
                         update_convolution_ui(&ui, &document);
@@ -1211,7 +1462,7 @@ fn wire_actions(
                 };
                 serialize_profile(document)
             };
-            buffer.set_text(&text);
+            set_editor_text(&model, &buffer, &text);
             graph.queue_draw();
         }
     });
@@ -1230,7 +1481,7 @@ fn wire_actions(
                 document.convolutions.clear();
                 (serialize_profile(document), document.clone())
             };
-            buffer.set_text(&text);
+            set_editor_text(&model, &buffer, &text);
             rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
             update_convolution_ui(&ui, &snapshot);
             graph.queue_draw();
@@ -1280,107 +1531,56 @@ fn wire_actions(
         move |_, _| profile_popover.popdown()
     });
 
-    let pending_save = model.pending_save.clone();
     buffer.connect_changed({
         let model = model.clone();
         let buffer = buffer.clone();
         let text_view = text_view.clone();
-        let filter_list = filter_list.clone();
-        let convolution_ui = convolution_ui.clone();
-        let name = name_entry.clone();
-        let status = status.clone();
         let graph = graph.clone();
         let analysis_label = analysis_label.clone();
-        let pending = pending_save.clone();
-        let profile_menu = profile_menu.clone();
+        let list = filter_list.clone();
+        let name = name_entry.clone();
+        let convolution_ui = convolution_ui.clone();
         move |_| {
-            if model.loading.get() {
+            if model.loading.get() || model.syncing_text.get() {
                 return;
             }
-            set_profile_menu_text(&profile_menu, &name.text());
-            if let Some(source) = pending.borrow_mut().take() {
-                source.remove();
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                .to_string();
+            let document = parse_text(name.text(), &text);
+            if !document.is_activatable() {
+                text_view.add_css_class("invalid-draft");
+                return;
             }
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let text_view = text_view.clone();
-            let filter_list = filter_list.clone();
-            let convolution_ui = convolution_ui.clone();
-            let name = name.clone();
-            let status = status.clone();
-            let graph = graph.clone();
-            let analysis_label = analysis_label.clone();
-            let pending_inner = pending.clone();
-            *pending.borrow_mut() = Some(gtk::glib::timeout_add_local_once(
-                std::time::Duration::from_millis(300),
-                move || {
-                    pending_inner.borrow_mut().take();
-                    let text = buffer
-                        .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                        .to_string();
-                    let draft = parse_text(name.text(), &text);
-                    if draft.is_activatable() {
-                        text_view.remove_css_class("invalid-draft");
-                    } else {
-                        text_view.add_css_class("invalid-draft");
-                    }
-                    let saved = save_current(
-                        &model,
-                        &name.text(),
-                        &text,
-                        &status,
-                        &graph,
-                        &analysis_label,
-                    );
-                    if saved {
-                        rebuild_filter_list(&filter_list, &draft, &model, &buffer, &graph);
-                        update_convolution_ui(&convolution_ui, &draft);
-                    }
-                },
-            ));
+            text_view.remove_css_class("invalid-draft");
+            *model.document.borrow_mut() = Some(document.clone());
+            let preview = preview_analysis(&model, &document);
+            set_analysis_label(&analysis_label, &preview);
+            *model.analysis.borrow_mut() = Some(preview);
+            remember_edit(&model);
+            schedule_live(&model);
+            schedule_save(&model);
+            rebuild_filter_list(&list, &document, &model, &buffer, &graph);
+            update_convolution_ui(&convolution_ui, &document);
+            graph.queue_draw();
         }
     });
     name_entry.connect_changed({
         let model = model.clone();
-        let buffer = buffer.clone();
-        let name = name_entry.clone();
-        let status = status.clone();
-        let graph = graph.clone();
-        let analysis_label = analysis_label.clone();
-        let pending = pending_save.clone();
-        let profile_menu = profile_menu.clone();
-        move |_| {
+        let menu = profile_menu.clone();
+        move |name| {
             if model.loading.get() {
                 return;
             }
-            set_profile_menu_text(&profile_menu, &name.text());
-            if let Some(source) = pending.borrow_mut().take() {
-                source.remove();
+            model.unsaved.set(true);
+            model
+                .live_revision
+                .set(model.live_revision.get().wrapping_add(1));
+            set_profile_menu_text(&menu, &name.text());
+            if let Some(document) = model.document.borrow_mut().as_mut() {
+                document.name = name.text().to_string();
             }
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let name = name.clone();
-            let status = status.clone();
-            let graph = graph.clone();
-            let analysis_label = analysis_label.clone();
-            let pending_inner = pending.clone();
-            *pending.borrow_mut() = Some(gtk::glib::timeout_add_local_once(
-                std::time::Duration::from_millis(300),
-                move || {
-                    pending_inner.borrow_mut().take();
-                    let text = buffer
-                        .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                        .to_string();
-                    save_current(
-                        &model,
-                        &name.text(),
-                        &text,
-                        &status,
-                        &graph,
-                        &analysis_label,
-                    );
-                },
-            ));
+            schedule_save(&model);
         }
     });
 
@@ -1794,9 +1994,6 @@ fn wire_actions(
     });
     trim.connect_value_changed({
         let model = model.clone();
-        let buffer = buffer.clone();
-        let name = name_entry.clone();
-        let status = status.clone();
         let graph = graph.clone();
         let analysis_label = analysis_label.clone();
         move |spin| {
@@ -1804,23 +2001,23 @@ fn wire_actions(
                 return;
             }
             model.manual_trim.set(spin.value());
-            let text = buffer
-                .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                .to_string();
-            save_current(
-                &model,
-                &name.text(),
-                &text,
-                &status,
-                &graph,
-                &analysis_label,
-            );
+            remember_edit(&model);
+            if let Some(document) = model.document.borrow().as_ref() {
+                let preview = preview_analysis(&model, document);
+                set_analysis_label(&analysis_label, &preview);
+                *model.analysis.borrow_mut() = Some(preview);
+            }
+            schedule_live(&model);
+            schedule_save(&model);
+            graph.queue_draw();
         }
     });
 
+    let tone_drag = Rc::new(Cell::new(None::<f64>));
     let drag_state: Rc<RefCell<Option<(usize, f64, f64)>>> = Rc::new(RefCell::new(None));
     let gesture = gtk::GestureDrag::new();
     gesture.connect_drag_begin({
+        let tone_drag = tone_drag.clone();
         let model = model.clone();
         let state = drag_state.clone();
         let graph = graph.clone();
@@ -1828,6 +2025,27 @@ fn wire_actions(
         let analysis_label = analysis_label.clone();
         move |_, x, y| {
             graph.grab_focus();
+            model.graph_dragging.set(true);
+            tone_drag.set(None);
+            if let Some(listener) = model
+                .graph_tone
+                .borrow()
+                .as_ref()
+                .filter(|ui| ui.cursor.is_active())
+            {
+                if let Some((frequency, _)) = graph::values_at_position(
+                    x,
+                    graph.height() as f64 / 2.0,
+                    graph.width() as f64,
+                    graph.height() as f64,
+                ) {
+                    listener.sweep.set_active(false);
+                    listener.tone.frequency.set_value(tone_position(frequency));
+                    tone_drag.set(Some(tone_position(frequency)));
+                }
+                return;
+            }
+            model.history.borrow_mut().checkpoint();
             let Some(document) = model.document.borrow().as_ref().cloned() else {
                 return;
             };
@@ -1853,6 +2071,7 @@ fn wire_actions(
                 if ((point_x - x).powi(2) + (point_y - y).powi(2)).sqrt() <= 34.0 {
                     *state.borrow_mut() = Some((index, filter.frequency, filter.gain_db));
                     model.selected_filter.set(Some(index));
+                    sync_band_ui(&model);
                     graph.queue_draw();
                     return;
                 }
@@ -1866,12 +2085,6 @@ fn wire_actions(
                 let Some(document) = document.as_mut() else {
                     return;
                 };
-                if !document.convolutions.is_empty() {
-                    status.set_text(
-                        "Convolution is active · remove the impulse response before adding a band",
-                    );
-                    return;
-                }
                 if !can_add_filter(document, ChannelSelection::All) {
                     status.set_text("This profile already has 64 bands on one channel");
                     return;
@@ -1901,11 +2114,20 @@ fn wire_actions(
         }
     });
     gesture.connect_drag_update({
+        let tone_drag = tone_drag.clone();
         let model = model.clone();
         let state = drag_state.clone();
         let graph = graph.clone();
         let analysis_label = analysis_label.clone();
         move |_, dx, dy| {
+            if let Some(position) = tone_drag.get() {
+                if let Some(ui) = model.graph_tone.borrow().as_ref() {
+                    ui.tone.frequency.set_value(
+                        (position + dx / (graph.width() as f64 - 82.0).max(1.0)).clamp(0.0, 1.0),
+                    );
+                }
+                return;
+            }
             let Some((index, start_frequency, start_gain)) = *state.borrow() else {
                 return;
             };
@@ -1927,6 +2149,9 @@ fn wire_actions(
             };
             set_analysis_label(&analysis_label, &preview);
             *model.analysis.borrow_mut() = Some(preview);
+            sync_band_ui(&model);
+            sync_listening(&model);
+            schedule_live(&model);
             graph.queue_draw();
         }
     });
@@ -1938,12 +2163,14 @@ fn wire_actions(
         let graph = graph.clone();
         let convolution_ui = convolution_ui.clone();
         move |_, _, _| {
+            model.graph_dragging.set(false);
+            let snapshot = model.document.borrow().clone();
             if state.borrow_mut().take().is_some()
-                && let Some(snapshot) = model.document.borrow().as_ref().cloned()
+                && let Some(snapshot) = snapshot
             {
                 rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
                 update_convolution_ui(&convolution_ui, &snapshot);
-                buffer.set_text(&serialize_profile(&snapshot));
+                set_editor_text(&model, &buffer, &serialize_profile(&snapshot));
             }
         }
     });
@@ -2021,32 +2248,246 @@ fn load_profile(
     let Some(profile) = model.profiles.borrow().get(index).cloned() else {
         return;
     };
+    if model.pending_save.borrow().is_some() {
+        if let Some(timer) = model.pending_save.borrow_mut().take() {
+            timer.remove();
+        }
+        submit_live(model, true);
+    }
+    if let Some(timer) = model.pending_live.borrow_mut().take() {
+        timer.remove();
+    }
+    if let Some(id) = model.current_id.borrow().as_ref() {
+        model.live_worker.end(id);
+    }
     model.loading.set(true);
     *model.current_id.borrow_mut() = Some(profile.id.clone());
     model.selected_filter.set(None);
+    if let Some(ui) = model.bands.borrow().as_ref() {
+        ui.range.set(12.0);
+    }
     set_profile_menu_text(profile_menu, &profile.name);
     name.set_text(&profile.name);
-    buffer.set_text(&profile.text);
+    set_editor_text(model, buffer, &profile.text);
     model.manual_trim.set(profile.manual_trim_db);
     trim.set_value(profile.manual_trim_db);
     let document = parse_text(&profile.name, &profile.text);
+    let initial = editing::Snapshot {
+        text: serialize_profile(&document),
+        trim: profile.manual_trim_db,
+    };
+    model.history.borrow_mut().reset(initial);
+    model.unsaved.set(false);
+    *model.reference.borrow_mut() = model.history.borrow().baseline().cloned();
+    model.hear_reference.set(false);
     *model.document.borrow_mut() = Some(document.clone());
+    sync_listening(model);
     rebuild_filter_list(filter_list, &document, model, buffer, graph);
     convolution_ui.layout.set(profile.impulse_layout);
     update_convolution_ui(convolution_ui, &document);
     show_profile_page(convolution_ui, &document);
     let curves = model.client.curves(&profile.id).unwrap_or_default();
-    {
-        let mut overlay = model.overlay.borrow_mut();
-        overlay.measurement = curves.measurement;
-        overlay.target = curves.target;
-    }
+    update_curve_context(model, curves);
     if let Ok(analysis) = model.client.analyze(&profile.id) {
         set_analysis_label(analysis_label, &analysis);
         store_service_analysis(model, analysis);
         graph.queue_draw();
     }
     model.loading.set(false);
+}
+
+fn show_curve_details(
+    window: &adw::ApplicationWindow,
+    model: &Rc<Model>,
+    kind: massiveeq_core::CurveKind,
+    status: &gtk::Label,
+) {
+    use massiveeq_core::{
+        CurveCompensation as Compensation, CurveMetadata, CurveTransducer as Transducer,
+    };
+    let Some(id) = model.current_id.borrow().clone() else {
+        return;
+    };
+    let curves = model.curves.borrow().clone();
+    let (exists, metadata) = match kind {
+        massiveeq_core::CurveKind::Measurement => {
+            (curves.measurement.is_some(), curves.measurement_metadata)
+        }
+        massiveeq_core::CurveKind::Target => (curves.target.is_some(), curves.target_metadata),
+    };
+    if !exists {
+        status.set_text("Load this curve before adding its measurement details");
+        return;
+    }
+    let metadata = metadata.unwrap_or_default();
+    let dialog = adw::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title("Curve details")
+        .default_width(430)
+        .default_height(620)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    let heading = gtk::Label::new(Some(match kind {
+        massiveeq_core::CurveKind::Measurement => "Measurement context",
+        massiveeq_core::CurveKind::Target => "Target context",
+    }));
+    heading.set_xalign(0.0);
+    heading.add_css_class("panel-title");
+    content.append(&heading);
+    let entry = |label: &str, value: &str, placeholder: &str| {
+        let field = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let title = gtk::Label::new(Some(label));
+        title.set_xalign(0.0);
+        title.add_css_class("level-code");
+        field.append(&title);
+        let input = gtk::Entry::new();
+        input.set_text(value);
+        input.set_placeholder_text(Some(placeholder));
+        input.update_property(&[gtk::accessible::Property::Label(label)]);
+        field.append(&input);
+        content.append(&field);
+        input
+    };
+    let source = entry(
+        "Source",
+        &metadata.source,
+        "Author, publication, or source URL",
+    );
+    source.set_max_length(2048);
+    let fixture = entry(
+        "Measurement fixture",
+        &metadata.fixture,
+        "Unknown unless documented by the source",
+    );
+    fixture.set_max_length(256);
+    let compensation = gtk::DropDown::from_strings(&[
+        "Unknown compensation",
+        "Raw response",
+        "Diffuse-field compensated",
+        "Other compensation",
+    ]);
+    compensation.set_selected(match metadata.compensation {
+        Compensation::Unknown => 0,
+        Compensation::Raw => 1,
+        Compensation::DiffuseField => 2,
+        Compensation::Other => 3,
+    });
+    compensation.update_property(&[gtk::accessible::Property::Label("Curve compensation")]);
+    content.append(&compensation);
+    let baseline = entry(
+        "Compensation baseline",
+        &metadata.baseline,
+        "Name of the fixture-specific baseline",
+    );
+    baseline.set_max_length(256);
+    let transducer = gtk::DropDown::from_strings(&[
+        "Unknown headphone type",
+        "Over-ear headphones",
+        "In-ear headphones",
+        "Speakers",
+    ]);
+    transducer.set_selected(match metadata.transducer {
+        Transducer::Unknown => 0,
+        Transducer::OverEar => 1,
+        Transducer::InEar => 2,
+        Transducer::Speaker => 3,
+    });
+    transducer.update_property(&[gtk::accessible::Property::Label("Curve headphone type")]);
+    content.append(&transducer);
+    let note = gtk::Label::new(Some(
+        "These details describe the supplied data. Matching declarations do not verify a measurement. Target ranges are references, not pass/fail tests; the EQ curve is a prediction.",
+    ));
+    note.set_wrap(true);
+    note.set_xalign(0.0);
+    note.add_css_class("level-code");
+    content.append(&note);
+    let link = gtk::LinkButton::with_label(
+        "https://headphones.com/blogs/features/what-headphone-sound-profiles-do-people-like",
+        "Headphones.com research and context",
+    );
+    content.append(&link);
+    let error = gtk::Label::new(None);
+    error.set_wrap(true);
+    error.set_xalign(0.0);
+    content.append(&error);
+    let save = gtk::Button::with_label("Save curve details");
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let cancel = gtk::Button::with_label("Cancel");
+    cancel.connect_clicked({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        }
+    });
+    save.set_hexpand(true);
+    actions.append(&cancel);
+    actions.append(&save);
+    content.append(&actions);
+    save.connect_clicked({
+        let model = model.clone();
+        let dialog = dialog.downgrade();
+        let error = error.clone();
+        move |_| {
+            let metadata = CurveMetadata {
+                source: source.text().into(),
+                fixture: fixture.text().into(),
+                baseline: baseline.text().into(),
+                compensation: match compensation.selected() {
+                    1 => Compensation::Raw,
+                    2 => Compensation::DiffuseField,
+                    3 => Compensation::Other,
+                    _ => Compensation::Unknown,
+                },
+                transducer: match transducer.selected() {
+                    1 => Transducer::OverEar,
+                    2 => Transducer::InEar,
+                    3 => Transducer::Speaker,
+                    _ => Transducer::Unknown,
+                },
+            };
+            match model.client.set_curve_metadata(&id, kind, &metadata) {
+                Ok(curves) => {
+                    update_curve_context(&model, curves);
+                    if let Some(dialog) = dialog.upgrade() {
+                        dialog.close();
+                    }
+                }
+                Err(e) => error.set_text(&e.to_string()),
+            }
+        }
+    });
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&content)
+        .build();
+    dialog.set_content(Some(&scroll));
+    dialog.present();
+}
+
+fn update_curve_context(model: &Model, curves: massiveeq_core::Curves) {
+    let full = curves.context_note();
+    if let Some(label) = model.curve_context.borrow().as_ref() {
+        label.set_visible(curves.measurement.is_some() || curves.target.is_some());
+        label.set_text(if full.contains("contexts differ") {
+            "Measurement and target contexts differ. See curve details."
+        } else if full.contains("matching user-entered") {
+            "Curves share declared context. EQ response is predicted."
+        } else {
+            "Curve context is incomplete. See curve details before comparing targets."
+        });
+        label.set_tooltip_text(Some(&full));
+    }
+    let mut overlay = model.overlay.borrow_mut();
+    overlay.measurement = curves.measurement.clone();
+    overlay.target = curves.target.clone();
+    *model.curves.borrow_mut() = curves;
 }
 
 /// The graph header's menu for measurement and target curves.
@@ -2056,6 +2497,8 @@ struct CurvesUi {
     load_target: gtk::Button,
     clear_measurement: gtk::Button,
     clear_target: gtk::Button,
+    measurement_details: gtk::Button,
+    target_details: gtk::Button,
 }
 
 fn build_curves_menu() -> Rc<CurvesUi> {
@@ -2085,6 +2528,8 @@ fn build_curves_menu() -> Rc<CurvesUi> {
     let load_target = button("LOAD TARGET…");
     let clear_measurement = button("CLEAR MEASUREMENT");
     let clear_target = button("CLEAR TARGET");
+    let measurement_details = button("Measurement details…");
+    let target_details = button("Target details…");
     let popover = gtk::Popover::new();
     popover.set_child(Some(&content));
     menu.set_popover(Some(&popover));
@@ -2094,6 +2539,8 @@ fn build_curves_menu() -> Rc<CurvesUi> {
         load_target,
         clear_measurement,
         clear_target,
+        measurement_details,
+        target_details,
     })
 }
 
@@ -2104,6 +2551,24 @@ fn wire_curves(
     graph: &gtk::DrawingArea,
     status: &gtk::Label,
 ) {
+    for (button, kind) in [
+        (
+            &ui.measurement_details,
+            massiveeq_core::CurveKind::Measurement,
+        ),
+        (&ui.target_details, massiveeq_core::CurveKind::Target),
+    ] {
+        button.connect_clicked({
+            let window = window.clone();
+            let model = model.clone();
+            let menu = ui.menu.clone();
+            let status = status.clone();
+            move |_| {
+                menu.popdown();
+                show_curve_details(&window, &model, kind, &status);
+            }
+        });
+    }
     // Save (or with an empty path, clear) a curve and show the result.
     let apply = Rc::new({
         let model = model.clone();
@@ -2115,9 +2580,7 @@ fn wire_curves(
             };
             match model.client.set_curve(&id, kind, path) {
                 Ok(curves) => {
-                    let mut overlay = model.overlay.borrow_mut();
-                    overlay.measurement = curves.measurement;
-                    overlay.target = curves.target;
+                    update_curve_context(&model, curves);
                     status.set_text(if path.is_empty() {
                         "Curve cleared"
                     } else {
@@ -2227,7 +2690,6 @@ impl Segmented {
 
 /// Controls of the tone finder page.
 struct ToneUi {
-    page: gtk::Box,
     play: gtk::ToggleButton,
     signal: Segmented,
     band: Segmented,
@@ -2338,7 +2800,6 @@ fn build_tone_page() -> (gtk::Box, Rc<ToneUi>) {
     card.append(&fix_row);
     page.append(&card);
     let ui = Rc::new(ToneUi {
-        page: page.clone(),
         play,
         signal,
         band,
@@ -2389,10 +2850,7 @@ fn push_tone(model: &Model, ui: &ToneUi, device_drop: &gtk::DropDown, status: &g
         ui.play.set_active(false);
         return;
     };
-    if let Err(error) = model.client.play_tone(&key, &tone_settings(ui)) {
-        status.set_text(&error.to_string());
-        ui.play.set_active(false);
-    }
+    model.live_worker.tone(key, tone_settings(ui));
 }
 
 /// Q of the fix filter: as wide as what the listener was hearing.
@@ -2471,7 +2929,7 @@ fn wire_tone(
                 "media-playback-start-symbolic"
             });
             if !play.is_active() {
-                let _ = model.client.stop_tone();
+                model.live_worker.stop_tone();
             }
             push();
         }
@@ -2500,15 +2958,12 @@ fn wire_tone(
             gtk::glib::ControlFlow::Continue
         }
     });
-    // Leaving the page or closing the window stops the tone.
-    {
-        let play = ui.play.clone();
-        ui.page.connect_unmap(move |_| play.set_active(false));
-    }
+    // The graph's listener remains available while editing bands. Text/IR
+    // navigation is wired at the stacks, and closing still stops playback.
     window.connect_close_request({
         let model = model.clone();
         move |_| {
-            let _ = model.client.stop_tone();
+            model.live_worker.stop_tone();
             gtk::glib::Propagation::Proceed
         }
     });
@@ -2552,7 +3007,7 @@ fn wire_tone(
                     return;
                 };
                 model.selected_filter.set(Some(index));
-                buffer.set_text(&text);
+                set_editor_text(&model, &buffer, &text);
                 rebuild_filter_list(&filter_list, &snapshot, &model, &buffer, &graph);
                 set_analysis_label(&analysis_label, &preview);
                 *model.analysis.borrow_mut() = Some(preview);
@@ -2620,10 +3075,881 @@ fn show_profile_page(ui: &ConvolutionUi, profile: &ProfileDocument) {
         "filters"
     });
     // The stack's own notification can be missed before the window maps.
-    if convolution_only {
-        ui.convolution_mode.set_active(true);
+    (ui.sync_tabs)();
+}
+
+struct GraphToneUi {
+    tone: Rc<ToneUi>,
+    cursor: gtk::ToggleButton,
+    sweep: gtk::ToggleButton,
+}
+
+fn sweep_position(start: f64, elapsed_seconds: f64, full_seconds: f64) -> f64 {
+    (start + elapsed_seconds.max(0.0) / full_seconds.max(1.0)).clamp(0.0, 1.0)
+}
+
+fn build_graph_tone(tone: &Rc<ToneUi>) -> (adw::WrapBox, GraphToneUi) {
+    let row = adw::WrapBox::builder()
+        .child_spacing(8)
+        .line_spacing(8)
+        .build();
+    row.add_css_class("graph-listen");
+    let play = gtk::ToggleButton::with_label("Listen");
+    play.update_property(&[gtk::accessible::Property::Label("Listen to graph tone")]);
+    let sweep = gtk::ToggleButton::with_label("Sweep");
+    sweep.set_tooltip_text(Some(
+        "Move a sine tone upward through the graph. Turn Sweep off to hold the current frequency.",
+    ));
+    let cursor = gtk::ToggleButton::with_label("Tone cursor");
+    cursor.set_tooltip_text(Some(
+        "Drag anywhere on the graph to move the tone frequency. Turn off to edit EQ points.",
+    ));
+    let speed = gtk::DropDown::from_strings(&["15 s", "30 s", "60 s"]);
+    speed.set_selected(1);
+    speed.update_property(&[gtk::accessible::Property::Label("Full sweep duration")]);
+    let frequency = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.001);
+    frequency.set_draw_value(false);
+    frequency.set_size_request(120, -1);
+    frequency.set_value(tone.frequency.value());
+    frequency.update_property(&[gtk::accessible::Property::Label("Graph tone frequency")]);
+    let readout = gtk::Label::new(Some("1.00 kHz"));
+    readout.add_css_class("level-code");
+    let ears = gtk::DropDown::from_strings(&["Both ears", "Left ear", "Right ear"]);
+    ears.update_property(&[gtk::accessible::Property::Label("Graph tone ears")]);
+    for widget in [
+        play.upcast_ref::<gtk::Widget>(),
+        sweep.upcast_ref(),
+        speed.upcast_ref(),
+        cursor.upcast_ref(),
+        frequency.upcast_ref(),
+        readout.upcast_ref(),
+        ears.upcast_ref(),
+    ] {
+        row.append(widget);
+    }
+    for (text, index) in [("−1 dB here", 1), ("+1 dB here", 2)] {
+        let fix = gtk::Button::with_label(text);
+        let target = tone.fixes[index].0.clone();
+        fix.connect_clicked(move |_| target.emit_clicked());
+        row.append(&fix);
+    }
+    play.connect_toggled({
+        let tone = tone.clone();
+        move |button| tone.play.set_active(button.is_active())
+    });
+    tone.play.connect_toggled({
+        let play = play.clone();
+        let sweep = sweep.clone();
+        move |button| {
+            play.set_active(button.is_active());
+            if !button.is_active() {
+                sweep.set_active(false);
+            }
+        }
+    });
+    frequency.connect_value_changed({
+        let tone = tone.clone();
+        move |scale| tone.frequency.set_value(scale.value())
+    });
+    tone.frequency.connect_value_changed({
+        let frequency = frequency.clone();
+        let readout = readout.clone();
+        move |scale| {
+            frequency.set_value(scale.value());
+            readout.set_text(&format_band_frequency(tone_frequency(scale.value())));
+        }
+    });
+    ears.connect_selected_notify({
+        let tone = tone.clone();
+        move |drop| {
+            tone.ears.buttons[match drop.selected() {
+                1 => 0,
+                2 => 2,
+                _ => 1,
+            }]
+            .set_active(true);
+        }
+    });
+    for (index, button) in tone.ears.buttons.iter().enumerate() {
+        let ears = ears.clone();
+        button.connect_toggled(move |b| {
+            if b.is_active() {
+                ears.set_selected(match index {
+                    0 => 1,
+                    2 => 2,
+                    _ => 0,
+                });
+            }
+        });
+    }
+    let clock = Rc::new(RefCell::new(None::<(std::time::Instant, f64)>));
+    sweep.connect_toggled({
+        let tone = tone.clone();
+        let clock = clock.clone();
+        move |button| {
+            if button.is_active() {
+                tone.signal.buttons[0].set_active(true);
+                if tone.frequency.value() >= 0.999 {
+                    tone.frequency.set_value(0.0);
+                }
+                *clock.borrow_mut() = Some((std::time::Instant::now(), tone.frequency.value()));
+                tone.play.set_active(true);
+            } else {
+                *clock.borrow_mut() = None;
+            }
+        }
+    });
+    speed.connect_selected_notify({
+        let clock = clock.clone();
+        let tone = tone.clone();
+        move |_| {
+            let running = clock.borrow().is_some();
+            if running {
+                *clock.borrow_mut() = Some((std::time::Instant::now(), tone.frequency.value()));
+            }
+        }
+    });
+    gtk::glib::timeout_add_local(std::time::Duration::from_millis(25), {
+        let tone = tone.clone();
+        let sweep = sweep.clone();
+        let clock = clock.clone();
+        move || {
+            let running = *clock.borrow();
+            if let Some((start, position)) = running {
+                let seconds = match speed.selected() {
+                    0 => 15.0,
+                    2 => 60.0,
+                    _ => 30.0,
+                };
+                let next = sweep_position(position, start.elapsed().as_secs_f64(), seconds);
+                tone.frequency.set_value(next);
+                if next >= 1.0 {
+                    sweep.set_active(false);
+                    tone.play.set_active(false);
+                }
+            }
+            gtk::glib::ControlFlow::Continue
+        }
+    });
+    (
+        row,
+        GraphToneUi {
+            tone: tone.clone(),
+            cursor,
+            sweep,
+        },
+    )
+}
+
+struct ListeningUi {
+    undo: gtk::Button,
+    redo: gtk::Button,
+    reference: gtk::ToggleButton,
+    bass: gtk::SpinButton,
+    tilt: gtk::SpinButton,
+    syncing: Cell<bool>,
+}
+
+fn submit_live(model: &Rc<Model>, save: bool) {
+    let Some(id) = model.current_id.borrow().clone() else {
+        return;
+    };
+    let Some(document) = model.document.borrow().clone() else {
+        return;
+    };
+    if !document.is_activatable() {
+        return;
+    }
+    let text = serialize_profile(&document);
+    let reference = model
+        .reference
+        .borrow()
+        .clone()
+        .filter(|snapshot| {
+            parse_text(&document.name, &snapshot.text).convolutions == document.convolutions
+        })
+        .map(|snapshot| live_client::Reference {
+            text: snapshot.text,
+            trim: snapshot.trim,
+        });
+    let hear_reference = reference.is_some() && model.hear_reference.get();
+    let key = serde_json::to_string(&(
+        &id,
+        &document.name,
+        &text,
+        model.manual_trim.get(),
+        &reference,
+        hear_reference,
+    ))
+    .unwrap_or_default();
+    let revision = if model.last_submitted.borrow().as_ref() != Some(&key) {
+        *model.last_submitted.borrow_mut() = Some(key);
+        let next = model.live_revision.get().wrapping_add(1);
+        model.live_revision.set(next);
+        next
     } else {
-        ui.parametric_mode.set_active(true);
+        model.live_revision.get()
+    };
+    // The local bank keeps the latest draft even if the user switches away
+    // and back before a background save completes.
+    if let Some(profile) = model.profiles.borrow_mut().iter_mut().find(|p| p.id == id) {
+        profile.text = text.clone();
+        profile.manual_trim_db = model.manual_trim.get();
+        if profile.name != document.name {
+            model.bank_names_dirty.set(true);
+        }
+        profile.name = document.name.clone();
+    }
+    model.live_worker.submit(live_client::Draft {
+        revision,
+        id,
+        name: document.name,
+        text,
+        trim: model.manual_trim.get(),
+        reference,
+        hear_reference,
+        save,
+    });
+}
+
+fn schedule_live(model: &Rc<Model>) {
+    model
+        .live_revision
+        .set(model.live_revision.get().wrapping_add(1));
+    if model.pending_live.borrow().is_some() {
+        return;
+    }
+    let model = model.clone();
+    let callback = model.clone();
+    *model.pending_live.borrow_mut() = Some(gtk::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(35),
+        move || {
+            callback.pending_live.borrow_mut().take();
+            submit_live(&callback, false);
+        },
+    ));
+}
+
+fn schedule_save(model: &Rc<Model>) {
+    if let Some(timer) = model.pending_save.borrow_mut().take() {
+        timer.remove();
+    }
+    let model = model.clone();
+    let callback = model.clone();
+    *model.pending_save.borrow_mut() = Some(gtk::glib::timeout_add_local_once(
+        std::time::Duration::from_millis(300),
+        move || {
+            callback.pending_save.borrow_mut().take();
+            callback.history.borrow_mut().checkpoint();
+            submit_live(&callback, true);
+        },
+    ));
+}
+
+fn set_editor_text(model: &Rc<Model>, buffer: &gtk::TextBuffer, text: &str) {
+    model.syncing_text.set(true);
+    buffer.set_text(text);
+    model.syncing_text.set(false);
+    if model.loading.get() {
+        return;
+    }
+    let name = model
+        .document
+        .borrow()
+        .as_ref()
+        .map(|d| d.name.clone())
+        .unwrap_or_default();
+    let document = parse_text(name, text);
+    if !document.is_activatable() {
+        return;
+    }
+    *model.document.borrow_mut() = Some(document.clone());
+    *model.analysis.borrow_mut() = Some(preview_analysis(model, &document));
+    remember_edit(model);
+    schedule_live(model);
+    schedule_save(model);
+}
+
+fn remember_edit(model: &Rc<Model>) {
+    model.unsaved.set(true);
+    if !model.restoring_history.get()
+        && let Some(document) = model.document.borrow().as_ref()
+    {
+        model.history.borrow_mut().record(editing::Snapshot {
+            text: serialize_profile(document),
+            trim: model.manual_trim.get(),
+        });
+    }
+    sync_listening(model);
+}
+
+fn sync_listening(model: &Model) {
+    let ui = model.listening.borrow();
+    let Some(ui) = ui.as_ref() else {
+        return;
+    };
+    ui.syncing.set(true);
+    ui.undo.set_sensitive(model.history.borrow().can_undo());
+    ui.redo.set_sensitive(model.history.borrow().can_redo());
+    let compatible = model.document.borrow().as_ref().is_some_and(|document| {
+        model.reference.borrow().as_ref().is_some_and(|snapshot| {
+            parse_text(&document.name, &snapshot.text).convolutions == document.convolutions
+        })
+    });
+    ui.reference.set_sensitive(compatible);
+    if !compatible {
+        model.hear_reference.set(false);
+    }
+    ui.reference.set_active(model.hear_reference.get());
+    if let Some(document) = model.document.borrow().as_ref() {
+        ui.bass.set_value(editing::bass_db(document));
+        ui.tilt.set_value(editing::tilt_db(document));
+    }
+    ui.syncing.set(false);
+}
+
+fn build_listening_controls(
+    window: &adw::ApplicationWindow,
+    model: &Rc<Model>,
+    buffer: &gtk::TextBuffer,
+    list: &gtk::FlowBox,
+    graph: &gtk::DrawingArea,
+    trim: &gtk::SpinButton,
+    status: &gtk::Label,
+) -> adw::WrapBox {
+    let row = adw::WrapBox::builder()
+        .child_spacing(8)
+        .line_spacing(8)
+        .build();
+    row.add_css_class("listening-controls");
+    let undo = gtk::Button::with_label("Undo");
+    let redo = gtk::Button::with_label("Redo");
+    let reference = gtk::ToggleButton::with_label("Hear starting sound");
+    reference.set_tooltip_text(Some(
+        "Compare your captured starting sound and current EQ at the same estimated perceived level",
+    ));
+    let capture = gtk::Button::with_label("Capture start");
+    capture.set_tooltip_text(Some(
+        "Use the current EQ as the new starting sound for comparison",
+    ));
+    for widget in [
+        undo.upcast_ref::<gtk::Widget>(),
+        redo.upcast_ref(),
+        reference.upcast_ref(),
+        capture.upcast_ref(),
+    ] {
+        row.append(widget);
+    }
+    let bass = gtk::SpinButton::with_range(-12.0, 12.0, 0.5);
+    let tilt = gtk::SpinButton::with_range(-12.0, 12.0, 0.5);
+    for (spin, label, tooltip) in [
+        (
+            &bass,
+            "Bass",
+            "Broad low shelf at 105 Hz. This adjustment remains editable as a normal EQ band.",
+        ),
+        (
+            &tilt,
+            "Tilt",
+            "Positive is brighter; negative is warmer. Balanced low/high shelves around 1 kHz.",
+        ),
+    ] {
+        spin.set_digits(1);
+        spin.set_width_chars(4);
+        spin.update_property(&[gtk::accessible::Property::Label(label)]);
+        spin.set_tooltip_text(Some(tooltip));
+        let field = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let label = gtk::Label::new(Some(label));
+        label.add_css_class("level-code");
+        field.append(&label);
+        field.append(spin);
+        row.append(&field);
+    }
+    *model.listening.borrow_mut() = Some(ListeningUi {
+        undo: undo.clone(),
+        redo: redo.clone(),
+        reference: reference.clone(),
+        bass: bass.clone(),
+        tilt: tilt.clone(),
+        syncing: Cell::new(false),
+    });
+    for (button, backwards) in [(&undo, true), (&redo, false)] {
+        button.connect_clicked({
+            let model = model.clone();
+            let buffer = buffer.clone();
+            let list = list.clone();
+            let graph = graph.clone();
+            let trim = trim.clone();
+            move |_| {
+                let snapshot = {
+                    let mut history = model.history.borrow_mut();
+                    if backwards {
+                        history.undo()
+                    } else {
+                        history.redo()
+                    }
+                };
+                let Some(snapshot) = snapshot else {
+                    return;
+                };
+                model.restoring_history.set(true);
+                model.hear_reference.set(false);
+                model.manual_trim.set(snapshot.trim);
+                model.loading.set(true);
+                trim.set_value(snapshot.trim);
+                model.loading.set(false);
+                let name = model
+                    .document
+                    .borrow()
+                    .as_ref()
+                    .map(|d| d.name.clone())
+                    .unwrap_or_default();
+                *model.document.borrow_mut() = Some(parse_text(&name, &snapshot.text));
+                set_editor_text(&model, &buffer, &snapshot.text);
+                model.restoring_history.set(false);
+                if let Some(document) = model.document.borrow().as_ref().cloned() {
+                    rebuild_filter_list(&list, &document, &model, &buffer, &graph);
+                }
+                sync_listening(&model);
+                graph.queue_draw();
+            }
+        });
+    }
+    reference.connect_toggled({
+        let model = model.clone();
+        move |button| {
+            if model
+                .listening
+                .borrow()
+                .as_ref()
+                .is_some_and(|ui| ui.syncing.get())
+            {
+                return;
+            }
+            model.hear_reference.set(button.is_active());
+            submit_live(&model, false);
+        }
+    });
+    capture.connect_clicked({
+        let model = model.clone();
+        let status = status.clone();
+        move |_| {
+            if let Some(document) = model.document.borrow().as_ref() {
+                *model.reference.borrow_mut() = Some(editing::Snapshot {
+                    text: serialize_profile(document),
+                    trim: model.manual_trim.get(),
+                });
+            }
+            model.hear_reference.set(false);
+            sync_listening(&model);
+            submit_live(&model, false);
+            status.set_text("Starting sound captured; comparisons are level matched");
+        }
+    });
+    for (spin, is_bass) in [(&bass, true), (&tilt, false)] {
+        spin.connect_value_changed({
+            let model = model.clone();
+            let buffer = buffer.clone();
+            let graph = graph.clone();
+            let list = list.clone();
+            let status = status.clone();
+            move |spin| {
+                if model.loading.get()
+                    || model
+                        .listening
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|ui| ui.syncing.get())
+                {
+                    return;
+                }
+                let result = {
+                    let mut document = model.document.borrow_mut();
+                    let Some(document) = document.as_mut() else {
+                        return;
+                    };
+                    (if is_bass {
+                        editing::set_bass(document, spin.value())
+                    } else {
+                        editing::set_tilt(document, spin.value())
+                    })
+                    .map(|()| document.clone())
+                };
+                match result {
+                    Ok(document) => {
+                        model.hear_reference.set(false);
+                        set_editor_text(&model, &buffer, &serialize_profile(&document));
+                        rebuild_filter_list(&list, &document, &model, &buffer, &graph);
+                        graph.queue_draw();
+                    }
+                    Err(error) => {
+                        status.set_text(&error);
+                        sync_listening(&model);
+                    }
+                }
+            }
+        });
+    }
+    let shortcuts = gtk::ShortcutController::new();
+    shortcuts.set_scope(gtk::ShortcutScope::Managed);
+    for (trigger, button) in [("<Control>z", undo), ("<Control><Shift>z", redo)] {
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string(trigger),
+            Some(gtk::CallbackAction::new(move |widget, _| {
+                // Text entries keep their native text-editing undo behavior.
+                if widget.root().and_then(|r| r.focus()).is_some_and(|f| {
+                    f.is::<gtk::TextView>() || f.is::<gtk::Text>() || f.is::<gtk::Entry>()
+                }) {
+                    return gtk::glib::Propagation::Proceed;
+                }
+                button.emit_clicked();
+                gtk::glib::Propagation::Stop
+            })),
+        ));
+    }
+    window.add_controller(shortcuts);
+    row
+}
+
+struct BandTile {
+    root: gtk::Box,
+    select: gtk::ToggleButton,
+    gain: gtk::Label,
+    frequency: gtk::Label,
+    kind: gtk::Label,
+    scale: gtk::Scale,
+}
+
+struct BandUi {
+    root: gtk::Box,
+    title: gtk::Label,
+    kind: Segmented,
+    channels: Segmented,
+    frequency: gtk::SpinButton,
+    gain: gtk::SpinButton,
+    q: gtk::SpinButton,
+    enabled: gtk::Switch,
+    previous: gtk::Button,
+    next: gtk::Button,
+    tiles: Vec<BandTile>,
+    range: Cell<f64>,
+    syncing: Rc<Cell<bool>>,
+}
+
+const BAND_KINDS: [FilterKind; 8] = [
+    FilterKind::Peaking,
+    FilterKind::LowShelf,
+    FilterKind::HighShelf,
+    FilterKind::LowPass,
+    FilterKind::HighPass,
+    FilterKind::BandPass,
+    FilterKind::Notch,
+    FilterKind::AllPass,
+];
+const BAND_KIND_LABELS: [&str; 8] = ["PK", "LS", "HS", "LP", "HP", "BP", "NO", "AP"];
+
+fn build_band_editor(
+    model: &Rc<Model>,
+    buffer: &gtk::TextBuffer,
+    graph: &gtk::DrawingArea,
+    list: &gtk::FlowBox,
+) -> gtk::Box {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    root.add_css_class("band-editor");
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let title = gtk::Label::new(Some("Select a band"));
+    title.add_css_class("band-editor-title");
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    heading.append(&title);
+    let enabled = gtk::Switch::new();
+    enabled.set_valign(gtk::Align::Center);
+    enabled.update_property(&[gtk::accessible::Property::Label("Selected band enabled")]);
+    heading.append(&enabled);
+    let previous = gtk::Button::from_icon_name("go-previous-symbolic");
+    let next = gtk::Button::from_icon_name("go-next-symbolic");
+    let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+    for (button, label) in [
+        (&previous, "Move band earlier"),
+        (&next, "Move band later"),
+        (&remove, "Delete selected band"),
+    ] {
+        button.add_css_class("flat");
+        button.set_tooltip_text(Some(label));
+        button.update_property(&[gtk::accessible::Property::Label(label)]);
+        heading.append(button);
+    }
+    root.append(&heading);
+    let kind = Segmented::new(&BAND_KIND_LABELS, 0);
+    let options = adw::WrapBox::builder()
+        .child_spacing(10)
+        .line_spacing(8)
+        .build();
+    kind.root.add_css_class("band-kinds");
+    for (button, name) in kind.buttons.iter().zip([
+        "Peak",
+        "Low shelf",
+        "High shelf",
+        "Low pass",
+        "High pass",
+        "Band pass",
+        "Notch",
+        "All pass",
+    ]) {
+        button.set_tooltip_text(Some(name));
+        button.update_property(&[gtk::accessible::Property::Label(name)]);
+    }
+    let channels = Segmented::new(&["L+R", "L", "R"], 0);
+    options.append(&kind.root);
+    options.append(&channels.root);
+    let frequency = gtk::SpinButton::with_range(20.0, 20_000.0, 1.0);
+    frequency.set_digits(1);
+    frequency.set_width_chars(6);
+    let gain = gtk::SpinButton::with_range(-60.0, 60.0, 0.1);
+    gain.set_digits(2);
+    gain.set_width_chars(5);
+    let q = gtk::SpinButton::with_range(0.01, 1000.0, 0.01);
+    q.set_digits(3);
+    q.set_width_chars(5);
+    for (spin, label, unit) in [
+        (&frequency, "Frequency", "Hz"),
+        (&gain, "Gain", "dB"),
+        (&q, "Q", "Q"),
+    ] {
+        spin.add_css_class("band-readout");
+        spin.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Selected band {label}"
+        ))]);
+        let field = spin_field(label, unit, spin);
+        field.set_hexpand(false);
+        spin.set_hexpand(false);
+        options.append(&field);
+    }
+    root.append(&options);
+    let syncing = Rc::new(Cell::new(false));
+    for (button, filter_kind) in kind.buttons.iter().zip(BAND_KINDS) {
+        button.connect_toggled({
+            let model = model.clone();
+            let buffer = buffer.clone();
+            let graph = graph.clone();
+            let syncing = syncing.clone();
+            move |button| {
+                if !syncing.get()
+                    && button.is_active()
+                    && let Some(index) = model.selected_filter.get()
+                {
+                    update_filter(&model, &buffer, &graph, index, |filter| {
+                        filter.kind = filter_kind
+                    });
+                }
+            }
+        });
+    }
+    for (button, selection) in channels.buttons.iter().zip([
+        ChannelSelection::All,
+        ChannelSelection::Left,
+        ChannelSelection::Right,
+    ]) {
+        button.connect_toggled({
+            let model = model.clone();
+            let buffer = buffer.clone();
+            let graph = graph.clone();
+            let syncing = syncing.clone();
+            move |button| {
+                if !syncing.get()
+                    && button.is_active()
+                    && let Some(index) = model.selected_filter.get()
+                {
+                    update_filter(&model, &buffer, &graph, index, |filter| {
+                        filter.channels = selection
+                    });
+                }
+            }
+        });
+    }
+    for (spin, parameter) in [(&frequency, 0), (&gain, 1), (&q, 2)] {
+        spin.connect_value_changed({
+            let model = model.clone();
+            let buffer = buffer.clone();
+            let graph = graph.clone();
+            let syncing = syncing.clone();
+            move |spin| {
+                if !syncing.get()
+                    && let Some(index) = model.selected_filter.get()
+                {
+                    update_filter(&model, &buffer, &graph, index, |filter| match parameter {
+                        0 => filter.frequency = spin.value(),
+                        1 => filter.gain_db = spin.value(),
+                        _ => filter.q = spin.value(),
+                    });
+                }
+            }
+        });
+    }
+    enabled.connect_active_notify({
+        let model = model.clone();
+        let buffer = buffer.clone();
+        let graph = graph.clone();
+        let syncing = syncing.clone();
+        move |switch| {
+            if !syncing.get()
+                && let Some(index) = model.selected_filter.get()
+            {
+                update_filter(&model, &buffer, &graph, index, |filter| {
+                    filter.enabled = switch.is_active()
+                });
+            }
+        }
+    });
+    for (button, offset) in [(&previous, -1_i32), (&next, 1), (&remove, 0)] {
+        button.connect_clicked({
+            let model = model.clone();
+            let buffer = buffer.clone();
+            let graph = graph.clone();
+            let list = list.clone();
+            move |_| {
+                let Some(index) = model.selected_filter.get() else {
+                    return;
+                };
+                let snapshot = {
+                    let mut document = model.document.borrow_mut();
+                    let Some(document) = document.as_mut() else {
+                        return;
+                    };
+                    if index >= document.filters.len() {
+                        return;
+                    }
+                    if offset == 0 {
+                        document.filters.remove(index);
+                        model.selected_filter.set(if document.filters.is_empty() {
+                            None
+                        } else {
+                            Some(index.min(document.filters.len() - 1))
+                        });
+                    } else {
+                        let target = index as i32 + offset;
+                        if target < 0 || target as usize >= document.filters.len() {
+                            return;
+                        }
+                        document.filters.swap(index, target as usize);
+                        model.selected_filter.set(Some(target as usize));
+                    }
+                    document.clone()
+                };
+                set_editor_text(&model, &buffer, &serialize_profile(&snapshot));
+                *model.analysis.borrow_mut() = Some(preview_analysis(&model, &snapshot));
+                rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
+                graph.queue_draw();
+            }
+        });
+    }
+    *model.bands.borrow_mut() = Some(BandUi {
+        root: root.clone(),
+        title,
+        kind,
+        channels,
+        frequency,
+        gain,
+        q,
+        enabled,
+        previous,
+        next,
+        tiles: Vec::new(),
+        range: Cell::new(12.0),
+        syncing,
+    });
+    root
+}
+
+/// Refresh values in place, keeping keyboard focus and an in-progress fader drag.
+fn sync_band_ui(model: &Model) {
+    let document = model.document.borrow();
+    let Some(profile) = document.as_ref() else {
+        return;
+    };
+    let ui = model.bands.borrow();
+    let Some(ui) = ui.as_ref() else {
+        return;
+    };
+    ui.syncing.set(true);
+    let selected = model.selected_filter.get();
+    // Normal EQ gets a useful ±12 dB travel; larger edits expand every fader
+    // together so their zero points and gain distances stay comparable.
+    let range = profile
+        .filters
+        .iter()
+        .map(|f| f.gain_db.abs())
+        .fold(12.0, f64::max);
+    let range = ((range / 12.0).ceil() * 12.0).max(ui.range.get());
+    ui.range.set(range);
+    for (index, (tile, filter)) in ui.tiles.iter().zip(&profile.filters).enumerate() {
+        let active = selected == Some(index);
+        tile.select.set_active(active);
+        if active {
+            tile.root.add_css_class("selected");
+        } else {
+            tile.root.remove_css_class("selected");
+        }
+        if filter.enabled {
+            tile.root.remove_css_class("disabled-band");
+        } else {
+            tile.root.add_css_class("disabled-band");
+        }
+        tile.scale.set_range(-range, range);
+        tile.scale.set_value(filter.gain_db);
+        tile.gain.set_text(&signed_db(filter.gain_db, 1));
+        tile.frequency
+            .set_text(&compact_band_frequency(filter.frequency));
+        let kind = BAND_KINDS
+            .iter()
+            .position(|kind| *kind == filter.kind)
+            .unwrap_or_default();
+        let ears = match filter.channels {
+            ChannelSelection::All => "L+R",
+            ChannelSelection::Left => "L",
+            ChannelSelection::Right => "R",
+        };
+        tile.kind
+            .set_text(&format!("{} · {ears}", BAND_KIND_LABELS[kind]));
+        tile.root.set_tooltip_text(Some(&format!(
+            "Band {} · {} · Q {:.3}{}",
+            index + 1,
+            format_band_frequency(filter.frequency),
+            filter.q,
+            if filter.enabled { "" } else { " · off" }
+        )));
+    }
+    let filter = selected.and_then(|index| profile.filters.get(index));
+    ui.root.set_visible(filter.is_some());
+    if let Some(filter) = filter {
+        let index = selected.unwrap_or_default();
+        ui.title.set_text(&format!("Band {:02}", index + 1));
+        let kind = BAND_KINDS
+            .iter()
+            .position(|kind| *kind == filter.kind)
+            .unwrap_or_default();
+        ui.kind.buttons[kind].set_active(true);
+        ui.channels.buttons[match filter.channels {
+            ChannelSelection::All => 0,
+            ChannelSelection::Left => 1,
+            ChannelSelection::Right => 2,
+        }]
+        .set_active(true);
+        ui.frequency.set_value(filter.frequency);
+        ui.gain.set_value(filter.gain_db);
+        ui.q.set_value(filter.q);
+        ui.enabled.set_active(filter.enabled);
+        ui.previous.set_sensitive(index > 0);
+        ui.next.set_sensitive(index + 1 < profile.filters.len());
+    }
+    ui.syncing.set(false);
+}
+
+fn compact_band_frequency(frequency: f64) -> String {
+    if frequency >= 1000.0 {
+        format!("{:.1}k", frequency / 1000.0)
+    } else {
+        format!("{frequency:.0}")
     }
 }
 
@@ -2634,328 +3960,141 @@ fn rebuild_filter_list(
     buffer: &gtk::TextBuffer,
     graph: &gtk::DrawingArea,
 ) {
+    if !profile.filters.is_empty()
+        && model
+            .selected_filter
+            .get()
+            .is_none_or(|i| i >= profile.filters.len())
+    {
+        model.selected_filter.set(Some(0));
+    } else if profile.filters.is_empty() {
+        model.selected_filter.set(None);
+    }
+    // Autosaves and graph edits need value updates, not new slider widgets.
+    let reuse = model
+        .bands
+        .borrow()
+        .as_ref()
+        .is_some_and(|ui| ui.tiles.len() == profile.filters.len())
+        && !profile.filters.is_empty()
+        && profile.graphic_eqs.is_empty()
+        && list.child_at_index(profile.filters.len() as i32).is_none();
+    if reuse {
+        sync_band_ui(model);
+        return;
+    }
     list.remove_all();
-
-    let mut filter_button_group: Option<gtk::ToggleButton> = None;
+    let syncing = model
+        .bands
+        .borrow()
+        .as_ref()
+        .map(|ui| ui.syncing.clone())
+        .unwrap_or_default();
+    let mut tiles = Vec::new();
+    let mut group: Option<gtk::ToggleButton> = None;
     for (index, filter) in profile.filters.iter().enumerate() {
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        card.add_css_class("filter-card");
-        card.set_hexpand(true);
-
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        root.add_css_class("band-fader");
         let select = gtk::ToggleButton::with_label(&format!("{:02}", index + 1));
-        select.add_css_class("filter-index");
-        if let Some(group) = &filter_button_group {
-            select.set_group(Some(group));
-        } else {
-            filter_button_group = Some(select.clone());
-        }
-        select.set_active(model.selected_filter.get() == Some(index));
-        select.set_tooltip_text(Some("Select this point on the response graph"));
-        header.append(&select);
-
-        let band_title = gtk::Label::new(Some(&format_band_frequency(filter.frequency)));
-        band_title.add_css_class("band-frequency");
-        header.append(&band_title);
-        let enabled = gtk::Switch::new();
-        enabled.set_active(filter.enabled);
-        enabled.set_valign(gtk::Align::Center);
-        enabled.add_css_class("filter-switch");
-        enabled.update_property(&[gtk::accessible::Property::Label(&format!(
-            "Enable filter at {}",
-            format_band_frequency(filter.frequency)
+        select.add_css_class("fader-select");
+        select.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Select band {}",
+            index + 1
         ))]);
-
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        header.append(&spacer);
-        header.append(&enabled);
-
-        let kind_names = gtk::StringList::new(&[
-            "Peak",
-            "Low shelf",
-            "High shelf",
-            "Low pass",
-            "High pass",
-            "Band pass",
-            "Notch",
-            "All pass",
-        ]);
-        let kind_drop = gtk::DropDown::new(Some(kind_names), gtk::Expression::NONE);
-        kind_drop.set_selected(match filter.kind {
-            FilterKind::Peaking => 0,
-            FilterKind::LowShelf => 1,
-            FilterKind::HighShelf => 2,
-            FilterKind::LowPass => 3,
-            FilterKind::HighPass => 4,
-            FilterKind::BandPass => 5,
-            FilterKind::Notch => 6,
-            FilterKind::AllPass => 7,
-        });
-        let channel_names = gtk::StringList::new(&["ALL", "L", "R"]);
-        let channel_drop = gtk::DropDown::new(Some(channel_names), gtk::Expression::NONE);
-        channel_drop.set_selected(match filter.channels {
-            ChannelSelection::All => 0,
-            ChannelSelection::Left => 1,
-            ChannelSelection::Right => 2,
-        });
-        let move_up = gtk::Button::from_icon_name("go-up-symbolic");
-        move_up.add_css_class("flat");
-        move_up.set_sensitive(index > 0);
-        move_up.set_tooltip_text(Some("Move band up"));
-        let move_down = gtk::Button::from_icon_name("go-down-symbolic");
-        move_down.add_css_class("flat");
-        move_down.set_sensitive(index + 1 < profile.filters.len());
-        move_down.set_tooltip_text(Some("Move band down"));
-        let remove = gtk::Button::from_icon_name("user-trash-symbolic");
-        remove.add_css_class("flat");
-        remove.add_css_class("destructive-action");
-        remove.set_tooltip_text(Some("Delete band"));
-        header.append(&move_up);
-        header.append(&move_down);
-        header.append(&remove);
-        card.append(&header);
-
-        let options = adw::WrapBox::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .child_spacing(8)
-            .line_spacing(8)
-            .line_homogeneous(true)
-            .build();
-        let kind_field = gtk::Box::new(gtk::Orientation::Vertical, 5);
-        kind_field.set_size_request(140, -1);
-        let kind_label = gtk::Label::new(Some("FILTER TYPE"));
-        kind_label.set_xalign(0.0);
-        kind_label.add_css_class("section-label");
-        kind_field.append(&kind_label);
-        kind_drop.set_hexpand(true);
-        kind_field.append(&kind_drop);
-        options.append(&kind_field);
-        let channel_field = gtk::Box::new(gtk::Orientation::Vertical, 5);
-        channel_field.set_size_request(110, -1);
-        let channel_label = gtk::Label::new(Some("CHANNEL"));
-        channel_label.set_xalign(0.0);
-        channel_label.add_css_class("section-label");
-        channel_field.append(&channel_label);
-        channel_drop.set_hexpand(true);
-        channel_field.append(&channel_drop);
-        options.append(&channel_field);
-        card.append(&options);
-
-        let parameters = adw::WrapBox::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .child_spacing(8)
-            .line_spacing(8)
-            .line_homogeneous(true)
-            .build();
-        let frequency = gtk::SpinButton::with_range(20.0, 20_000.0, 1.0);
-        frequency.set_value(filter.frequency);
-        frequency.set_digits(1);
-        frequency.set_width_chars(6);
-        frequency.set_hexpand(true);
-        frequency.add_css_class("band-readout");
-        let gain = gtk::SpinButton::with_range(-60.0, 60.0, 0.1);
-        gain.set_value(filter.gain_db);
-        gain.set_digits(2);
-        gain.set_width_chars(5);
-        gain.set_hexpand(true);
-        gain.add_css_class("band-readout");
-        let q = gtk::SpinButton::with_range(0.01, 1000.0, 0.01);
-        q.set_value(filter.q);
-        q.set_digits(3);
-        q.set_width_chars(5);
-        q.set_hexpand(true);
-        q.add_css_class("band-readout");
-        parameters.append(&spin_field("CENTER", "Hz", &frequency));
-        parameters.append(&spin_field("GAIN", "dB", &gain));
-        parameters.append(&spin_field("Q / WIDTH", "Q", &q));
-        card.append(&parameters);
-
+        if let Some(first) = &group {
+            select.set_group(Some(first));
+        } else {
+            group = Some(select.clone());
+        }
+        root.append(&select);
+        let gain = gtk::Label::new(None);
+        gain.add_css_class("fader-gain");
+        root.append(&gain);
+        let scale = gtk::Scale::with_range(gtk::Orientation::Vertical, -12.0, 12.0, 0.1);
+        scale.set_inverted(true);
+        scale.set_draw_value(false);
+        scale.set_has_origin(true);
+        scale.set_size_request(-1, 124);
+        scale.set_halign(gtk::Align::Center);
+        scale.add_mark(0.0, gtk::PositionType::Left, None);
+        scale.add_css_class("band-slider");
+        scale.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Band {} gain",
+            index + 1
+        ))]);
+        root.append(&scale);
+        let frequency = gtk::Label::new(Some(&compact_band_frequency(filter.frequency)));
+        frequency.add_css_class("fader-frequency");
+        root.append(&frequency);
+        let kind = gtk::Label::new(None);
+        kind.add_css_class("fader-kind");
+        root.append(&kind);
         select.connect_toggled({
             let model = model.clone();
             let graph = graph.clone();
+            let syncing = syncing.clone();
             move |button| {
-                if button.is_active() {
+                if !syncing.get() && button.is_active() {
                     model.selected_filter.set(Some(index));
-                    graph.grab_focus();
+                    sync_band_ui(&model);
                     graph.queue_draw();
                 }
             }
         });
-        enabled.connect_active_notify({
+        scale.connect_value_changed({
             let model = model.clone();
             let buffer = buffer.clone();
             let graph = graph.clone();
-            move |switch| {
-                let enabled = switch.is_active();
-                // Response analysis and text serialization can be noticeable
-                // for a large bank. Defer them until after GTK has painted the
-                // switch, just like the output-level Filters control.
-                gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(40), {
-                    let model = model.clone();
-                    let buffer = buffer.clone();
-                    let graph = graph.clone();
-                    move || {
-                        update_filter(&model, &buffer, &graph, index, |filter| {
-                            filter.enabled = enabled
-                        });
-                    }
-                });
-            }
-        });
-        kind_drop.connect_selected_notify({
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let graph = graph.clone();
-            move |drop| {
-                update_filter(&model, &buffer, &graph, index, |filter| {
-                    filter.kind = match drop.selected() {
-                        1 => FilterKind::LowShelf,
-                        2 => FilterKind::HighShelf,
-                        3 => FilterKind::LowPass,
-                        4 => FilterKind::HighPass,
-                        5 => FilterKind::BandPass,
-                        6 => FilterKind::Notch,
-                        7 => FilterKind::AllPass,
-                        _ => FilterKind::Peaking,
-                    }
-                })
-            }
-        });
-        channel_drop.connect_selected_notify({
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let graph = graph.clone();
-            move |drop| {
-                update_filter(&model, &buffer, &graph, index, |filter| {
-                    filter.channels = match drop.selected() {
-                        1 => ChannelSelection::Left,
-                        2 => ChannelSelection::Right,
-                        _ => ChannelSelection::All,
-                    }
-                })
-            }
-        });
-        frequency.connect_value_changed({
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let graph = graph.clone();
-            let band_title = band_title.clone();
-            move |spin| {
-                band_title.set_text(&format_band_frequency(spin.value()));
-                update_filter(&model, &buffer, &graph, index, |filter| {
-                    filter.frequency = spin.value()
-                })
-            }
-        });
-        gain.connect_value_changed({
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let graph = graph.clone();
-            move |spin| {
-                update_filter(&model, &buffer, &graph, index, |filter| {
-                    filter.gain_db = spin.value()
-                })
-            }
-        });
-        q.connect_value_changed({
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let graph = graph.clone();
-            move |spin| {
-                update_filter(&model, &buffer, &graph, index, |filter| {
-                    filter.q = spin.value()
-                })
-            }
-        });
-
-        move_up.connect_clicked({
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let graph = graph.clone();
-            let list = list.clone();
-            move |_| {
-                if index == 0 {
-                    return;
+            let syncing = syncing.clone();
+            move |scale| {
+                if !syncing.get() {
+                    model.selected_filter.set(Some(index));
+                    update_filter(&model, &buffer, &graph, index, |filter| {
+                        filter.gain_db = scale.value()
+                    });
                 }
-                let snapshot = {
-                    let mut document = model.document.borrow_mut();
-                    let Some(document) = document.as_mut() else {
-                        return;
-                    };
-                    document.filters.swap(index, index - 1);
-                    model.selected_filter.set(Some(index - 1));
-                    document.clone()
-                };
-                buffer.set_text(&serialize_profile(&snapshot));
-                rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
-                graph.queue_draw();
             }
         });
-        move_down.connect_clicked({
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed({
             let model = model.clone();
-            let buffer = buffer.clone();
             let graph = graph.clone();
-            let list = list.clone();
-            move |_| {
-                let snapshot = {
-                    let mut document = model.document.borrow_mut();
-                    let Some(document) = document.as_mut() else {
-                        return;
-                    };
-                    if index + 1 >= document.filters.len() {
-                        return;
-                    }
-                    document.filters.swap(index, index + 1);
-                    model.selected_filter.set(Some(index + 1));
-                    document.clone()
-                };
-                buffer.set_text(&serialize_profile(&snapshot));
-                rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
+            move |_, _, _, _| {
+                model.selected_filter.set(Some(index));
+                sync_band_ui(&model);
                 graph.queue_draw();
             }
         });
-        remove.connect_clicked({
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let graph = graph.clone();
-            let list = list.clone();
-            move |_| {
-                let snapshot = {
-                    let mut document = model.document.borrow_mut();
-                    let Some(document) = document.as_mut() else {
-                        return;
-                    };
-                    if index >= document.filters.len() {
-                        return;
-                    }
-                    document.filters.remove(index);
-                    model.selected_filter.set(
-                        (!document.filters.is_empty())
-                            .then_some(index.min(document.filters.len() - 1)),
-                    );
-                    document.clone()
-                };
-                buffer.set_text(&serialize_profile(&snapshot));
-                rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
-                graph.queue_draw();
-            }
+        root.add_controller(click);
+        list.insert(&root, -1);
+        tiles.push(BandTile {
+            root,
+            select,
+            gain,
+            frequency,
+            kind,
+            scale,
         });
-        list.insert(&card, -1);
+    }
+    if let Some(ui) = model.bands.borrow_mut().as_mut() {
+        ui.tiles = tiles;
     }
     for graphic in &profile.graphic_eqs {
-        let channel = match graphic.channels {
-            ChannelSelection::All => "ALL",
-            ChannelSelection::Left => "L",
-            ChannelSelection::Right => "R",
-        };
-        let row = adw::ActionRow::builder()
-            .title(format!("{channel} · GraphicEQ"))
-            .subtitle(format!("{} response points", graphic.points.len()))
-            .build();
-        row.add_css_class("filter-card");
+        let row = gtk::Label::new(Some(&format!("GraphicEQ\n{} points", graphic.points.len())));
+        row.add_css_class("band-fader");
         list.insert(&row, -1);
     }
+    if profile.filters.is_empty() && profile.graphic_eqs.is_empty() {
+        let empty = gtk::Label::new(Some(
+            "Add a band or click the response graph to start shaping your EQ.",
+        ));
+        empty.set_wrap(true);
+        empty.set_max_width_chars(34);
+        empty.add_css_class("level-code");
+        list.insert(&empty, -1);
+    }
+    sync_band_ui(model);
 }
 
 fn update_filter(
@@ -2981,8 +4120,9 @@ fn update_filter(
         )
     };
     *model.analysis.borrow_mut() = Some(preview);
+    sync_band_ui(model);
     graph.queue_draw();
-    buffer.set_text(&text);
+    set_editor_text(model, buffer, &text);
 }
 
 fn can_add_filter(document: &ProfileDocument, channels: ChannelSelection) -> bool {
@@ -3300,7 +4440,7 @@ fn install_comparison_shortcuts(
     window: &adw::ApplicationWindow,
     model: &Rc<Model>,
     device_drop: &gtk::DropDown,
-    device_bypass: &gtk::Switch,
+    device_bypass: &gtk::ToggleButton,
     comparison_ui: &Rc<ComparisonUi>,
 ) {
     let controller = gtk::EventControllerKey::new();
@@ -3393,7 +4533,7 @@ fn update_device_controls(
     drop: &gtk::DropDown,
     state: &gtk::Label,
     assign: &gtk::Button,
-    bypass: &gtk::Switch,
+    bypass: &gtk::ToggleButton,
 ) {
     let Some(device) = model
         .devices
@@ -3503,6 +4643,15 @@ fn update_device_controls(
     bypass.set_sensitive(
         pending_bypassed.is_none() && has_ab_source && matches!(device.channels, 1 | 2),
     );
+    // The accent is for actions that put a profile on the output.
+    if matches!(
+        assign.label().as_deref(),
+        Some("Apply selected profile" | "Replace with selected" | "Retry profile")
+    ) {
+        assign.add_css_class("primary");
+    } else {
+        assign.remove_css_class("primary");
+    }
     std::mem::drop(pending_bypass);
     update_live_indicators(model);
 }
@@ -3558,6 +4707,9 @@ const FOCUS_IDLE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The user is in the middle of something the editor should not pull away from.
 fn user_is_busy(model: &Model) -> bool {
+    if model.graph_dragging.get() {
+        return true;
+    }
     model
         .last_input
         .get()
@@ -3675,10 +4827,10 @@ fn update_live_indicators(model: &Rc<Model>) {
     let (playing_on, paused_on) = current.as_deref().map(users_of).unwrap_or_default();
     let status = &live.profile_status;
     let (text, playing) = match (playing_on.as_slice(), paused_on.as_slice()) {
-        ([], []) => ("NOT PLAYING".to_owned(), false),
-        ([], _) => (paused_reason.to_uppercase(), false),
-        ([only], _) => (format!("PLAYING ON {}", only.to_uppercase()), true),
-        (outputs, _) => (format!("PLAYING ON {} OUTPUTS", outputs.len()), true),
+        ([], []) => ("Not playing".to_owned(), false),
+        ([], paused) => (format!("{} · {paused_reason}", paused.join(", ")), false),
+        ([only], _) => (format!("Playing on {only}"), true),
+        (outputs, _) => (format!("Playing on {} outputs", outputs.len()), true),
     };
     status.set_text(&text);
     status.set_tooltip_text(Some(&match (playing_on.as_slice(), paused_on.as_slice()) {
@@ -3690,25 +4842,19 @@ fn update_live_indicators(model: &Rc<Model>) {
         (outputs, _) => format!("Playing on {}", outputs.join(", ")),
     }));
     if playing {
-        status.add_css_class("playing");
+        live.profile_tile.add_css_class("live");
     } else {
-        status.remove_css_class("playing");
+        live.profile_tile.remove_css_class("live");
     }
     status.set_visible(current.is_some());
 
     let selected = devices.get(live.device_drop.selected() as usize);
-    let output_status = &live.output_status;
-    match selected {
-        Some(device) if !device.connected => {
-            output_status.set_text("NOT CONNECTED");
-            output_status.set_visible(true);
-        }
-        Some(device) if device.is_default => {
-            output_status.set_text("SYSTEM OUTPUT");
-            output_status.set_visible(true);
-        }
-        _ => output_status.set_visible(false),
-    }
+    live.output_status.set_text(match selected {
+        Some(device) if !device.connected => "Not connected",
+        Some(device) if device.is_default => "System output",
+        Some(_) => "Available",
+        None => "No outputs",
+    });
 
     let profiles = model.profiles.borrow();
     for (index, profile) in profiles.iter().enumerate() {
@@ -3748,41 +4894,6 @@ fn displayed_device_bypass(
         .filter(|pending| pending.device_key == device_key)
         .map(|pending| pending.bypassed)
         .unwrap_or(service_bypassed)
-}
-
-fn engine_summary(status: &serde_json::Value) -> String {
-    let Some(active) = status.pointer("/engine/active/0") else {
-        return "NATIVE DSP · IDLE".into();
-    };
-    let rate = active
-        .get("sample_rate")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(48_000) as f64
-        / 1000.0;
-    let latency = active
-        .get("latency_ms")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or_default();
-    let cpu = active
-        .get("cpu_percent_of_deadline")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or_default();
-    let source = match source_rate(status) {
-        Some(SourceRate::Native) => " · SOURCE NATIVE".to_owned(),
-        Some(SourceRate::Resampled { source, .. }) => {
-            format!(" · SOURCE {:.1} kHz → RESAMPLED", source as f64 / 1000.0)
-        }
-        None => String::new(),
-    };
-    if active
-        .get("cpu_warning")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        format!("NATIVE DSP · {rate:.1} kHz{source} · {latency:.1} ms · CPU {cpu:.0}% ⚠")
-    } else {
-        format!("NATIVE DSP · {rate:.1} kHz{source} · {latency:.1} ms")
-    }
 }
 
 /// Whether playing audio reaches the graph at its own rate.
@@ -3884,40 +4995,49 @@ fn install_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
         r#"
-        @define-color accent_bg_color #e64b2f;
-        @define-color accent_color #ff7358;
-        @define-color accent_fg_color #fff8f4;
+        @define-color accent_bg_color #ff7a1a;
+        @define-color accent_color #ff8c33;
+        @define-color accent_fg_color #1a0d03;
 
         window,
         .instrument-root {
-            background-color: #101112;
-            color: #ecece8;
+            background-color: #0b0b0c;
+            color: #ecebe6;
             font-size: 13px;
         }
 
         .instrument-header {
-            background-color: #141617;
-            border-bottom: 1px solid #272a2b;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+            background-color: #0b0b0c;
+            border-bottom: 1px solid #232326;
+            box-shadow: none;
+            min-height: 52px;
         }
 
-        .brand-title title,
-        .brand-title subtitle,
+        .brand,
+        .header-status,
         .header-data,
         .panel-title,
         .section-label,
-        .console-status {
+        .rail-label,
+        .frame-title,
+        .readouts,
+        .readout-key,
+        .console-status,
+        .tile-value-number,
+        .level-code {
             font-family: monospace;
         }
 
-        .brand-title title {
+        .brand {
             font-weight: 800;
             letter-spacing: 1px;
+            margin-left: 4px;
         }
 
-        .brand-title subtitle {
-            font-size: 9px;
-            opacity: 0.46;
+        .header-status {
+            color: #8b8b90;
+            font-size: 11px;
+            letter-spacing: 0.4px;
         }
 
         .header-data {
@@ -3926,11 +5046,28 @@ fn install_css() {
             opacity: 0.54;
         }
 
-        .update-button {
-            background-color: rgba(230, 75, 47, 0.12);
-            border: 1px solid rgba(230, 75, 47, 0.62);
+        /* Engine: an orange power button while the DSP runs. */
+        button.power {
+            min-width: 32px;
+            min-height: 32px;
+            padding: 0;
             border-radius: 999px;
-            color: #ff8a72;
+            background-color: #242426;
+            color: #8b8b90;
+            border: none;
+            box-shadow: none;
+        }
+
+        button.power:checked {
+            background-color: #ff7a1a;
+            color: #fff;
+        }
+
+        .update-button {
+            background-color: transparent;
+            border: 1px solid rgba(255, 122, 26, 0.6);
+            border-radius: 12px;
+            color: #ff8c33;
             font-family: monospace;
             font-size: 9px;
             font-weight: 800;
@@ -3938,32 +5075,254 @@ fn install_css() {
         }
 
         .update-button:hover {
-            background-color: rgba(230, 75, 47, 0.22);
-            border-color: #e64b2f;
-            color: #fff8f4;
+            background-color: rgba(255, 122, 26, 0.14);
         }
 
-        .control-card,
-        .graph-card,
-        .source-card {
-            background-color: #1a1c1d;
-            border: 1px solid #292c2d;
-            border-radius: 24px;
-            padding: 18px;
-            box-shadow: 0 14px 28px rgba(0, 0, 0, 0.22);
+        /* Left rail */
+        .rail-label {
+            color: #56565b;
+            font-size: 9.5px;
+            font-weight: 700;
+            letter-spacing: 0.8px;
+            margin: 6px 4px 0 4px;
         }
 
-        .control-card { padding: 13px 16px; }
-        .graph-card { padding: 20px 18px 10px 18px; }
+        .rail-tile {
+            background-color: #1b1b1d;
+            border-radius: 22px;
+            padding: 14px;
+        }
 
-        .level-readout {
-            border-bottom: 1px solid #292c2d;
-            padding: 4px 2px 9px 2px;
+        .tile-icon {
+            min-width: 46px;
+            min-height: 46px;
+            border-radius: 999px;
+            background-color: #242426;
+            color: #ecebe6;
+        }
+
+        entry.tile-title,
+        entry.tile-title:focus-within {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            font-size: 17px;
+            font-weight: 600;
+            min-height: 26px;
+            padding: 0;
+        }
+
+        entry.tile-title:focus-within {
+            border-bottom: 1px solid #ff7a1a;
+            border-radius: 0;
+        }
+
+        .tile-subtitle {
+            color: #8b8b90;
+            font-size: 12.5px;
+        }
+
+        .tile-value {
+            background-color: #242426;
+            border-radius: 999px;
+            padding: 7px 0;
+        }
+
+        .tile-value-number {
+            font-size: 17px;
+            font-weight: 600;
+        }
+
+        .tile-value-caption {
+            color: #8b8b90;
+            font-size: 11px;
+        }
+
+        /* Filters on this output: the watch's orange circle. */
+        button.filters-dot {
+            min-width: 54px;
+            min-height: 54px;
+            padding: 0;
+            border-radius: 999px;
+            background-color: #3a2414;
+            border: none;
+            box-shadow: none;
+        }
+
+        button.filters-dot:checked {
+            background-color: #ff7a1a;
+        }
+
+        /* The open profile, while it plays: a lit tile. */
+        .rail-tile.live {
+            background-color: #f3f2ee;
+            color: #121213;
+        }
+
+        .rail-tile.live .tile-icon {
+            background-color: #e2e1dc;
+            color: #121213;
+        }
+
+        .rail-tile.live entry.tile-title {
+            color: #121213;
+            caret-color: #121213;
+        }
+
+        .rail-tile.live .tile-subtitle,
+        .rail-tile.live .tile-value-caption {
+            color: #6b6b70;
+        }
+
+        .rail-tile.live .tile-value {
+            background-color: #e6e5e0;
+        }
+
+        dropdown.tile-dropdown > button,
+        dropdown.tile-dropdown > button:hover {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            font-size: 17px;
+            font-weight: 600;
+            min-height: 26px;
+            padding: 0;
+        }
+
+        dropdown.tile-dropdown {
+            min-width: 0;
+        }
+
+        .device-state {
+            color: #8b8b90;
+            font-family: monospace;
+            font-size: 10.5px;
+        }
+
+        button.tile-action {
+            background-color: #242426;
+            border: none;
+            border-radius: 14px;
+            box-shadow: none;
+            color: #ecebe6;
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 9px 12px;
+        }
+
+        button.tile-action.primary {
+            background-color: #ff7a1a;
+            color: #1a0d03;
+        }
+
+        button.tile-action:disabled {
+            color: #56565b;
+        }
+
+        list.profile-bank,
+        list.profile-bank > row {
+            background: transparent;
+        }
+
+        list.profile-bank > row {
+            background-color: #1b1b1d;
+            border-radius: 16px;
+            margin-bottom: 6px;
+            padding: 0 2px;
+        }
+
+        list.profile-bank > row:hover {
+            background-color: #222225;
+        }
+
+        /* The profile open in the editor. */
+        list.profile-bank > row:selected {
+            background-color: #2b2b2e;
+        }
+
+        list.profile-bank > row.playing .subtitle {
+            color: #ff8c33;
+            opacity: 1;
+        }
+
+        .bank-actions button {
+            background-color: #1b1b1d;
+            border: none;
+            border-radius: 14px;
+            box-shadow: none;
+            min-height: 34px;
+        }
+
+        .tool-tile,
+        .tool-tile > button {
+            min-height: 74px;
+        }
+
+        button.tool-tile,
+        .tool-tile > button {
+            background-color: #1b1b1d;
+            border: none;
+            border-radius: 20px;
+            box-shadow: none;
+            color: #ecebe6;
+            font-size: 12.5px;
+            font-weight: 500;
+        }
+
+        button.tool-tile.round {
+            min-width: 74px;
+            border-radius: 999px;
+            padding: 0;
+        }
+
+        button.tool-tile:hover,
+        .tool-tile > button:hover {
+            background-color: #232326;
+        }
+
+        button.tool-tile.on,
+        .tool-tile.on > button {
+            background-color: #ff7a1a;
+            color: #1a0d03;
+        }
+
+        /* Frames with their titles set into the rule (after btop). */
+        .titled-frame {
+            border: 1px solid #3a3a3e;
+            border-radius: 14px;
+            padding: 20px 16px 12px 16px;
+        }
+
+        .frame-title {
+            background-color: #0b0b0c;
+            color: #ecebe6;
+            font-size: 12px;
+            padding: 0 6px;
+        }
+
+        .frame-end {
+            background-color: #0b0b0c;
+            padding: 0 4px;
+        }
+
+        .readout-row {
+            padding: 2px 4px 0 40px;
+        }
+
+        .readouts,
+        .readout-key {
+            color: #8b8b90;
+            font-size: 11px;
+        }
+
+        .readout-key {
+            font-size: 9.5px;
+            letter-spacing: 0.6px;
         }
 
         .level-code {
-            color: #929798;
-            font-family: monospace;
+            color: #8b8b90;
             font-size: 10px;
         }
 
@@ -3973,107 +5332,6 @@ fn install_css() {
             letter-spacing: 0.7px;
         }
 
-        .profile-menu > button {
-            background-color: #242729;
-            border: 1px solid #303436;
-            border-radius: 999px;
-            font-family: monospace;
-            font-weight: 700;
-            min-width: 120px;
-            padding: 7px 16px;
-        }
-
-        .profile-add {
-            border-radius: 999px;
-            font-family: monospace;
-            font-size: 9px;
-            font-weight: 700;
-            padding: 7px 12px;
-        }
-
-        .comparison-menu > button {
-            border-radius: 999px;
-            font-family: monospace;
-            font-size: 10px;
-            font-weight: 700;
-            padding: 7px 12px;
-        }
-
-        .comparison-candidate {
-            background-color: #1b1d1e;
-            border: 1px solid #2d3031;
-            border-radius: 10px;
-            padding: 6px 8px;
-            font-family: monospace;
-            box-shadow: none;
-        }
-
-        .comparison-candidate:checked {
-            background-color: rgba(230, 75, 47, 0.10);
-            border-color: rgba(230, 75, 47, 0.72);
-            color: #f2f1ec;
-        }
-
-        .comparison-listen {
-            background-color: #1b1d1e;
-            border: 1px solid #2d3031;
-            border-radius: 10px;
-            padding: 8px 10px;
-            font-family: monospace;
-            box-shadow: none;
-        }
-
-        .comparison-listen.active {
-            background-color: #e64b2f;
-            border-color: #ef5a3e;
-            color: #fff8f4;
-        }
-
-        .comparison-listen.active .comparison-mark {
-            color: #fff8f4;
-        }
-
-        .comparison-mark {
-            color: #e66a53;
-            font-family: monospace;
-            font-size: 9px;
-            font-weight: 700;
-        }
-
-        .editor-switcher button {
-            background: transparent;
-            border: 0;
-            border-radius: 0;
-            border-bottom: 2px solid transparent;
-            color: #8f9394;
-            font-family: monospace;
-            font-size: 10px;
-            font-weight: 700;
-            padding: 8px 12px;
-        }
-
-        .editor-switcher button:checked {
-            background: transparent;
-            border-bottom-color: #e64b2f;
-            color: #f1f1ec;
-        }
-
-        .code-editor {
-            background-color: #151718;
-            border: 1px solid #292c2d;
-            border-radius: 22px;
-        }
-
-        textview.invalid-draft {
-            color: #ff9b88;
-        }
-
-        .profile-name {
-            font-family: monospace;
-            font-size: 16px;
-            font-weight: 500;
-        }
-
         .section-label {
             font-size: 9px;
             font-weight: 700;
@@ -4081,31 +5339,90 @@ fn install_css() {
             opacity: 0.46;
         }
 
-        .device-state {
-            color: #929798;
+        .comparison-menu > button {
+            border-radius: 14px;
             font-family: monospace;
-            font-size: 11px;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 7px 12px;
         }
 
-        /* Where the open profile plays, beside its field label. */
-        .route-status {
-            color: #7d8283;
+        .comparison-candidate {
+            background-color: #1b1b1d;
+            border: 1px solid #2a2a2d;
+            border-radius: 12px;
+            padding: 6px 8px;
+            font-family: monospace;
+            box-shadow: none;
+        }
+
+        .comparison-candidate:checked {
+            background-color: rgba(255, 122, 26, 0.10);
+            border-color: rgba(255, 122, 26, 0.72);
+            color: #f2f1ec;
+        }
+
+        .comparison-listen {
+            background-color: #1b1b1d;
+            border: 1px solid #2a2a2d;
+            border-radius: 12px;
+            padding: 8px 10px;
+            font-family: monospace;
+            box-shadow: none;
+        }
+
+        .comparison-listen.active {
+            background-color: #ff7a1a;
+            border-color: #ff8c33;
+            color: #1a0d03;
+        }
+
+        .comparison-listen.active .comparison-mark {
+            color: #1a0d03;
+        }
+
+        .comparison-mark {
+            color: #ff8c33;
             font-family: monospace;
             font-size: 9px;
             font-weight: 700;
-            letter-spacing: 0.6px;
         }
 
-        .route-status.playing {
-            color: #ff7358;
+        /* Editor pages, set into the bands frame. */
+        .editor-switcher button {
+            background: transparent;
+            border: 0;
+            border-radius: 10px;
+            box-shadow: none;
+            color: #8b8b90;
+            font-family: monospace;
+            font-size: 10.5px;
+            font-weight: 700;
+            min-height: 0;
+            padding: 5px 10px;
+        }
+
+        .editor-switcher button:checked {
+            background-color: #242426;
+            color: #ecebe6;
+        }
+
+        .code-editor {
+            background-color: #121213;
+            border: 1px solid #2a2a2d;
+            border-radius: 18px;
+        }
+
+        textview.invalid-draft {
+            color: #ff9b88;
         }
 
         entry,
         spinbutton,
         dropdown > button {
-            background-color: #242729;
-            color: #efefeb;
-            border: 1px solid #303436;
+            background-color: #1b1b1d;
+            color: #ecebe6;
+            border: 1px solid #2a2a2d;
             border-radius: 12px;
             box-shadow: none;
         }
@@ -4113,8 +5430,8 @@ fn install_css() {
         entry:focus,
         spinbutton:focus-within,
         dropdown > button:focus {
-            border-color: #e64b2f;
-            box-shadow: 0 0 0 1px rgba(230, 75, 47, 0.42);
+            border-color: #ff7a1a;
+            box-shadow: 0 0 0 1px rgba(255, 122, 26, 0.4);
         }
 
         button {
@@ -4122,23 +5439,21 @@ fn install_css() {
         }
 
         button.suggested-action {
-            background-color: #e64b2f;
-            color: #fff8f4;
-            border-color: #ef5a3e;
+            background-color: #ff7a1a;
+            color: #1a0d03;
+            border-color: #ff8c33;
             font-family: monospace;
             font-weight: 700;
         }
 
         button.suggested-action:disabled {
-            background-color: #2b2e30;
-            color: #8e9293;
-            border-color: #34383a;
+            background-color: #242426;
+            color: #8b8b90;
+            border-color: #2a2a2d;
         }
 
-        switch:checked,
-        togglebutton:checked {
-            background-color: #e64b2f;
-            color: #fff8f4;
+        switch:checked {
+            background-color: #ff7a1a;
         }
 
         switch {
@@ -4156,7 +5471,7 @@ fn install_css() {
         }
 
         separator {
-            background-color: #2b2e2f;
+            background-color: #232326;
         }
 
         .filter-list,
@@ -4170,78 +5485,90 @@ fn install_css() {
             min-width: 0;
         }
 
-        .filter-card {
-            background-color: #191b1c;
-            border: 1px solid #292c2d;
-            border-radius: 22px;
-            padding: 8px 10px;
-            box-shadow: 0 10px 22px rgba(0, 0, 0, 0.18);
-        }
-
-        .convolution-card {
-            background-color: #191b1c;
-            border: 1px solid #292c2d;
-            border-radius: 22px;
-            padding: 18px;
-            box-shadow: 0 10px 22px rgba(0, 0, 0, 0.18);
-        }
-
-        .tone-play {
-            min-width: 64px;
-            min-height: 64px;
-            border-radius: 999px;
-            background-color: #242729;
-            border: 1px solid #34383a;
-            padding: 0;
-        }
-
-        .tone-play:checked {
-            background-color: #e64b2f;
-            border-color: #ef5a3e;
-            color: #fff8f4;
-        }
-
-        .tone-readout {
-            background-color: #202325;
+        .band-fader {
+            min-width: 72px;
+            background-color: #1b1b1d;
             border-radius: 18px;
-            min-width: 150px;
-            padding: 10px 16px;
+            padding: 7px 7px 10px;
+            color: #ecebe6;
         }
 
-        .tone-value {
+        .band-fader.selected {
+            background-color: #f3f2ee;
+            color: #121213;
+        }
+
+        .band-fader.disabled-band .fader-gain,
+        .band-fader.disabled-band .band-slider {
+            opacity: 0.35;
+        }
+
+        button.fader-select {
+            background: transparent;
+            box-shadow: none;
+            border: none;
+            min-height: 18px;
+            padding: 0;
+            color: #8b8b90;
             font-family: monospace;
-            font-size: 22px;
-            font-weight: 600;
+            font-size: 9px;
         }
 
-        .segmented button {
-            background-color: #202325;
-            border: 1px solid #2d3031;
-            color: #9a9e9f;
+        .band-fader.selected button.fader-select {
+            color: #6b6b70;
+        }
+
+        .fader-gain,
+        .fader-frequency,
+        .fader-kind,
+        .band-editor-title {
+            font-family: monospace;
+        }
+
+        .fader-gain { font-size: 14px; font-weight: 700; }
+        .fader-frequency { font-size: 12px; }
+        .fader-kind { font-size: 9px; color: #8b8b90; }
+        .band-fader.selected .fader-kind { color: #6b6b70; }
+
+        scale.band-slider { padding: 10px 20px; }
+        scale.band-slider trough { min-width: 6px; background: #303033; border-radius: 3px; }
+        scale.band-slider highlight { background: #ff7a1a; border-radius: 3px; }
+        scale.band-slider slider {
+            min-width: 20px;
+            min-height: 20px;
+            margin: -7px;
+            background: #ecebe6;
+            border: none;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+        }
+        .band-fader.selected scale.band-slider trough { background: #d8d7d1; }
+        .band-fader.selected scale.band-slider slider { background: #121213; }
+        scale.band-slider marks indicator { background: #56565b; min-width: 5px; }
+
+        .band-editor { border-top: 1px solid #2a2a2d; padding-top: 10px; }
+        .band-editor-title { font-size: 11px; color: #8b8b90; }
+        .listening-controls button,
+        .graph-listen button,
+        .graph-listen dropdown > button {
             font-family: monospace;
             font-size: 10px;
-            font-weight: 700;
-            padding: 6px 12px;
+            min-height: 24px;
+            padding: 5px 8px;
         }
+        .listening-controls spinbutton { min-height: 28px; }
+        .listening-controls spinbutton text { font-family: monospace; font-size: 11px; }
 
-        .segmented button:checked {
-            background-color: #33373a;
-            border-color: #3d4244;
-            color: #f1f1ec;
-        }
+        .band-editor .band-kinds button { min-width: 12px; padding: 6px; font-size: 10px; }
+        .band-kinds { margin-top: 12px; }
+        .band-editor .segmented { margin-top: 12px; }
+        .band-editor .segmented button { min-height: 24px; }
+        .band-editor .band-readout { margin-top: 0; }
 
-        .tone-fix {
-            background-color: #202325;
-            border: 1px solid #2d3031;
-            border-radius: 14px;
-            font-family: monospace;
-            font-weight: 700;
-            min-width: 76px;
-            padding: 10px 14px;
-        }
-
-        .tone-fix:hover {
-            border-color: #e64b2f;
+        .convolution-card {
+            background-color: #1b1b1d;
+            border: none;
+            border-radius: 20px;
+            padding: 18px;
         }
 
         .convolution-name {
@@ -4261,13 +5588,8 @@ fn install_css() {
         }
 
         .filter-index:checked {
-            background-color: #e64b2f;
-            border-color: #ef5a3e;
-        }
-
-        .heading {
-            font-family: monospace;
-            font-weight: 700;
+            background-color: #ecebe6;
+            color: #121213;
         }
 
         .band-frequency {
@@ -4294,96 +5616,132 @@ fn install_css() {
 
         .band-add {
             background-color: transparent;
-            color: #e66a53;
-            border: 1px dashed #4b302b;
-            border-radius: 18px;
+            color: #8b8b90;
+            border: 1px solid #3a3a3e;
+            border-radius: 12px;
             font-family: monospace;
             font-weight: 700;
-            padding: 10px 14px;
+            padding: 9px 14px;
         }
 
         .band-add:hover {
-            background-color: rgba(230, 75, 47, 0.08);
-            border-color: #8a4437;
+            color: #ecebe6;
+            border-color: #56565b;
         }
 
         .reset-filters {
-            color: #9a9e9f;
+            background: transparent;
+            color: #8b8b90;
             font-family: monospace;
             font-size: 10px;
             font-weight: 700;
             padding: 7px 12px;
         }
 
-        .mode-switcher button {
-            min-width: 130px;
-            min-height: 28px;
-            background: transparent;
+        .tone-play {
+            min-width: 64px;
+            min-height: 64px;
+            border-radius: 999px;
+            background-color: #242426;
             border: none;
-            border-bottom: 2px solid transparent;
-            border-radius: 0;
-            box-shadow: none;
-            color: #858a8b;
+            padding: 0;
+        }
+
+        .tone-play:checked {
+            background-color: #ff7a1a;
+            color: #1a0d03;
+        }
+
+        .tone-readout {
+            background-color: #242426;
+            border-radius: 18px;
+            min-width: 150px;
+            padding: 10px 16px;
+        }
+
+        .tone-value {
             font-family: monospace;
-            font-size: 11px;
+            font-size: 22px;
+            font-weight: 600;
+        }
+
+        .segmented button {
+            background-color: #1b1b1d;
+            border: 1px solid #2a2a2d;
+            color: #8b8b90;
+            font-family: monospace;
+            font-size: 10px;
             font-weight: 700;
-            padding: 5px 12px 7px 12px;
-        }
-
-        .mode-switcher button:hover {
-            background: transparent;
-            color: #c6c9c8;
-        }
-
-        .mode-switcher button:checked {
-            background: transparent;
-            border-bottom-color: #e64b2f;
+            padding: 6px 12px;
             box-shadow: none;
-            color: #ecece8;
         }
 
-        .device-dropdown,
-        .device-dropdown > button {
-            min-width: 0;
+        .segmented button:checked {
+            background-color: #2b2b2e;
+            border-color: #3a3a3e;
+            color: #ecebe6;
+        }
+
+        .tone-fix {
+            background-color: #242426;
+            border: none;
+            border-radius: 14px;
+            font-family: monospace;
+            font-weight: 700;
+            min-width: 76px;
+            padding: 10px 14px;
+        }
+
+        .tone-fix:hover {
+            background-color: #2b2b2e;
         }
 
         .console-status {
-            color: #8f9495;
+            color: #8b8b90;
             font-size: 10px;
             padding: 2px 6px;
         }
 
         popover > contents {
-            background-color: #191b1c;
-            border: 1px solid #303334;
+            background-color: #151516;
+            border: 1px solid #2a2a2d;
             border-radius: 20px;
-            box-shadow: 0 16px 38px rgba(0, 0, 0, 0.38);
+            box-shadow: 0 16px 38px rgba(0, 0, 0, 0.45);
         }
 
         list.boxed-list,
         list.boxed-list > row {
-            background-color: #222527;
+            background-color: #1b1b1d;
         }
 
-        /* The profile open in the editor. */
-        list.boxed-list > row:selected {
-            background-color: #2d3133;
+        scale trough {
+            background-color: #242426;
+            min-height: 6px;
+            border-radius: 3px;
         }
 
-        list.boxed-list > row.playing .subtitle {
-            color: #ff7358;
-            opacity: 1;
+        scale highlight {
+            background-color: #ff7a1a;
+            border-radius: 3px;
+        }
+
+        scale slider {
+            background-color: #ecebe6;
+            min-width: 20px;
+            min-height: 20px;
+            border-radius: 999px;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
         }
 
         scrollbar slider {
-            background-color: #4a4e50;
+            background-color: #3a3a3e;
             border-radius: 999px;
             min-width: 5px;
             min-height: 5px;
         }
 
         textview {
-            background-color: #151718;
+            background-color: #121213;
             color: #e7e7e2;
             font-family: monospace;
             padding: 14px;
@@ -4396,56 +5754,6 @@ fn install_css() {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
-    }
-}
-
-fn save_current(
-    model: &Rc<Model>,
-    name: &str,
-    text: &str,
-    status: &gtk::Label,
-    graph: &gtk::DrawingArea,
-    analysis_label: &gtk::Label,
-) -> bool {
-    let Some(id) = model.current_id.borrow().clone() else {
-        return false;
-    };
-    let parsed = parse_text(name, text);
-    if !parsed.is_activatable() {
-        status.set_text(
-            &parsed
-                .diagnostics
-                .first()
-                .map(|d| format!("Line {}: {}", d.line, d.message))
-                .unwrap_or_else(|| "Invalid profile".into()),
-        );
-        return false;
-    }
-    match model.client.put(&id, name, text, model.manual_trim.get()) {
-        Ok(profile) => {
-            let renamed = model
-                .profiles
-                .borrow_mut()
-                .iter_mut()
-                .find(|item| item.id == id)
-                .map(|existing| std::mem::replace(existing, profile).name != existing.name)
-                .unwrap_or(false);
-            if renamed {
-                resort_profiles(model);
-            }
-            *model.document.borrow_mut() = Some(parsed);
-            status.set_text("Saved and applied");
-            if let Ok(analysis) = model.client.analyze(&id) {
-                set_analysis_label(analysis_label, &analysis);
-                store_service_analysis(model, analysis);
-                graph.queue_draw();
-            }
-            true
-        }
-        Err(error) => {
-            status.set_text(&error.to_string());
-            false
-        }
     }
 }
 
@@ -4525,24 +5833,162 @@ fn interpolate_response(points: &[ResponsePoint], frequency: f64) -> f64 {
     points.last().map_or(0.0, |point| point.gain_db)
 }
 
+thread_local! {
+    /// The preamp value on the profile tile; set with every analysis.
+    static PREAMP_READOUT: RefCell<Option<gtk::Label>> = const { RefCell::new(None) };
+}
+
+const ACCENT: &str = "#ff7a1a";
+
+/// A signed decibel value with a typographic minus.
+fn signed_db(value: f64, digits: usize) -> String {
+    format!("{value:+.digits$}").replace('-', "−")
+}
+
 fn set_analysis_label(label: &gtk::Label, analysis: &ProfileAnalysis) {
     let left_preamp = analysis.left.preamp_db + analysis.effective_gain_db;
     let right_preamp = analysis.right.preamp_db + analysis.effective_gain_db;
+    let value = |text: String| format!("<span foreground='{ACCENT}'>{text}</span>");
     let preamp = if (left_preamp - right_preamp).abs() < 0.01 {
-        format!("AUTO PREAMP {left_preamp:+.2} dB")
+        value(signed_db(left_preamp, 2))
     } else {
-        format!("AUTO PREAMP  L {left_preamp:+.2} dB  /  R {right_preamp:+.2} dB")
+        format!(
+            "L {}  R {}",
+            value(signed_db(left_preamp, 2)),
+            value(signed_db(right_preamp, 2))
+        )
     };
-    label.set_text(&format!(
-        "{preamp}   •   MATCH {:+.2} dB   •   SAFETY {:+.2} dB{}",
-        analysis.match_gain_db,
-        analysis.safety_attenuation_db,
+    label.set_markup(&format!(
+        "PREAMP {preamp}     MATCH {}     SAFETY {}{}",
+        value(signed_db(analysis.match_gain_db, 2)),
+        value(signed_db(analysis.safety_attenuation_db, 2)),
         if analysis.headroom_limited {
-            "   •   HEADROOM LIMITED"
+            "     <span foreground='#ecebe6'>HEADROOM LIMITED</span>"
         } else {
             ""
         }
     ));
+    label.set_tooltip_text(Some(&label.text()));
+    PREAMP_READOUT.with(|readout| {
+        if let Some(readout) = readout.borrow().as_ref() {
+            readout.set_text(&format!(
+                "{} dB",
+                signed_db(left_preamp.min(right_preamp), 1)
+            ));
+        }
+    });
+}
+
+/// The header's status strip: what plays on the system output, then the
+/// engine's rate, latency, and load.
+fn header_markup(status: &serde_json::Value, model: &Model) -> String {
+    let escape = |text: &str| gtk::glib::markup_escape_text(text).to_string();
+    let accent = |text: &str| format!("<span foreground='{ACCENT}'>{}</span>", escape(text));
+    let devices = model.devices.borrow();
+    let comparisons = model.comparisons.borrow();
+    let route = devices
+        .iter()
+        .find(|device| device.connected && device.is_default)
+        .map(|device| {
+            let profile = (!model.engine_off.get())
+                .then(|| device.playing_profile_id(&comparisons))
+                .flatten()
+                .and_then(|id| {
+                    model
+                        .profiles
+                        .borrow()
+                        .iter()
+                        .find(|profile| profile.id == id)
+                        .map(|profile| profile.name.clone())
+                });
+            match profile {
+                Some(profile) => format!(
+                    "{}  ▸  {}",
+                    accent(&profile.to_uppercase()),
+                    escape(&device.description.to_uppercase())
+                ),
+                None => format!("DIRECT  ▸  {}", escape(&device.description.to_uppercase())),
+            }
+        })
+        .unwrap_or_else(|| "NO OUTPUT".to_owned());
+    let mut parts = vec![route];
+    if let Some(active) = status.pointer("/engine/active/0") {
+        let number = |key: &str| active.get(key).and_then(serde_json::Value::as_f64);
+        if let Some(rate) = number("sample_rate") {
+            parts.push(format!("{} kHz", accent(&format!("{:.1}", rate / 1000.0))));
+        }
+        if let Some(latency) = number("latency_ms") {
+            parts.push(format!("{} ms", accent(&format!("{latency:.1}"))));
+        }
+        if let Some(cpu) = number("cpu_percent_of_deadline") {
+            parts.push(format!("CPU {}", accent(&format!("{cpu:.0}%"))));
+        }
+    } else if model.engine_off.get() {
+        parts.push("ENGINE OFF".to_owned());
+    }
+    if let Some(SourceRate::Resampled { source, .. }) = source_rate(status) {
+        parts.push(format!(
+            "SOURCE {} kHz RESAMPLED",
+            accent(&format!("{:.1}", source as f64 / 1000.0))
+        ));
+    }
+    parts.join("  <span foreground='#3a3a3e'>│</span>  ")
+}
+
+/// A round icon badge for the start of a tile.
+fn tile_icon(name: &str) -> gtk::Box {
+    let badge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    badge.add_css_class("tile-icon");
+    badge.set_hexpand(false);
+    badge.set_valign(gtk::Align::Center);
+    let image = gtk::Image::from_icon_name(name);
+    image.set_hexpand(true);
+    image.set_halign(gtk::Align::Center);
+    badge.append(&image);
+    badge
+}
+
+fn rail_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.add_css_class("rail-label");
+    label
+}
+
+/// A panel outlined by a thin rule, its numbered title set into the top edge
+/// (after btop), with an optional widget set into the right of that edge.
+fn titled_frame(
+    number: u32,
+    title: &str,
+    child: &impl IsA<gtk::Widget>,
+    end: Option<&gtk::Widget>,
+) -> gtk::Overlay {
+    let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    frame.add_css_class("titled-frame");
+    frame.set_margin_top(14);
+    frame.append(child);
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&frame));
+    let label = gtk::Label::new(None);
+    label.set_markup(&format!(
+        "<span foreground='{ACCENT}' size='70%' rise='4000'>{number}</span>{}",
+        gtk::glib::markup_escape_text(title)
+    ));
+    label.add_css_class("frame-title");
+    label.set_halign(gtk::Align::Start);
+    label.set_valign(gtk::Align::Start);
+    label.set_margin_start(16);
+    label.set_margin_top(5);
+    overlay.add_overlay(&label);
+    if let Some(end) = end {
+        end.add_css_class("frame-end");
+        end.set_halign(gtk::Align::End);
+        end.set_valign(gtk::Align::Start);
+        end.set_margin_end(16);
+        overlay.add_overlay(end);
+        overlay.set_measure_overlay(end, true);
+    }
+    overlay
 }
 
 fn refresh_profiles(model: &Rc<Model>, list: &gtk::ListBox) {
@@ -4613,6 +6059,7 @@ fn show_startup_error(app: &adw::Application, message: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::sweep_position;
     use super::{
         ChannelSelection, DeviceInfo, Filter, FilterKind, PendingDeviceBypass, ProfileDocument,
         SourceRate, apply_tone_fix, can_add_filter, device_focus_target, displayed_device_bypass,
@@ -4635,6 +6082,14 @@ mod tests {
             bypassed: false,
             is_default,
         }
+    }
+
+    #[test]
+    fn sweep_moves_in_log_frequency_and_stops_at_the_end() {
+        assert_eq!(sweep_position(0.25, 0.0, 30.0), 0.25);
+        assert_eq!(sweep_position(0.25, 7.5, 30.0), 0.5);
+        assert_eq!(sweep_position(0.9, 10.0, 15.0), 1.0);
+        assert_eq!(sweep_position(0.25, -1.0, 30.0), 0.25);
     }
 
     #[test]

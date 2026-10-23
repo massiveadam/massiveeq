@@ -49,6 +49,7 @@ impl FilterHost {
         library: &Library,
         devices: &[DeviceInfo],
         force_update: bool,
+        edits: &crate::live_edit::Sessions,
     ) -> Result<()> {
         let finished = self
             .filters
@@ -103,7 +104,7 @@ impl FilterHost {
                 continue;
             }
             let (compiled, revision) =
-                match compile_output_state(storage, library, device, settings) {
+                match compile_output_with_edits(storage, library, device, settings, edits) {
                     Ok(value) => value,
                     Err(error) => {
                         self.errors.insert(key, error.to_string());
@@ -217,6 +218,18 @@ impl FilterHost {
         Ok(())
     }
 
+    pub fn errors_for_profile(
+        &self,
+        library: &Library,
+        devices: &[DeviceInfo],
+        id: &str,
+    ) -> Option<String> {
+        devices
+            .iter()
+            .filter(|device| device.effective_profile_id(&library.comparison_sets) == Some(id))
+            .find_map(|device| self.errors.get(&device.key.as_storage_key()).cloned())
+    }
+
     fn surround_node_names(&self) -> Vec<String> {
         self.filters
             .values()
@@ -266,6 +279,115 @@ impl FilterHost {
             "errors": self.errors,
         })
     }
+}
+
+fn compile_reference(
+    edit: &crate::live_edit::Session,
+    profile: &massiveeq_core::ProfileDocument,
+    options: &CompileOptions,
+) -> Result<CompiledProfile> {
+    let key = (
+        options.sample_rate,
+        options.quantum,
+        options.output_channels,
+    );
+    let mut cache = edit
+        .reference_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(compiled) = cache.get(&key) {
+        return Ok(compiled.clone());
+    }
+    let compiled = compile_profile(profile, options)?;
+    cache.insert(key, compiled.clone());
+    Ok(compiled)
+}
+
+fn compile_output_with_edits(
+    storage: &Storage,
+    library: &Library,
+    device: &DeviceInfo,
+    settings: device::GraphSettings,
+    edits: &crate::live_edit::Sessions,
+) -> Result<(CompiledProfile, u64)> {
+    if !library.global_bypass
+        && let Some(bank) = library
+            .comparison_sets
+            .get(&device.key.as_storage_key())
+            .filter(|bank| bank.enabled)
+    {
+        return compile_comparison_with_edits(
+            storage,
+            library,
+            device,
+            settings,
+            bank,
+            device.bypassed,
+            Some(edits),
+        );
+    }
+    if !library.global_bypass
+        && let Some(id) = device.effective_profile_id(&library.comparison_sets)
+        && let Some(edit) = edits.get(id)
+        && !edit.expired(std::time::Instant::now())
+    {
+        let options = CompileOptions {
+            sample_rate: settings.sample_rate,
+            quantum: settings.quantum,
+            output_channels: device.channels,
+            manual_trim_db: edit.trim,
+            profile_dir: storage.profile_dir(id),
+        };
+        let mut current = compile_profile(&edit.draft, &options)?;
+        let mut revision = profile_revision(
+            &edit.draft,
+            edit.trim,
+            device.bypassed,
+            settings.sample_rate,
+            settings.quantum,
+            device.channels,
+        );
+        if let Some((reference, trim)) = &edit.reference {
+            let mut original = compile_reference(
+                edit,
+                reference,
+                &CompileOptions {
+                    manual_trim_db: *trim,
+                    ..options
+                },
+            )?;
+            anyhow::ensure!(
+                current.latency_frames == original.latency_frames,
+                "Starting sound has different processing latency; capture a new starting sound"
+            );
+            let width = current.input_channels.max(original.input_channels);
+            widen_input(&mut current, width)?;
+            widen_input(&mut original, width)?;
+            let current_level = perceived_output_level_db(&current);
+            let reference_level = perceived_output_level_db(&original);
+            let target = current_level.min(reference_level).min(0.0);
+            attenuate_for_comparison(&mut current, target - current_level)?;
+            attenuate_for_comparison(&mut original, target - reference_level)?;
+            revision ^= profile_revision(
+                reference,
+                *trim,
+                edit.hear_reference,
+                settings.sample_rate,
+                settings.quantum,
+                device.channels,
+            )
+            .rotate_left(17);
+            if edit.hear_reference {
+                current = original;
+            }
+        }
+        if device.bypassed {
+            let gain = perceived_output_level_db(&current).min(0.0);
+            current = compile_level_matched_bypass(&current, gain)?;
+        }
+        return Ok((current, revision));
+    }
+    compile_output_state(storage, library, device, settings)
 }
 
 fn compile_output_state(
@@ -366,6 +488,21 @@ fn compile_comparison_profile(
     comparison: &ComparisonSet,
     bypassed: bool,
 ) -> Result<(CompiledProfile, u64)> {
+    compile_comparison_with_edits(
+        storage, library, device, settings, comparison, bypassed, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_comparison_with_edits(
+    storage: &Storage,
+    library: &Library,
+    device: &DeviceInfo,
+    settings: device::GraphSettings,
+    comparison: &ComparisonSet,
+    bypassed: bool,
+    edits: Option<&crate::live_edit::Sessions>,
+) -> Result<(CompiledProfile, u64)> {
     anyhow::ensure!(
         comparison.profile_ids.len() >= 2,
         "a comparison bank needs at least two candidates"
@@ -378,14 +515,21 @@ fn compile_comparison_profile(
     );
 
     let mut candidates = Vec::with_capacity(comparison.profile_ids.len());
+    let mut reference_levels = Vec::new();
     let mut signature = serde_json::to_string(comparison).unwrap_or_default();
     for profile_id in &comparison.profile_ids {
         if profile_id == COMPARISON_BYPASS_ID {
             signature.push_str("|bypass");
             continue;
         }
-        let (profile, trim) = storage.parsed_profile(library, profile_id)?;
-        let compiled = compile_profile(
+        let saved = storage.parsed_profile(library, profile_id)?;
+        let edit = edits
+            .and_then(|edits| edits.get(profile_id))
+            .filter(|edit| !edit.expired(std::time::Instant::now()));
+        let (profile, trim) = edit
+            .map(|edit| (edit.draft.clone(), edit.trim))
+            .unwrap_or(saved);
+        let mut compiled = compile_profile(
             &profile,
             &CompileOptions {
                 sample_rate: settings.sample_rate,
@@ -395,6 +539,34 @@ fn compile_comparison_profile(
                 profile_dir: storage.profile_dir(profile_id),
             },
         )?;
+        reference_levels.push(perceived_output_level_db(&compiled));
+        if let Some(edit) = edit
+            && let Some((original, trim)) = &edit.reference
+        {
+            let reference = compile_reference(
+                edit,
+                original,
+                &CompileOptions {
+                    sample_rate: settings.sample_rate,
+                    quantum: settings.quantum,
+                    output_channels: device.channels,
+                    manual_trim_db: *trim,
+                    profile_dir: storage.profile_dir(profile_id),
+                },
+            )?;
+            anyhow::ensure!(
+                reference.latency_frames == compiled.latency_frames,
+                "starting sound has incompatible latency"
+            );
+            reference_levels.push(perceived_output_level_db(&reference));
+            signature.push_str(&format!(
+                "|reference={:?}|trim={trim}|hear={}",
+                original, edit.hear_reference
+            ));
+            if edit.hear_reference {
+                compiled = reference;
+            }
+        }
         let perceived = perceived_output_level_db(&compiled);
         signature.push('|');
         signature.push_str(profile_id);
@@ -420,9 +592,8 @@ fn compile_comparison_profile(
             .all(|(_, compiled, _)| compiled.latency_frames == latency),
         "comparison candidates have incompatible processing latency"
     );
-    let target_level = candidates
-        .iter()
-        .map(|(_, _, perceived)| *perceived)
+    let target_level = reference_levels
+        .into_iter()
         .fold(0.0_f64, f64::min)
         .min(0.0);
     // Every candidate runs on the same sink, as wide as the widest candidate.
@@ -660,6 +831,84 @@ mod tests {
     use super::*;
     use massiveeq_core::{DeviceKey, parse_text};
 
+    #[test]
+    fn live_drafts_switch_reference_at_one_level_and_expire_to_saved_audio() {
+        use crate::live_edit::{LIVE_TIMEOUT, Reference, Request, Session, Sessions};
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = Library::default();
+        let profile = storage.create_profile(&mut library, "Live").unwrap();
+        let device = DeviceInfo {
+            key: DeviceKey {
+                backend: "test".into(),
+                stable_id: "live".into(),
+                route: "stereo".into(),
+            },
+            node_name: "live".into(),
+            description: "Live".into(),
+            channels: 2,
+            connected: true,
+            assigned_profile: Some(profile.id.clone()),
+            bypassed: false,
+            is_default: true,
+        };
+        library
+            .assignments
+            .insert(device.key.as_storage_key(), profile.id.clone());
+        let settings = device::GraphSettings {
+            sample_rate: 48000,
+            quantum: 1024,
+        };
+        let session = Session::parse(
+            &storage,
+            &library,
+            &profile.id,
+            Request {
+                text: "Filter: ON LS Fc 100 Hz Gain 8 dB Q 0.707".into(),
+                trim: 0.0,
+                reference: Some(Reference {
+                    text: String::new(),
+                    trim: 0.0,
+                }),
+                hear_reference: false,
+            },
+        )
+        .unwrap();
+        let mut edits = Sessions::from([(profile.id.clone(), session)]);
+        let (current, revision) =
+            compile_output_with_edits(&storage, &library, &device, settings, &edits).unwrap();
+        edits.get_mut(&profile.id).unwrap().hear_reference = true;
+        let (original, original_revision) =
+            compile_output_with_edits(&storage, &library, &device, settings, &edits).unwrap();
+        assert_ne!(revision, original_revision);
+        assert_eq!(current.latency_frames, original.latency_frames);
+        assert!(
+            (perceived_output_level_db(&current) - perceived_output_level_db(&original)).abs()
+                < 1e-9
+        );
+        assert!(current.analysis.final_peak_db <= -0.999);
+        assert!(original.analysis.final_peak_db <= -0.999);
+        assert!(
+            storage
+                .parsed_profile(&library, &profile.id)
+                .unwrap()
+                .0
+                .filters
+                .is_empty()
+        );
+        edits.get_mut(&profile.id).unwrap().renewed -= LIVE_TIMEOUT;
+        let (expired, _) =
+            compile_output_with_edits(&storage, &library, &device, settings, &edits).unwrap();
+        let (saved, _) = compile_output_state(&storage, &library, &device, settings).unwrap();
+        assert_eq!(
+            expired.channels[0].gain_linear,
+            saved.channels[0].gain_linear
+        );
+        library.global_bypass = true;
+        let (dry, _) =
+            compile_output_with_edits(&storage, &library, &device, settings, &edits).unwrap();
+        assert_eq!(dry.channels[0].gain_linear, 1.0);
+    }
     #[test]
     fn profile_revision_changes_for_audio_relevant_state() {
         let profile = parse_text("test", "Filter: ON PK Fc 1000 Hz Gain 3 dB Q 1");
