@@ -4,6 +4,16 @@
 
 ### Changed
 
+- Rename LISTEN to TONE GEN. While the tone plays, the output level holds
+  where it was when the tone started, for the edit and the A/B starting
+  sound alike, so a band change sounds like exactly that change instead of
+  also re-matching the whole output's loudness. Clipping protection still
+  applies to the tone, and matching resumes when it stops.
+- Delete a band by double-clicking its node, right-clicking its node or
+  chip, or pressing Delete or Backspace; Ctrl+Z restores it.
+- Band chips wrap onto a second row, then scroll, instead of running off the
+  footer; ＋ follows the last chip.
+- Band numbers on the graph and chips take their ear's colour.
 - Arrow keys on the selected band: Up/Down change gain by 0.1 dB, Shift+Up/Down
   by 1 dB, Left/Right move frequency, and Shift+Left/Right change Q. Held keys
   speed up. Clicking a band chip or a panel knob keeps these keys on the band.
@@ -70,6 +80,9 @@
 
 ### Fixed
 
+- Dragging the Bass, Tilt, or Output knob no longer moves the window: the
+  footer is a window handle, and knob drags now claim the pointer. Knob value
+  labels keep a fixed width, so the footer does not shift as values change.
 - Dragging a band knob quickly no longer glitches: the panel moved with its
   node under the pointer and fed that movement back into the knob. The panel
   now holds still while the pointer is on it or a knob is dragged, and knob

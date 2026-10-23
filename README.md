@@ -56,8 +56,9 @@ support contract.
 
 **Listening and comparing**
 
-- **LISTEN**: sweep a sine or band of pink noise through the current EQ and
-  cut or boost what jumps out, by ear
+- **TONE GEN**: sweep a sine or band of pink noise through the current EQ and
+  cut or boost what jumps out, by ear; the output level holds while it plays,
+  so each change sounds like exactly that change
 - **A/B**: audition the starting sound against your edit, or level-matched
   comparison banks of 2–9 profiles plus dry playback
 - Headphone measurement and target (or target-range) curves behind the EQ,
@@ -91,7 +92,7 @@ support contract.
   <tr>
     <td width="50%">
       <a href="docs/screenshots/listen-tone-finder.png">
-        <img src="docs/screenshots/listen-tone-finder.png" alt="LISTEN tone finder with its sweep and signal menu open and a tone marker on the graph" width="100%">
+        <img src="docs/screenshots/listen-tone-finder.png" alt="TONE GEN tone finder with its sweep and signal menu open and a tone marker on the graph" width="100%">
       </a>
     </td>
     <td width="50%">
@@ -101,7 +102,7 @@ support contract.
     </td>
   </tr>
   <tr>
-    <td align="center"><em>LISTEN: tune by ear with a sweep or tone</em></td>
+    <td align="center"><em>TONE GEN: tune by ear with a sweep or tone</em></td>
     <td align="center"><em>A/B: starting sound and level-matched banks</em></td>
   </tr>
   <tr>
@@ -281,23 +282,29 @@ delete. Knobs follow the mouse vertically (Shift is finer), take the mouse
 wheel, and reset on double-click; the panel holds still while you work in it.
 Escape closes the panel.
 
+To delete a band, double-click its node, right-click its node or chip, or
+press **Delete** or **Backspace** with it selected; the panel's **×** works
+too. **Ctrl+Z** brings it back.
+
 With a band selected, **Up**/**Down** change its gain by 0.1 dB and
 **Shift+Up**/**Down** by 1 dB; **Left**/**Right** move its frequency and
 **Shift+Left**/**Right** change its Q. Hold a key to go faster. The
-chips along the footer list every band and select it; **＋** adds one.
+chips along the footer list every band, numbered in its ear's colour (blue for
+left, red for right) as on the graph, and select it; **＋** adds one. Past one
+row the chips wrap onto a second, then scroll.
 Profiles with other filter types (high-pass, notch, and so on) still load and
 play; their bands show their type and can be switched to one of the three.
 
 The header holds the profile bank (◀ ▾ ▶), undo and redo, **A/B**, the
 output picker with its assign action, and the engine switch. The footer
-holds **FILTERS**, **LISTEN**, the bands, the **Bass**, **Tilt**, and
+holds **FILTERS**, **TONE GEN**, the bands, the **Bass**, **Tilt**, and
 **Output** knobs, and **TEXT**, **IR**, and **CURVES**. While **FILTERS** or
 the engine is off, the graph dims: it shows the EQ you would hear, not what
 is playing.
 
 ## Tuning by ear: the tone finder
 
-**LISTEN** in the footer plays a test signal through the
+**TONE GEN** in the footer plays a test signal through the
 selected output's current EQ: a sine, or pink noise across the full range,
 one octave, or a third of an octave around the chosen frequency, to the left
 ear, right ear, or both; the menu beside it chooses which, and holds the
@@ -305,8 +312,20 @@ sweep. Sweep the frequency (a marker follows on the graph)
 and listen for spots that jump out or vanish. **−3**, **−1**, **+1**, or
 **+3 dB** adds a peak filter there, as wide as what you were hearing, or adjusts
 the filter already within a twelfth of an octave. Every signal plays at the
-same RMS level, capped at −12 dBFS; start quiet. The tone stops when you
-turn LISTEN off, open the text editor, close the window, or within five
+same RMS level, capped at −12 dBFS; start quiet.
+
+While the tone plays, the output level holds where it was when the tone
+started. Normally MassiveEQ re-matches loudness after every change, so music
+stays equally loud and never clips: boost one band and everything else turns
+down. That is right for music but confusing for tones, because the tone you
+are comparing against moves too. With the level held, a +3 dB band sounds 3 dB
+louder at its frequency and nothing else changes; **A/B** against the starting
+sound plays both at the same held level, so the difference is exactly the
+difference between the two curves. The readout says **LEVEL HELD FOR TONE
+GEN**. Clipping protection steps in only if a boost would clip the tone itself
+(it has 11 dB of room below full scale), so pause music while you tune. When
+the tone stops, matching resumes. The tone stops when you
+turn TONE GEN off, open the text editor, close the window, or within five
 seconds if the editor goes away. [Listening workflow and implementation
 notes](docs/listening-workflow.md) describe the controls and credit the
 research that informed them.

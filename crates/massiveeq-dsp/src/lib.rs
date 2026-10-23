@@ -11,8 +11,8 @@ pub use analysis::{ChannelResponse, CompiledAnalysis, ResponsePoint};
 pub use biquad::{Biquad, BiquadCoefficients};
 pub use compiler::{
     CompileError, CompileOptions, CompiledProfile, MatrixRoute, attenuate_for_comparison,
-    compile_bypass, compile_bypass_with_gain, compile_profile, perceived_output_level_db,
-    widen_input,
+    compile_bypass, compile_bypass_with_gain, compile_profile, hold_output_gain,
+    perceived_output_level_db, widen_input,
 };
 pub use convolution::{ConvolutionKernel, IrData, load_ir};
 pub use graphic::{GraphicDesign, design_graphic_eq};
