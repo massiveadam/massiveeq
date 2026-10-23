@@ -31,7 +31,7 @@ MEQ_TESTFLIGHT_PRIVATE_BUS=1 \
 dbus-run-session -- bash /absolute/staged/repo/.agents/skills/verify-massiveeq/testflight.sh /absolute/staged/repo
 ```
 
-The runner owns a separate D-Bus service and XDG configuration/data directories. It creates a synthetic HD 650 fixture, assigns it to the real ALSA output, opens the actual GTK editor, and drives named controls through AT-SPI. Do not describe the fixture as a real headphone measurement.
+The runner owns a separate D-Bus service and XDG configuration/data directories. It checks acquired D-Bus names, since an activatable service is not a running instance. It creates a synthetic HD 650 fixture, assigns it to the real ALSA output, opens the actual GTK editor, and drives named controls through AT-SPI. Do not describe the fixture as a real headphone measurement.
 
 ## Main user-facing features
 

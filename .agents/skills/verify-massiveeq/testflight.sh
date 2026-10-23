@@ -6,7 +6,7 @@ helpers=$(dirname "$(realpath "$0")")
 test "${MEQ_TESTFLIGHT_PRIVATE_BUS:-}" = 1
 test -n "${MEQ_TESTFLIGHT_ROOT:-}"
 test -n "${WAYLAND_DISPLAY:-}"
-if busctl --user --no-pager --no-legend list | grep -q '^org.massiveeq.Service1 '; then
+if busctl --user --acquired --no-pager --no-legend list | grep '^org.massiveeq.Service1 ' >/dev/null; then
   echo 'This bus already has a MassiveEQ service; use a new private D-Bus session.' >&2
   exit 1
 fi
