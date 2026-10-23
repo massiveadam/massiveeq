@@ -61,11 +61,16 @@ prepare
 sleep 3
 # The existing listening scenario resolves its helper directory from $0.
 scenario
+ui click "Sweep and signal" "toggle button"
+sleep 0.5
 ui setnamedvalue "Graph tone frequency" 0.725363752
 ui click "Listen" "toggle button"
 sleep 1
 before=$(python3 "$helpers/record-tone.py" "$MEQ_TESTFLIGHT_ROOT/evidence/before.wav")
-ui setnamedvalue "Band 2 gain" -9
+# Bands are edited in the panel beside the selected band's node.
+ui click "Select band 2" "toggle button"
+sleep 0.4
+ui setnamedvalue "Selected band Gain" -9
 sleep 1
 after=$(python3 "$helpers/record-tone.py" "$MEQ_TESTFLIGHT_ROOT/evidence/after.wav")
 python3 - "$before" "$after" <<'PY'
@@ -79,7 +84,7 @@ sleep 0.5
 meq Status >"$MEQ_TESTFLIGHT_ROOT/evidence/status.json"
 jq -e '.engine.errors == {} and (.engine.active | length) == 1 and (.engine.active[0] | .input_overflows == 0 and .output_underflows == 0 and .invalid_buffers == 0 and .cpu_warning == false)' "$MEQ_TESTFLIGHT_ROOT/evidence/status.json"
 shot benji-editor.png
-ui setnamedvalue "Band 2 gain" -4.25
+ui setnamedvalue "Selected band Gain" -4.25
 ui click "Close" button
 sleep 0.8
 meq ListProfiles | jq -e '.[] | select(.name == "HD 650") | .text | contains("Gain -4.25 dB")'

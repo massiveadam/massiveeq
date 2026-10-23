@@ -1,16 +1,16 @@
 # Listening and live editing
 
-MassiveEQ keeps the graph, audio audition, and saved profile separate. Dragging an EQ point or moving a fader previews its current value while the gesture is still in progress. A quiet period of 300 ms saves a completed edit; releasing a graph point starts that save timer. Live requests are coalesced at 35 ms and sent on a background worker, so compiling a profile or writing it does not block GTK input.
+MassiveEQ keeps the graph, audio audition, and saved profile separate. Dragging an EQ point or turning a knob previews its current value while the gesture is still in progress. A quiet period of 300 ms saves a completed edit; releasing a graph point starts that save timer. Live requests are coalesced at 35 ms and sent on a background worker, so compiling a profile or writing it does not block GTK input.
 
 ## Controls
 
-The response panel holds Listen, Sweep, the full-range sweep duration, a tone-cursor mode, frequency, ear selection, and small corrections at the held frequency. Sweep moves logarithmically upward and stops at 20 kHz. Turning Sweep off holds the frequency while Listen continues. Turning Listen off stops playback. Tone cursor makes graph drags move the test frequency; turning it off returns the graph to normal EQ editing. Moving to Text or IR stops playback. The full Tone page remains available for pink noise and its band controls.
+LISTEN in the footer plays and stops the tone. The menu beside it holds Sweep, the full-range sweep duration, a tone-cursor mode, the frequency and level, sine or pink noise and its band, ear selection, and corrections at the held frequency. Sweep moves logarithmically upward and stops at 20 kHz. Turning Sweep off holds the frequency while Listen continues. Closing the menu keeps the tone playing; turning Listen off stops it. Tone cursor makes graph drags move the test frequency; turning it off returns the graph to normal EQ editing. Opening the text editor stops playback.
 
-Bass is a broad shelf at 105 Hz. Positive Tilt is brighter and negative Tilt is warmer, using opposing shelves around 1 kHz. These are ordinary parametric filters, visible in the band bank and portable in exported profiles. They preserve IRs and other filters. Repeated changes reuse the same matching shelves rather than adding a new filter on every step.
+Bass is a broad shelf at 105 Hz. Positive Tilt is brighter and negative Tilt is warmer, using opposing shelves around 1 kHz. These are ordinary parametric filters, visible among the band chips and portable in exported profiles. They preserve IRs and other filters. Repeated changes reuse the same matching shelves rather than adding a new filter on every step.
 
 Undo and Redo restore complete EQ text and manual trim. A drag or a continuous burst of edits is one step. Ctrl+Z and Ctrl+Shift+Z work outside editable text fields, where native text undo takes precedence. History is bounded to 100 steps and resets when opening another profile or loading an IR.
 
-Hear starting sound auditions the snapshot captured when a profile opens. Capture start replaces that snapshot with the current EQ. The reference and edited profile use a common clipping-safe estimated perceived level. This uses the same matching basis as the existing comparison bank. It does not measure SPL at the listener's ears. Changing the audition does not overwrite the edited profile.
+In the A/B menu, Hear starting sound auditions the snapshot captured when a profile opens. Capture start replaces that snapshot with the current EQ. The reference and edited profile use a common clipping-safe estimated perceived level. This uses the same matching basis as the existing comparison bank. It does not measure SPL at the listener's ears. Changing the audition does not overwrite the edited profile.
 
 ## Curve context
 

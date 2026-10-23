@@ -1,6 +1,8 @@
 mod client;
 mod editing;
+mod glyph;
 mod graph;
+mod knob;
 mod live_client;
 mod update;
 
@@ -94,7 +96,6 @@ struct PendingDeviceBypass {
 
 #[derive(Clone)]
 struct ConvolutionUi {
-    stack: adw::ViewStack,
     file_name: gtk::Label,
     file_path: gtk::Label,
     channel: gtk::DropDown,
@@ -228,20 +229,6 @@ fn build_ui(app: &adw::Application) {
     let brand = gtk::Label::new(Some("MASSIVE/EQ"));
     brand.add_css_class("brand");
     header.pack_start(&brand);
-    let rail_menu = gtk::MenuButton::new();
-    rail_menu.set_icon_name("sidebar-show-symbolic");
-    rail_menu.set_tooltip_text(Some("Profiles and tools"));
-    rail_menu.update_property(&[gtk::accessible::Property::Label("Profiles and tools")]);
-    rail_menu.set_visible(false);
-    let rail_popover = gtk::Popover::new();
-    let rail_popup_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .propagate_natural_height(true)
-        .max_content_height(640)
-        .build();
-    rail_popover.set_child(Some(&rail_popup_scroll));
-    rail_menu.set_popover(Some(&rail_popover));
-    header.pack_start(&rail_menu);
     // What plays where, and the engine's numbers, as one status strip.
     let header_status = gtk::Label::new(None);
     header_status.add_css_class("header-status");
@@ -254,7 +241,7 @@ fn build_ui(app: &adw::Application) {
     profile_popover_box.set_margin_bottom(12);
     profile_popover_box.set_margin_start(12);
     profile_popover_box.set_margin_end(12);
-    profile_popover_box.set_size_request(330, 360);
+    profile_popover_box.set_size_request(320, -1);
     let profile_list = gtk::ListBox::new();
     profile_list.add_css_class("profile-bank");
     profile_list.set_selection_mode(gtk::SelectionMode::Single);
@@ -292,16 +279,13 @@ fn build_ui(app: &adw::Application) {
     profile_menu_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     profile_menu.set_child(Some(&profile_menu_label));
     profile_menu.set_always_show_arrow(true);
-    profile_menu.set_margin_start(10);
-    profile_menu.set_margin_top(3);
-    profile_menu.set_margin_bottom(3);
     profile_menu.set_popover(Some(&profile_popover));
-    profile_menu.add_css_class("profile-menu");
+    profile_menu.add_css_class("preset-menu");
+    profile_menu.update_property(&[gtk::accessible::Property::Label("Profiles")]);
     let header_add_profile = gtk::Button::from_icon_name("list-add-symbolic");
     header_add_profile.add_css_class("profile-add");
     header_add_profile.set_valign(gtk::Align::Center);
     header_add_profile.set_tooltip_text(Some("New profile"));
-
     let global_bypass = gtk::ToggleButton::new();
     global_bypass.set_icon_name("system-shutdown-symbolic");
     global_bypass.add_css_class("power");
@@ -330,12 +314,6 @@ fn build_ui(app: &adw::Application) {
     update::add_update_button(&header, &window);
     toolbar.add_top_bar(&header);
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(16);
-    content.set_margin_bottom(22);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
-
     let profile_status = gtk::Label::new(None);
     profile_status.add_css_class("tile-subtitle");
     profile_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -344,7 +322,7 @@ fn build_ui(app: &adw::Application) {
         .placeholder_text("Profile name")
         .hexpand(true)
         .build();
-    name_entry.add_css_class("tile-title");
+    name_entry.add_css_class("preset-name");
     let output_status = gtk::Label::new(None);
     output_status.add_css_class("tile-subtitle");
     output_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -358,10 +336,9 @@ fn build_ui(app: &adw::Application) {
             .collect::<Vec<_>>(),
     );
     let device_drop = gtk::DropDown::new(Some(device_strings.clone()), gtk::Expression::NONE);
-    device_drop.set_hexpand(true);
     device_drop.set_size_request(1, -1);
-    device_drop.add_css_class("tile-dropdown");
-    device_drop.set_factory(Some(&ellipsized_string_factory(32)));
+    device_drop.add_css_class("output-dropdown");
+    device_drop.set_factory(Some(&ellipsized_string_factory(24)));
     device_drop.set_list_factory(Some(&ellipsized_string_factory(48)));
     let device_state = gtk::Label::new(Some("Not applied"));
     device_state.set_xalign(0.0);
@@ -369,12 +346,17 @@ fn build_ui(app: &adw::Application) {
     device_state.add_css_class("device-state");
     device_state.set_ellipsize(gtk::pango::EllipsizeMode::End);
     let assign_button = gtk::Button::with_label("Apply to output");
-    assign_button.add_css_class("tile-action");
-    assign_button.set_hexpand(true);
-    // The round accent control: lit while this output's filters run.
+    assign_button.add_css_class("assign-button");
+    // The plugin bypass: lit while this output's filters run.
     let device_bypass = gtk::ToggleButton::new();
-    device_bypass.add_css_class("filters-dot");
+    device_bypass.add_css_class("footer-toggle");
     device_bypass.set_valign(gtk::Align::Center);
+    {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.append(&gtk::Image::from_icon_name("system-shutdown-symbolic"));
+        content.append(&gtk::Label::new(Some("FILTERS")));
+        device_bypass.set_child(Some(&content));
+    }
     device_bypass.set_active(
         model
             .devices
@@ -454,11 +436,11 @@ fn build_ui(app: &adw::Application) {
     comparison_box.append(&comparison_status);
     comparison_popover.set_child(Some(&comparison_box));
     let comparison_menu = gtk::MenuButton::new();
-    comparison_menu.set_label("COMPARE");
+    comparison_menu.set_label("A/B");
     comparison_menu.set_popover(Some(&comparison_popover));
-    comparison_menu.add_css_class("comparison-menu");
+    comparison_menu.add_css_class("bar-menu");
     comparison_menu.set_tooltip_text(Some(
-        "Compare profiles at a shared BS.1770 K-weighted pink-noise level",
+        "Hear the starting sound, or compare profiles at a shared BS.1770 K-weighted level",
     ));
     let comparison_ui = Rc::new(ComparisonUi {
         menu: comparison_menu,
@@ -476,91 +458,57 @@ fn build_ui(app: &adw::Application) {
     });
     let curves_ui = build_curves_menu();
 
-    // Left rail: the open profile and its output as tiles, the profile bank,
-    // and the tools.
-    let rail = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    rail.add_css_class("rail");
-    rail.set_size_request(292, -1);
-
-    let profile_tile = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    profile_tile.add_css_class("rail-tile");
-    let profile_head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    profile_head.append(&tile_icon("audio-headphones-symbolic"));
-    let profile_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    profile_text.set_hexpand(true);
-    profile_text.set_valign(gtk::Align::Center);
-    profile_text.append(&name_entry);
-    profile_text.append(&profile_status);
-    profile_head.append(&profile_text);
-    profile_tile.append(&profile_head);
-    let profile_controls = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    let preamp_tile = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    preamp_tile.add_css_class("tile-value");
-    preamp_tile.set_hexpand(true);
-    preamp_tile.set_valign(gtk::Align::Center);
-    let preamp_value = gtk::Label::new(Some("—"));
-    preamp_value.add_css_class("tile-value-number");
-    let preamp_caption = gtk::Label::new(Some("Preamp"));
-    preamp_caption.add_css_class("tile-value-caption");
-    preamp_tile.append(&preamp_value);
-    preamp_tile.append(&preamp_caption);
-    PREAMP_READOUT.with(|readout| *readout.borrow_mut() = Some(preamp_value));
-    profile_controls.append(&preamp_tile);
-    profile_controls.append(&device_bypass);
-    profile_tile.append(&profile_controls);
-    rail.append(&profile_tile);
-
-    let output_tile = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    output_tile.add_css_class("rail-tile");
-    let output_head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    output_head.append(&tile_icon("audio-speakers-symbolic"));
-    let output_text = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    output_text.set_hexpand(true);
-    output_text.set_valign(gtk::Align::Center);
-    output_text.set_size_request(1, -1);
-    output_text.append(&device_drop);
-    output_text.append(&output_status);
-    output_head.append(&output_text);
-    output_tile.append(&output_head);
-    output_tile.append(&device_state);
-    output_tile.append(&assign_button);
-    rail.append(&output_tile);
-
-    rail.append(&rail_label("PROFILES"));
-    rail.append(&profile_scroll);
+    // Preset bar: step through the profile bank, or open it.
+    let previous_profile = gtk::Button::from_icon_name("go-previous-symbolic");
+    previous_profile.set_tooltip_text(Some("Previous profile"));
+    previous_profile.update_property(&[gtk::accessible::Property::Label("Previous profile")]);
+    let next_profile = gtk::Button::from_icon_name("go-next-symbolic");
+    next_profile.set_tooltip_text(Some("Next profile"));
+    next_profile.update_property(&[gtk::accessible::Property::Label("Next profile")]);
+    let preset = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    preset.add_css_class("linked");
+    preset.add_css_class("preset");
+    preset.set_valign(gtk::Align::Center);
+    preset.append(&previous_profile);
+    preset.append(&profile_menu);
+    preset.append(&next_profile);
+    header.pack_start(&preset);
+    for (button, step) in [(&previous_profile, -1_i32), (&next_profile, 1)] {
+        let list = profile_list.clone();
+        button.connect_clicked(move |_| {
+            let count = {
+                let mut count = 0;
+                while list.row_at_index(count).is_some() {
+                    count += 1;
+                }
+                count
+            };
+            if count == 0 {
+                return;
+            }
+            let current = list.selected_row().map_or(0, |row| row.index());
+            let next = (current + step).rem_euclid(count);
+            if let Some(row) = list.row_at_index(next) {
+                list.select_row(Some(&row));
+            }
+        });
+    }
+    let history_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    history_box.set_valign(gtk::Align::Center);
+    header.pack_start(&history_box);
+    comparison_ui.menu.set_valign(gtk::Align::Center);
+    header.pack_start(&comparison_ui.menu);
+    header.pack_end(&assign_button);
+    assign_button.set_valign(gtk::Align::Center);
+    header.pack_end(&device_drop);
+    device_drop.set_valign(gtk::Align::Center);
+    profile_popover_box.append(&name_entry);
+    profile_popover_box.append(&profile_status);
+    profile_popover_box.append(&profile_scroll);
     profile_buttons.add_css_class("bank-actions");
-    rail.append(&profile_buttons);
+    profile_popover_box.append(&profile_buttons);
 
-    rail.append(&rail_label("TOOLS"));
-    let tools = gtk::Grid::new();
-    tools.set_column_spacing(8);
-    tools.set_row_spacing(8);
-    tools.set_column_homogeneous(true);
-    comparison_ui.menu.add_css_class("tool-tile");
-    tools.attach(&comparison_ui.menu, 0, 0, 2, 1);
-    let tone_tool = gtk::Button::with_label("Tone");
-    tone_tool.add_css_class("tool-tile");
-    tone_tool.add_css_class("round");
-    tone_tool.set_halign(gtk::Align::Center);
-    tone_tool.set_valign(gtk::Align::Center);
-    tools.attach(&tone_tool, 2, 0, 1, 1);
-    let ir_tool = gtk::Button::with_label("IR");
-    ir_tool.add_css_class("tool-tile");
-    ir_tool.add_css_class("round");
-    ir_tool.set_halign(gtk::Align::Center);
-    ir_tool.set_valign(gtk::Align::Center);
-    ir_tool.set_tooltip_text(Some("Impulse response"));
-    tools.attach(&ir_tool, 0, 1, 1, 1);
-    curves_ui.menu.add_css_class("tool-tile");
-    tools.attach(&curves_ui.menu, 1, 1, 2, 1);
-    rail.append(&tools);
-
-    let main_column = gtk::Box::new(gtk::Orientation::Vertical, 18);
-    main_column.set_hexpand(true);
-    let body = gtk::Box::new(gtk::Orientation::Horizontal, 18);
-    body.append(&rail);
-    body.append(&main_column);
-
+    // The graph is the instrument; the selected band's panel floats on it.
     let graph = graph::response_graph(
         model.analysis.clone(),
         model.document.clone(),
@@ -572,7 +520,7 @@ fn build_ui(app: &adw::Application) {
     graph.set_accessible_role(gtk::AccessibleRole::Group);
     graph.add_css_class("response-graph");
     graph.set_tooltip_text(Some(
-        "Click an empty position to add a peak filter. Arrows edit gain and frequency; Shift+Up/Down edits Q; Shift+Left/Right moves frequency farther.",
+        "Click to add a band. Drag a band to move it; scroll over it for Q. Arrows edit the selected band; Shift+Up/Down edits Q; Escape closes its panel.",
     ));
     graph.update_property(&[
         gtk::accessible::Property::Label("Frequency response graph"),
@@ -580,122 +528,116 @@ fn build_ui(app: &adw::Application) {
             "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Click empty graph space to add a filter. Use arrow keys to edit the selected filter; hold Shift for Q or larger frequency steps.",
         ),
     ]);
+    graph.set_vexpand(true);
+    let graph_overlay = gtk::Overlay::new();
+    graph_overlay.add_css_class("graph-stage");
+    graph_overlay.set_child(Some(&graph));
     let analysis_label = gtk::Label::new(Some("AUTO PREAMP —"));
-    analysis_label.set_xalign(0.0);
-    analysis_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     analysis_label.add_css_class("readouts");
-    let level_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    level_row.add_css_class("readout-row");
-    analysis_label.set_hexpand(true);
-    level_row.append(&analysis_label);
-    let trim = gtk::SpinButton::with_range(-24.0, 24.0, 0.1);
-    trim.set_digits(1);
-    trim.set_width_chars(5);
-    trim.set_tooltip_text(Some(
-        "Fine-tune the perceptually matched preamp; safety attenuation still prevents clipping",
-    ));
-    let trim_label = gtk::Label::new(Some("ADJUST"));
-    trim_label.add_css_class("readout-key");
-    let trim_unit = gtk::Label::new(Some("dB"));
-    trim_unit.add_css_class("level-code");
-    let trim_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    trim_controls.set_halign(gtk::Align::End);
-    trim_controls.append(&trim_label);
-    trim_controls.append(&trim);
-    trim_controls.append(&trim_unit);
-    level_row.append(&trim_controls);
-    header_status.set_markup(&header_markup(&engine_status, &model));
-    header_status.set_tooltip_text(Some(&engine_tooltip(&engine_status)));
-    let (tone_page, tone_ui) = build_tone_page();
-    let (graph_listen, graph_tone) = build_graph_tone(&tone_ui);
-    *model.graph_tone.borrow_mut() = Some(graph_tone);
-    let response_body = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    response_body.append(&graph);
-    response_body.append(&level_row);
-    response_body.append(&graph_listen);
+    analysis_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    analysis_label.set_halign(gtk::Align::End);
+    analysis_label.set_valign(gtk::Align::Start);
+    analysis_label.set_margin_end(30);
+    analysis_label.set_margin_top(34);
+    analysis_label.set_can_target(false);
+    graph_overlay.add_overlay(&analysis_label);
+    let status = gtk::Label::new(Some("Ready"));
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("console-status");
     let curve_context = gtk::Label::new(None);
     curve_context.set_wrap(true);
     curve_context.set_xalign(0.0);
     curve_context.add_css_class("level-code");
     curve_context.set_visible(false);
-    response_body.append(&curve_context);
-    *model.curve_context.borrow_mut() = Some(curve_context);
-    main_column.append(&titled_frame(1, "response", &response_body, None));
-    content.append(&body);
+    *model.curve_context.borrow_mut() = Some(curve_context.clone());
+    let notes = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    notes.set_halign(gtk::Align::Start);
+    notes.set_valign(gtk::Align::End);
+    notes.set_margin_start(66);
+    notes.set_margin_bottom(44);
+    notes.set_can_target(false);
+    // The header already shows the route; status shows only when it has news.
+    device_state.set_visible(false);
+    notes.append(&device_state);
+    status.connect_label_notify(|label| {
+        let text = label.text();
+        label.set_visible(!text.is_empty() && text != "Ready");
+    });
+    status.set_visible(false);
+    notes.append(&status);
+    notes.append(&curve_context);
+    graph_overlay.add_overlay(&notes);
+    header_status.set_markup(&header_markup(&engine_status, &model));
+    header_status.set_tooltip_text(Some(&engine_tooltip(&engine_status)));
 
-    let view_stack = adw::ViewStack::new();
-    view_stack.set_vhomogeneous(false);
+    let output = knob::LabeledKnob::new(
+        knob::Knob::new(-24.0, 24.0, 0.0, knob::Taper::Linear, true),
+        "Output",
+        |value| signed_db(value, 1),
+    );
+    output.knob.set_tooltip_text(Some(
+        "Fine-tune the perceptually matched preamp; safety attenuation still prevents clipping",
+    ));
+    let trim = output.knob.clone();
+    let (tone_page, tone_ui) = build_tone_page();
+    let (graph_listen, graph_tone) = build_graph_tone(&tone_ui);
+    let listen_play = graph_tone.play.clone();
+    *model.graph_tone.borrow_mut() = Some(graph_tone);
+
+    let text_view = gtk::TextView::new();
+    text_view.set_monospace(true);
+    text_view.set_wrap_mode(gtk::WrapMode::None);
+    text_view.buffer().set_enable_undo(true);
+    let text_scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(420)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&text_view)
+        .build();
+    text_scroll.add_css_class("code-editor");
+    let main_stack = gtk::Stack::new();
+    main_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    main_stack.set_transition_duration(120);
+    main_stack.add_named(&graph_overlay, Some("graph"));
+    let text_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    text_page.add_css_class("text-page");
+    text_scroll.set_vexpand(true);
+    text_page.append(&text_scroll);
+    main_stack.add_named(&text_page, Some("text"));
+
+    // Band chips select bands; the panel on the graph edits them.
     let filter_list = gtk::FlowBox::new();
-    filter_list.set_selection_mode(gtk::SelectionMode::None);
+    filter_list.set_orientation(gtk::Orientation::Vertical);
     filter_list.set_min_children_per_line(1);
-    filter_list.set_max_children_per_line(64);
-    filter_list.set_column_spacing(10);
-    filter_list.set_row_spacing(10);
-    filter_list.set_homogeneous(true);
-    filter_list.set_activate_on_single_click(false);
-    filter_list.set_valign(gtk::Align::Start);
+    filter_list.set_max_children_per_line(1);
+    filter_list.set_selection_mode(gtk::SelectionMode::None);
+    filter_list.set_column_spacing(6);
+    filter_list.set_valign(gtk::Align::Center);
     filter_list.set_halign(gtk::Align::Start);
-    filter_list.add_css_class("filter-list");
-    let narrow_filters = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-        adw::BreakpointConditionLengthType::MaxWidth,
-        720.0,
-        adw::LengthUnit::Px,
-    ));
-    // The rail sits above the editor once both no longer fit side by side.
-    let narrow_route = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-        adw::BreakpointConditionLengthType::MaxWidth,
-        880.0,
-        adw::LengthUnit::Px,
-    ));
-    // Only the last matching breakpoint applies. Each narrow rule moves the
-    // same live rail into a header popover, preserving its controls and state.
-    for breakpoint in [&narrow_route, &narrow_filters] {
-        breakpoint.add_setter(&rail_menu, "visible", Some(&true.to_value()));
-        breakpoint.add_setter(&header_status, "visible", Some(&false.to_value()));
-        breakpoint.connect_apply({
-            let body = body.clone();
-            let rail = rail.clone();
-            let scroll = rail_popup_scroll.clone();
-            move |_| {
-                body.remove(&rail);
-                scroll.set_child(Some(&rail));
-            }
-        });
-        breakpoint.connect_unapply({
-            let body = body.clone();
-            let rail = rail.clone();
-            let popover = rail_popover.clone();
-            let scroll = rail_popup_scroll.clone();
-            move |_| {
-                popover.popdown();
-                scroll.set_child(gtk::Widget::NONE);
-                body.prepend(&rail);
-            }
-        });
-    }
-    narrow_filters.add_setter(
-        &level_row,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
+    filter_list.add_css_class("band-chips");
+    let chips_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(true)
+        .child(&filter_list)
+        .build();
+    let add_filter_button = gtk::Button::from_icon_name("list-add-symbolic");
+    add_filter_button.add_css_class("band-chip");
+    add_filter_button.add_css_class("add");
+    add_filter_button.set_valign(gtk::Align::Center);
+    add_filter_button.set_tooltip_text(Some("Add band"));
+    add_filter_button.update_property(&[gtk::accessible::Property::Label("Add band")]);
+    build_band_editor(
+        &model,
+        &text_view.buffer(),
+        &graph,
+        &filter_list,
+        &graph_overlay,
     );
-    narrow_filters.add_setter(&header_status, "visible", Some(&false.to_value()));
-    narrow_filters.add_setter(&analysis_label, "wrap", Some(&true.to_value()));
-    narrow_filters.add_setter(
-        &analysis_label,
-        "ellipsize",
-        Some(&gtk::pango::EllipsizeMode::None.to_value()),
-    );
-    let parametric_stack = gtk::Stack::new();
-    parametric_stack.set_vhomogeneous(false);
-    parametric_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-    parametric_stack.set_transition_duration(120);
-    let visual_page = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    visual_page.append(&filter_list);
-    parametric_stack.add_named(&visual_page, Some("visual"));
-    view_stack.set_valign(gtk::Align::Start);
 
     let convolution_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    convolution_page.set_valign(gtk::Align::Start);
+    convolution_page.set_size_request(380, -1);
     let convolution_card = gtk::Box::new(gtk::Orientation::Vertical, 10);
     convolution_card.add_css_class("convolution-card");
     let convolution_heading = gtk::Label::new(Some("IMPULSE RESPONSE"));
@@ -732,16 +674,6 @@ fn build_ui(app: &adw::Application) {
     convolution_actions.append(&choose_convolution);
     convolution_actions.append(&remove_convolution);
     convolution_card.append(&convolution_actions);
-    narrow_filters.add_setter(
-        &convolution_options,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
-    narrow_filters.add_setter(
-        &convolution_actions,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
     let convolution_note = gtk::Label::new(Some(
         "Parametric filters and GraphicEQ apply on top of the impulse response, per ear.",
     ));
@@ -750,97 +682,49 @@ fn build_ui(app: &adw::Application) {
     convolution_note.add_css_class("level-code");
     convolution_card.append(&convolution_note);
     convolution_page.append(&convolution_card);
-    view_stack.add_titled(&convolution_page, Some("convolution"), "Convolution");
-
-    let text_view = gtk::TextView::new();
-    text_view.set_monospace(true);
-    text_view.set_wrap_mode(gtk::WrapMode::None);
-    text_view.buffer().set_enable_undo(true);
-    let text_scroll = gtk::ScrolledWindow::builder()
-        .min_content_height(420)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .child(&text_view)
-        .build();
-    text_scroll.add_css_class("code-editor");
-    parametric_stack.add_named(&text_scroll, Some("text"));
-    let band_editor = build_band_editor(&model, &text_view.buffer(), &graph, &filter_list);
-    visual_page.append(&band_editor);
-    parametric_stack.add_named(&tone_page, Some("tone"));
-    view_stack.add_titled(&parametric_stack, Some("filters"), "Parametric");
-    // One row of editor pages: the bands as cards or text, the impulse
-    // response, and the tone finder. Two stacks sit behind it.
-    let editor_switcher = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    editor_switcher.add_css_class("editor-switcher");
-    let visual_mode = gtk::ToggleButton::with_label("BANDS");
-    let text_mode = gtk::ToggleButton::with_label("TEXT");
-    let convolution_mode = gtk::ToggleButton::with_label("IR");
-    let tone_mode = gtk::ToggleButton::with_label("TONE");
-    tone_mode.set_tooltip_text(Some(
-        "Find peaks and dips on your own ears with a test tone",
-    ));
-    for (button, view, editor) in [
-        (&visual_mode, "filters", Some("visual")),
-        (&text_mode, "filters", Some("text")),
-        (&convolution_mode, "convolution", None),
-        (&tone_mode, "filters", Some("tone")),
-    ] {
-        if button != &visual_mode {
-            button.set_group(Some(&visual_mode));
-        }
-        editor_switcher.append(button);
-        let view_stack = view_stack.clone();
-        let parametric_stack = parametric_stack.clone();
-        button.connect_clicked(move |button| {
-            button.set_active(true);
-            if let Some(editor) = editor {
-                parametric_stack.set_visible_child_name(editor);
-            }
-            view_stack.set_visible_child_name(view);
-        });
-    }
-    // Mark the tab for whatever page the stacks show.
-    let sync_tabs: Rc<dyn Fn()> = Rc::new({
-        let view_stack = view_stack.clone();
-        let parametric_stack = parametric_stack.clone();
-        let tabs = [
-            visual_mode.clone(),
-            text_mode.clone(),
-            convolution_mode.clone(),
-            tone_mode.clone(),
-        ];
-        move || {
-            let index = if view_stack.visible_child_name().as_deref() == Some("convolution") {
-                2
-            } else {
-                match parametric_stack.visible_child_name().as_deref() {
-                    Some("text") => 1,
-                    Some("tone") => 3,
-                    _ => 0,
-                }
-            };
-            tabs[index].set_active(true);
+    let ir_popover = gtk::Popover::new();
+    ir_popover.set_child(Some(&convolution_page));
+    let ir_menu = gtk::MenuButton::new();
+    ir_menu.set_label("IR");
+    ir_menu.set_popover(Some(&ir_popover));
+    ir_menu.add_css_class("footer-menu");
+    ir_menu.set_tooltip_text(Some("Impulse response"));
+    let text_toggle = gtk::ToggleButton::with_label("TEXT");
+    text_toggle.add_css_class("footer-flat");
+    text_toggle.set_tooltip_text(Some("Edit the profile as Equalizer APO text (Ctrl+E)"));
+    text_toggle.connect_toggled({
+        let stack = main_stack.clone();
+        move |button| {
+            stack.set_visible_child_name(if button.is_active() { "text" } else { "graph" });
         }
     });
-    {
-        let sync = sync_tabs.clone();
-        view_stack.connect_visible_child_name_notify(move |_| sync());
-        let sync = sync_tabs.clone();
-        parametric_stack.connect_visible_child_name_notify(move |_| sync());
-    }
-    visual_mode.set_active(true);
-    let reset_filters_button = gtk::Button::with_label("RESET FILTERS");
-    reset_filters_button.add_css_class("reset-filters");
+    curves_ui.menu.add_css_class("footer-menu");
+    let reset_filters_button = gtk::Button::with_label("Flatten all bands");
+    reset_filters_button.add_css_class("popover-action");
     reset_filters_button.set_tooltip_text(Some(
         "Flatten every parametric band to 0 dB without changing its frequency or Q",
     ));
-    window.add_breakpoint(narrow_route);
-    window.add_breakpoint(narrow_filters);
-    let add_filter_button = gtk::Button::with_label("＋ Add band");
-    add_filter_button.add_css_class("band-add");
-    add_filter_button.set_halign(gtk::Align::Start);
+    profile_popover_box.append(&reset_filters_button);
+    // The IR button lights while the open profile has an impulse response.
+    let sync_tabs: Rc<dyn Fn()> = Rc::new({
+        let model = Rc::downgrade(&model);
+        let ir_menu = ir_menu.clone();
+        move || {
+            let has_ir = model.upgrade().is_some_and(|model| {
+                model
+                    .document
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|document| !document.convolutions.is_empty())
+            });
+            if has_ir {
+                ir_menu.add_css_class("on");
+            } else {
+                ir_menu.remove_css_class("on");
+            }
+        }
+    });
     let convolution_ui = ConvolutionUi {
-        stack: view_stack.clone(),
         file_name: convolution_file_name,
         file_path: convolution_file_path,
         channel: convolution_channel,
@@ -850,88 +734,108 @@ fn build_ui(app: &adw::Application) {
         layout: Rc::new(Cell::new(None)),
         sync_tabs: sync_tabs.clone(),
     };
-    view_stack.connect_visible_child_name_notify({
-        let add_filter = add_filter_button.clone();
-        let reset_filters = reset_filters_button.clone();
-        let parametric_stack = parametric_stack.clone();
-        move |stack| {
-            let parametric = stack.visible_child_name().as_deref() == Some("filters");
-            let visual = parametric_stack.visible_child_name().as_deref() == Some("visual");
-            add_filter.set_visible(parametric && visual);
-            reset_filters.set_visible(true);
-            reset_filters.set_sensitive(parametric && visual);
-            reset_filters.set_opacity(if parametric && visual { 1.0 } else { 0.0 });
-        }
-    });
-    parametric_stack.connect_visible_child_name_notify({
-        let view_stack = view_stack.clone();
-        let add_filter = add_filter_button.clone();
-        let reset_filters = reset_filters_button.clone();
-        move |stack| {
-            let parametric = view_stack.visible_child_name().as_deref() == Some("filters");
-            let visual = stack.visible_child_name().as_deref() == Some("visual");
-            add_filter.set_visible(parametric && visual);
-            reset_filters.set_sensitive(parametric && visual);
-            reset_filters.set_opacity(if parametric && visual { 1.0 } else { 0.0 });
-        }
-    });
-    let bands_body = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    let band_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    band_actions.append(&add_filter_button);
-    reset_filters_button.set_hexpand(true);
-    reset_filters_button.set_halign(gtk::Align::End);
-    band_actions.append(&reset_filters_button);
-    bands_body.append(&band_actions);
-    bands_body.append(&view_stack);
-    main_column.append(&titled_frame(
-        2,
-        "bands",
-        &bands_body,
-        Some(editor_switcher.upcast_ref()),
+
+    // Listening: the toggle plays a tone at the graph's tone line; its menu
+    // holds the sweep, signal, and one-click corrections.
+    let listen_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    listen_box.set_size_request(400, -1);
+    listen_box.append(&graph_listen);
+    // LISTEN in the footer plays and stops; the page's own button would repeat it.
+    tone_ui.play.set_visible(false);
+    listen_box.append(&tone_page);
+    let listen_popover = gtk::Popover::new();
+    listen_popover.set_child(Some(&listen_box));
+    let listen_menu = gtk::MenuButton::new();
+    listen_menu.set_icon_name("pan-up-symbolic");
+    listen_menu.set_popover(Some(&listen_popover));
+    listen_menu.set_tooltip_text(Some("Sweep, signal, and corrections"));
+    listen_menu.update_property(&[gtk::accessible::Property::Label("Sweep and signal")]);
+    listen_play.add_css_class("footer-toggle");
+    let listen_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    listen_group.add_css_class("linked");
+    listen_group.add_css_class("listen-group");
+    listen_group.set_valign(gtk::Align::Center);
+    listen_group.append(&listen_play);
+    listen_group.append(&listen_menu);
+
+    // Footer, as on a plugin: bypass and listening, the bands, the macro
+    // knobs, and the secondary editors.
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    footer.add_css_class("footer");
+    let footer_start = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    footer_start.set_valign(gtk::Align::Center);
+    footer_start.append(&device_bypass);
+    footer_start.append(&listen_group);
+    footer.append(&footer_start);
+    let bands_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    bands_row.set_hexpand(true);
+    bands_row.append(&chips_scroll);
+    bands_row.append(&add_filter_button);
+    footer.append(&bands_row);
+    let footer_end = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    footer_end.set_valign(gtk::Align::Center);
+    let macro_knobs = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+    footer_end.append(&macro_knobs);
+    let editors = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    editors.set_valign(gtk::Align::Center);
+    editors.append(&text_toggle);
+    editors.append(&ir_menu);
+    editors.append(&curves_ui.menu);
+    footer_end.append(&editors);
+    footer.append(&footer_end);
+    toolbar.set_content(Some(&main_stack));
+    toolbar.add_bottom_bar(&footer);
+    window.set_content(Some(&toolbar));
+
+    // The status strip gives way first; narrow windows stack the footer.
+    let crowded = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        1180.0,
+        adw::LengthUnit::Px,
     ));
-    // Tools that open editor pages.
-    tone_tool.connect_clicked({
-        let popover = rail_popover.clone();
-        let view_stack = view_stack.clone();
-        let parametric_stack = parametric_stack.clone();
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        820.0,
+        adw::LengthUnit::Px,
+    ));
+    for breakpoint in [&crowded, &narrow] {
+        breakpoint.add_setter(&header_status, "visible", Some(&false.to_value()));
+    }
+    narrow.add_setter(
+        &footer,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    narrow.add_setter(&brand, "visible", Some(&false.to_value()));
+    narrow.add_setter(&history_box, "visible", Some(&false.to_value()));
+    narrow.add_setter(&previous_profile, "visible", Some(&false.to_value()));
+    narrow.add_setter(&next_profile, "visible", Some(&false.to_value()));
+    // The output picker moves from the crowded header to the footer.
+    narrow.connect_apply({
+        let header = header.clone();
+        let footer_start = footer_start.clone();
+        let device_drop = device_drop.clone();
         move |_| {
-            parametric_stack.set_visible_child_name("tone");
-            view_stack.set_visible_child_name("filters");
-            popover.popdown();
+            header.remove(&device_drop);
+            footer_start.append(&device_drop);
         }
     });
-    ir_tool.connect_clicked({
-        let view_stack = view_stack.clone();
-        let popover = rail_popover.clone();
+    narrow.connect_unapply({
+        let header = header.clone();
+        let footer_start = footer_start.clone();
+        let device_drop = device_drop.clone();
         move |_| {
-            view_stack.set_visible_child_name("convolution");
-            popover.popdown();
+            footer_start.remove(&device_drop);
+            // Packed last at the end, it returns to the left of Unassign.
+            header.pack_end(&device_drop);
         }
     });
+    window.add_breakpoint(crowded);
+    window.add_breakpoint(narrow);
     profile_list.connect_row_activated({
-        let popover = rail_popover.clone();
+        let popover = profile_popover.clone();
         move |_, _| popover.popdown()
     });
-
-    let status = gtk::Label::new(Some("Ready"));
-    status.set_xalign(0.0);
-    status.set_wrap(true);
-    status.add_css_class("dim-label");
-    status.add_css_class("console-status");
-    content.append(&status);
-
-    let clamp = adw::Clamp::builder()
-        .maximum_size(1280)
-        .tightening_threshold(980)
-        .child(&content)
-        .build();
-    let page_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&clamp)
-        .build();
-    toolbar.set_content(Some(&page_scroll));
-    window.set_content(Some(&toolbar));
 
     let listening_controls = build_listening_controls(
         &window,
@@ -942,7 +846,24 @@ fn build_ui(app: &adw::Application) {
         &trim,
         &status,
     );
-    response_body.append(&listening_controls);
+    history_box.append(&listening_controls.undo);
+    history_box.append(&listening_controls.redo);
+    // A/B: the starting sound first, then the profile comparison bank.
+    if let Some(comparison_box) = comparison_ui.stack.parent().and_downcast::<gtk::Box>() {
+        let reference_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        reference_row.set_homogeneous(true);
+        reference_row.append(&listening_controls.reference);
+        reference_row.append(&listening_controls.capture);
+        comparison_box.prepend(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        comparison_box.prepend(&reference_row);
+        let reference_title = gtk::Label::new(Some("STARTING SOUND"));
+        reference_title.set_xalign(0.0);
+        reference_title.add_css_class("panel-title");
+        comparison_box.prepend(&reference_title);
+    }
+    macro_knobs.append(&listening_controls.bass.root);
+    macro_knobs.append(&listening_controls.tilt.root);
+    macro_knobs.append(&output.root);
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(20), {
         let model = model.clone();
         let graph = graph.clone();
@@ -1041,10 +962,12 @@ fn build_ui(app: &adw::Application) {
         output_status,
         profile_list: profile_list.clone(),
         device_drop: device_drop.clone(),
-        profile_tile: profile_tile.clone(),
+        profile_tile: preset.clone(),
         menus: vec![
             profile_menu.clone(),
-            rail_menu.clone(),
+            listen_menu.clone(),
+            ir_menu.clone(),
+            curves_ui.menu.clone(),
             comparison_ui.menu.clone(),
         ],
     });
@@ -1109,30 +1032,14 @@ fn build_ui(app: &adw::Application) {
         &graph,
         &status,
     );
-    let stop_hidden_listener = Rc::new({
-        let views = view_stack.clone();
-        let editors = parametric_stack.clone();
+    // The text editor covers the graph, so its tone line stops with it.
+    main_stack.connect_visible_child_name_notify({
         let tone = tone_ui.clone();
-        let bar = graph_listen.clone();
-        move || {
-            let visible = views.visible_child_name().as_deref() == Some("filters")
-                && matches!(
-                    editors.visible_child_name().as_deref(),
-                    Some("visual" | "tone")
-                );
-            bar.set_visible(visible);
-            if !visible {
+        move |stack| {
+            if stack.visible_child_name().as_deref() != Some("graph") {
                 tone.play.set_active(false);
             }
         }
-    });
-    view_stack.connect_visible_child_name_notify({
-        let sync = stop_hidden_listener.clone();
-        move |_| sync()
-    });
-    parametric_stack.connect_visible_child_name_notify({
-        let sync = stop_hidden_listener.clone();
-        move |_| sync()
     });
     gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), {
         let model = model.clone();
@@ -1257,7 +1164,7 @@ fn build_ui(app: &adw::Application) {
         &device_bypass,
         &comparison_ui,
     );
-    install_editor_shortcut(&window, &view_stack, &parametric_stack);
+    install_editor_shortcut(&window, &text_toggle);
     window.present();
     graph.grab_focus();
 }
@@ -1290,7 +1197,7 @@ fn wire_actions(
     device_bypass: &gtk::ToggleButton,
     global_bypass: &gtk::ToggleButton,
     comparison_ui: &Rc<ComparisonUi>,
-    trim: &gtk::SpinButton,
+    trim: &knob::Knob,
 ) {
     let buffer = text_view.buffer();
     add_filter.connect_clicked({
@@ -2219,6 +2126,67 @@ fn wire_actions(
         }
     });
     graph.add_controller(keyboard);
+
+    // Scroll over the selected band (or anywhere, with it selected and the
+    // pointer near) to change its Q, as in plugin EQs.
+    let pointer = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_motion({
+        let pointer = pointer.clone();
+        move |_, x, y| pointer.set((x, y))
+    });
+    graph.add_controller(motion);
+    let scroll = gtk::EventControllerScroll::new(
+        gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
+    );
+    scroll.connect_scroll({
+        let model = model.clone();
+        let buffer = buffer.clone();
+        let graph = graph.clone();
+        move |_, _, dy| {
+            let Some(index) = model.selected_filter.get() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            let near = model
+                .document
+                .borrow()
+                .as_ref()
+                .and_then(|document| document.filters.get(index))
+                .is_some_and(|filter| {
+                    let (x, y) = graph::filter_point_position(
+                        filter.frequency,
+                        filter.gain_db,
+                        graph.width() as f64,
+                        graph.height() as f64,
+                    );
+                    let (px, py) = pointer.get();
+                    ((px - x).powi(2) + (py - y).powi(2)).sqrt() <= 60.0
+                });
+            if !near {
+                return gtk::glib::Propagation::Proceed;
+            }
+            update_filter(&model, &buffer, &graph, index, |filter| {
+                filter.q = (filter.q * 1.12_f64.powf(-dy)).clamp(0.05, 50.0);
+            });
+            gtk::glib::Propagation::Stop
+        }
+    });
+    graph.add_controller(scroll);
+    let escape = gtk::EventControllerKey::new();
+    escape.connect_key_pressed({
+        let model = model.clone();
+        let graph = graph.clone();
+        move |_, key, _, _| {
+            if key != gtk::gdk::Key::Escape || model.selected_filter.get().is_none() {
+                return gtk::glib::Propagation::Proceed;
+            }
+            model.selected_filter.set(None);
+            sync_band_ui(&model);
+            graph.queue_draw();
+            gtk::glib::Propagation::Stop
+        }
+    });
+    graph.add_controller(escape);
 }
 
 fn set_profile_menu_text(menu: &gtk::MenuButton, text: &str) {
@@ -2241,7 +2209,7 @@ fn load_profile(
     name: &gtk::Entry,
     analysis_label: &gtk::Label,
     graph: &gtk::DrawingArea,
-    trim: &gtk::SpinButton,
+    trim: &knob::Knob,
     profile_menu: &gtk::MenuButton,
     convolution_ui: &ConvolutionUi,
 ) {
@@ -2263,9 +2231,6 @@ fn load_profile(
     model.loading.set(true);
     *model.current_id.borrow_mut() = Some(profile.id.clone());
     model.selected_filter.set(None);
-    if let Some(ui) = model.bands.borrow().as_ref() {
-        ui.range.set(12.0);
-    }
     set_profile_menu_text(profile_menu, &profile.name);
     name.set_text(&profile.name);
     set_editor_text(model, buffer, &profile.text);
@@ -2768,7 +2733,7 @@ fn build_tone_page() -> (gtk::Box, Rc<ToneUi>) {
     };
     let frequency = slider((0.0, 1.0, 0.001), tone_position(1_000.0));
     frequency.set_increments(1.0 / 120.0, 1.0 / 30.0);
-    frequency.update_property(&[gtk::accessible::Property::Label("Tone frequency")]);
+    frequency.update_property(&[gtk::accessible::Property::Label("Graph tone frequency")]);
     let level = slider((-60.0, -12.0, 1.0), -36.0);
     level.update_property(&[gtk::accessible::Property::Label("Tone level")]);
     card.append(&frequency);
@@ -3066,20 +3031,14 @@ fn update_convolution_ui(ui: &ConvolutionUi, profile: &ProfileDocument) {
 /// Open a freshly loaded profile on the page that holds its processing: the
 /// impulse response when that is all it has, otherwise the filters.
 fn show_profile_page(ui: &ConvolutionUi, profile: &ProfileDocument) {
-    let convolution_only = !profile.convolutions.is_empty()
-        && profile.filters.is_empty()
-        && profile.graphic_eqs.is_empty();
-    ui.stack.set_visible_child_name(if convolution_only {
-        "convolution"
-    } else {
-        "filters"
-    });
-    // The stack's own notification can be missed before the window maps.
+    let _ = profile;
     (ui.sync_tabs)();
 }
 
 struct GraphToneUi {
     tone: Rc<ToneUi>,
+    /// Plays the tone at the graph's tone line; lives in the footer.
+    play: gtk::ToggleButton,
     cursor: gtk::ToggleButton,
     sweep: gtk::ToggleButton,
 }
@@ -3094,7 +3053,14 @@ fn build_graph_tone(tone: &Rc<ToneUi>) -> (adw::WrapBox, GraphToneUi) {
         .line_spacing(8)
         .build();
     row.add_css_class("graph-listen");
-    let play = gtk::ToggleButton::with_label("Listen");
+    let play = gtk::ToggleButton::new();
+    {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.append(&gtk::Image::from_icon_name("audio-volume-high-symbolic"));
+        content.append(&gtk::Label::new(Some("LISTEN")));
+        play.set_child(Some(&content));
+    }
+    play.set_tooltip_text(Some("Play a tone at the graph's tone line"));
     play.update_property(&[gtk::accessible::Property::Label("Listen to graph tone")]);
     let sweep = gtk::ToggleButton::with_label("Sweep");
     sweep.set_tooltip_text(Some(
@@ -3111,27 +3077,20 @@ fn build_graph_tone(tone: &Rc<ToneUi>) -> (adw::WrapBox, GraphToneUi) {
     frequency.set_draw_value(false);
     frequency.set_size_request(120, -1);
     frequency.set_value(tone.frequency.value());
-    frequency.update_property(&[gtk::accessible::Property::Label("Graph tone frequency")]);
+    frequency.update_property(&[gtk::accessible::Property::Label(
+        "Graph tone frequency slider",
+    )]);
     let readout = gtk::Label::new(Some("1.00 kHz"));
     readout.add_css_class("level-code");
     let ears = gtk::DropDown::from_strings(&["Both ears", "Left ear", "Right ear"]);
     ears.update_property(&[gtk::accessible::Property::Label("Graph tone ears")]);
+    // The tone page below carries frequency, ears, and the corrections.
     for widget in [
-        play.upcast_ref::<gtk::Widget>(),
-        sweep.upcast_ref(),
+        sweep.upcast_ref::<gtk::Widget>(),
         speed.upcast_ref(),
         cursor.upcast_ref(),
-        frequency.upcast_ref(),
-        readout.upcast_ref(),
-        ears.upcast_ref(),
     ] {
         row.append(widget);
-    }
-    for (text, index) in [("−1 dB here", 1), ("+1 dB here", 2)] {
-        let fix = gtk::Button::with_label(text);
-        let target = tone.fixes[index].0.clone();
-        fix.connect_clicked(move |_| target.emit_clicked());
-        row.append(&fix);
     }
     play.connect_toggled({
         let tone = tone.clone();
@@ -3235,6 +3194,7 @@ fn build_graph_tone(tone: &Rc<ToneUi>) -> (adw::WrapBox, GraphToneUi) {
         row,
         GraphToneUi {
             tone: tone.clone(),
+            play,
             cursor,
             sweep,
         },
@@ -3245,9 +3205,19 @@ struct ListeningUi {
     undo: gtk::Button,
     redo: gtk::Button,
     reference: gtk::ToggleButton,
-    bass: gtk::SpinButton,
-    tilt: gtk::SpinButton,
+    bass: knob::Knob,
+    tilt: knob::Knob,
     syncing: Cell<bool>,
+}
+
+/// The listening controls, for placing in the header, A/B menu, and footer.
+struct ListeningWidgets {
+    undo: gtk::Button,
+    redo: gtk::Button,
+    reference: gtk::ToggleButton,
+    capture: gtk::Button,
+    bass: knob::LabeledKnob,
+    tilt: knob::LabeledKnob,
 }
 
 fn submit_live(model: &Rc<Model>, save: bool) {
@@ -3414,16 +3384,16 @@ fn build_listening_controls(
     buffer: &gtk::TextBuffer,
     list: &gtk::FlowBox,
     graph: &gtk::DrawingArea,
-    trim: &gtk::SpinButton,
+    trim: &knob::Knob,
     status: &gtk::Label,
-) -> adw::WrapBox {
-    let row = adw::WrapBox::builder()
-        .child_spacing(8)
-        .line_spacing(8)
-        .build();
-    row.add_css_class("listening-controls");
-    let undo = gtk::Button::with_label("Undo");
-    let redo = gtk::Button::with_label("Redo");
+) -> ListeningWidgets {
+    let undo = gtk::Button::from_icon_name("edit-undo-symbolic");
+    let redo = gtk::Button::from_icon_name("edit-redo-symbolic");
+    for (button, name) in [(&undo, "Undo"), (&redo, "Redo")] {
+        button.add_css_class("bar-icon");
+        button.set_tooltip_text(Some(name));
+        button.update_property(&[gtk::accessible::Property::Label(name)]);
+    }
     let reference = gtk::ToggleButton::with_label("Hear starting sound");
     reference.set_tooltip_text(Some(
         "Compare your captured starting sound and current EQ at the same estimated perceived level",
@@ -3432,45 +3402,28 @@ fn build_listening_controls(
     capture.set_tooltip_text(Some(
         "Use the current EQ as the new starting sound for comparison",
     ));
-    for widget in [
-        undo.upcast_ref::<gtk::Widget>(),
-        redo.upcast_ref(),
-        reference.upcast_ref(),
-        capture.upcast_ref(),
-    ] {
-        row.append(widget);
-    }
-    let bass = gtk::SpinButton::with_range(-12.0, 12.0, 0.5);
-    let tilt = gtk::SpinButton::with_range(-12.0, 12.0, 0.5);
-    for (spin, label, tooltip) in [
-        (
-            &bass,
-            "Bass",
-            "Broad low shelf at 105 Hz. This adjustment remains editable as a normal EQ band.",
-        ),
-        (
-            &tilt,
-            "Tilt",
-            "Positive is brighter; negative is warmer. Balanced low/high shelves around 1 kHz.",
-        ),
-    ] {
-        spin.set_digits(1);
-        spin.set_width_chars(4);
-        spin.update_property(&[gtk::accessible::Property::Label(label)]);
-        spin.set_tooltip_text(Some(tooltip));
-        let field = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        let label = gtk::Label::new(Some(label));
-        label.add_css_class("level-code");
-        field.append(&label);
-        field.append(spin);
-        row.append(&field);
-    }
+    let bass = knob::LabeledKnob::new(
+        knob::Knob::new(-12.0, 12.0, 0.0, knob::Taper::Linear, true),
+        "Bass",
+        |value| signed_db(value, 1),
+    );
+    bass.knob.set_tooltip_text(Some(
+        "Broad low shelf at 105 Hz. This adjustment remains editable as a normal EQ band.",
+    ));
+    let tilt = knob::LabeledKnob::new(
+        knob::Knob::new(-12.0, 12.0, 0.0, knob::Taper::Linear, true),
+        "Tilt",
+        |value| signed_db(value, 1),
+    );
+    tilt.knob.set_tooltip_text(Some(
+        "Positive is brighter; negative is warmer. Balanced low/high shelves around 1 kHz.",
+    ));
     *model.listening.borrow_mut() = Some(ListeningUi {
         undo: undo.clone(),
         redo: redo.clone(),
         reference: reference.clone(),
-        bass: bass.clone(),
-        tilt: tilt.clone(),
+        bass: bass.knob.clone(),
+        tilt: tilt.knob.clone(),
         syncing: Cell::new(false),
     });
     for (button, backwards) in [(&undo, true), (&redo, false)] {
@@ -3546,7 +3499,7 @@ fn build_listening_controls(
             status.set_text("Starting sound captured; comparisons are level matched");
         }
     });
-    for (spin, is_bass) in [(&bass, true), (&tilt, false)] {
+    for (spin, is_bass) in [(&bass.knob, true), (&tilt.knob, false)] {
         spin.connect_value_changed({
             let model = model.clone();
             let buffer = buffer.clone();
@@ -3592,7 +3545,10 @@ fn build_listening_controls(
     }
     let shortcuts = gtk::ShortcutController::new();
     shortcuts.set_scope(gtk::ShortcutScope::Managed);
-    for (trigger, button) in [("<Control>z", undo), ("<Control><Shift>z", redo)] {
+    for (trigger, button) in [
+        ("<Control>z", undo.clone()),
+        ("<Control><Shift>z", redo.clone()),
+    ] {
         shortcuts.add_shortcut(gtk::Shortcut::new(
             gtk::ShortcutTrigger::parse_string(trigger),
             Some(gtk::CallbackAction::new(move |widget, _| {
@@ -3608,31 +3564,34 @@ fn build_listening_controls(
         ));
     }
     window.add_controller(shortcuts);
-    row
+    ListeningWidgets {
+        undo,
+        redo,
+        reference,
+        capture,
+        bass,
+        tilt,
+    }
 }
 
+/// A band's chip in the footer: its symbol and frequency; selects the band.
 struct BandTile {
-    root: gtk::Box,
     select: gtk::ToggleButton,
-    gain: gtk::Label,
-    frequency: gtk::Label,
-    kind: gtk::Label,
-    scale: gtk::Scale,
+    glyph: gtk::DrawingArea,
+    label: gtk::Label,
 }
 
+/// The selected band's panel, floating beside its node on the graph.
 struct BandUi {
     root: gtk::Box,
-    title: gtk::Label,
+    overlay: gtk::Overlay,
     kind: Segmented,
     channels: Segmented,
-    frequency: gtk::SpinButton,
-    gain: gtk::SpinButton,
-    q: gtk::SpinButton,
-    enabled: gtk::Switch,
-    previous: gtk::Button,
-    next: gtk::Button,
+    frequency: knob::Knob,
+    gain: knob::Knob,
+    q: knob::Knob,
+    enabled: gtk::ToggleButton,
     tiles: Vec<BandTile>,
-    range: Cell<f64>,
     syncing: Rc<Cell<bool>>,
 }
 
@@ -3648,84 +3607,135 @@ const BAND_KINDS: [FilterKind; 8] = [
 ];
 const BAND_KIND_LABELS: [&str; 8] = ["PK", "LS", "HS", "LP", "HP", "BP", "NO", "AP"];
 
+const BAND_KIND_NAMES: [&str; 8] = [
+    "Peak",
+    "Low shelf",
+    "High shelf",
+    "Low pass",
+    "High pass",
+    "Band pass",
+    "Notch",
+    "All pass",
+];
+
+/// Build the selected band's floating panel and place it on `overlay`, which
+/// holds the graph. It follows the band's node as it moves.
 fn build_band_editor(
     model: &Rc<Model>,
     buffer: &gtk::TextBuffer,
     graph: &gtk::DrawingArea,
     list: &gtk::FlowBox,
-) -> gtk::Box {
+    overlay: &gtk::Overlay,
+) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    root.add_css_class("band-editor");
-    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let title = gtk::Label::new(Some("Select a band"));
-    title.add_css_class("band-editor-title");
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-    heading.append(&title);
-    let enabled = gtk::Switch::new();
-    enabled.set_valign(gtk::Align::Center);
-    enabled.update_property(&[gtk::accessible::Property::Label("Selected band enabled")]);
-    heading.append(&enabled);
-    let previous = gtk::Button::from_icon_name("go-previous-symbolic");
-    let next = gtk::Button::from_icon_name("go-next-symbolic");
-    let remove = gtk::Button::from_icon_name("user-trash-symbolic");
-    for (button, label) in [
-        (&previous, "Move band earlier"),
-        (&next, "Move band later"),
-        (&remove, "Delete selected band"),
-    ] {
-        button.add_css_class("flat");
-        button.set_tooltip_text(Some(label));
-        button.update_property(&[gtk::accessible::Property::Label(label)]);
-        heading.append(button);
-    }
-    root.append(&heading);
-    let kind = Segmented::new(&BAND_KIND_LABELS, 0);
-    let options = adw::WrapBox::builder()
-        .child_spacing(10)
+    root.add_css_class("band-panel");
+    root.set_halign(gtk::Align::Start);
+    root.set_valign(gtk::Align::Start);
+    let top = adw::WrapBox::builder()
+        .child_spacing(8)
         .line_spacing(8)
         .build();
-    kind.root.add_css_class("band-kinds");
-    for (button, name) in kind.buttons.iter().zip([
-        "Peak",
-        "Low shelf",
-        "High shelf",
-        "Low pass",
-        "High pass",
-        "Band pass",
-        "Notch",
-        "All pass",
-    ]) {
+    let kind = Segmented::new(&BAND_KIND_LABELS, 0);
+    kind.root.add_css_class("kind-picker");
+    for ((button, name), filter_kind) in kind.buttons.iter().zip(BAND_KIND_NAMES).zip(BAND_KINDS) {
+        button.set_child(Some(&glyph::widget(filter_kind, 26, 16)));
         button.set_tooltip_text(Some(name));
         button.update_property(&[gtk::accessible::Property::Label(name)]);
     }
-    let channels = Segmented::new(&["L+R", "L", "R"], 0);
-    options.append(&kind.root);
-    options.append(&channels.root);
-    let frequency = gtk::SpinButton::with_range(20.0, 20_000.0, 1.0);
-    frequency.set_digits(1);
-    frequency.set_width_chars(6);
-    let gain = gtk::SpinButton::with_range(-60.0, 60.0, 0.1);
-    gain.set_digits(2);
-    gain.set_width_chars(5);
-    let q = gtk::SpinButton::with_range(0.01, 1000.0, 0.01);
-    q.set_digits(3);
-    q.set_width_chars(5);
-    for (spin, label, unit) in [
-        (&frequency, "Frequency", "Hz"),
-        (&gain, "Gain", "dB"),
-        (&q, "Q", "Q"),
-    ] {
-        spin.add_css_class("band-readout");
-        spin.update_property(&[gtk::accessible::Property::Label(&format!(
-            "Selected band {label}"
-        ))]);
-        let field = spin_field(label, unit, spin);
-        field.set_hexpand(false);
-        spin.set_hexpand(false);
-        options.append(&field);
+    top.append(&kind.root);
+    let channels = Segmented::new(&["L", "L+R", "R"], 1);
+    channels.root.add_css_class("ear-picker");
+    for (button, name) in channels
+        .buttons
+        .iter()
+        .zip(["Left ear", "Both ears", "Right ear"])
+    {
+        button.set_tooltip_text(Some(name));
     }
-    root.append(&options);
+    top.append(&channels.root);
+    let enabled = gtk::ToggleButton::new();
+    enabled.set_icon_name("system-shutdown-symbolic");
+    enabled.add_css_class("band-power");
+    enabled.set_tooltip_text(Some("Band on or off"));
+    enabled.update_property(&[gtk::accessible::Property::Label("Selected band enabled")]);
+    top.append(&enabled);
+    let remove = gtk::Button::from_icon_name("window-close-symbolic");
+    remove.add_css_class("band-remove");
+    remove.set_tooltip_text(Some("Delete band"));
+    remove.update_property(&[gtk::accessible::Property::Label("Delete selected band")]);
+    top.append(&remove);
+    root.append(&top);
+
+    let knobs = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    knobs.set_halign(gtk::Align::Center);
+    let frequency = knob::LabeledKnob::new(
+        knob::Knob::new(20.0, 20_000.0, 1_000.0, knob::Taper::Log, false),
+        "Freq",
+        format_band_frequency,
+    );
+    let gain = knob::LabeledKnob::new(
+        knob::Knob::new(-24.0, 24.0, 0.0, knob::Taper::Linear, true),
+        "Gain",
+        |value| format!("{} dB", signed_db(value, 1)),
+    );
+    let q = knob::LabeledKnob::new(
+        knob::Knob::new(0.1, 20.0, 1.0, knob::Taper::Log, false),
+        "Q",
+        |value| format!("{value:.2}"),
+    );
+    for (control, label) in [(&frequency, "Frequency"), (&gain, "Gain"), (&q, "Q")] {
+        control.knob.set_size_request(48, 48);
+        control
+            .knob
+            .update_property(&[gtk::accessible::Property::Label(&format!(
+                "Selected band {label}"
+            ))]);
+        knobs.append(&control.root);
+    }
+    root.append(&knobs);
+    root.set_visible(false);
+    overlay.add_overlay(&root);
+    // Sit just below the node, or above it near the bottom, inside the graph.
+    overlay.connect_get_child_position({
+        let model = Rc::downgrade(model);
+        let graph = graph.clone();
+        let panel = root.clone();
+        move |_, child| {
+            if child != panel.upcast_ref::<gtk::Widget>() {
+                return None;
+            }
+            let model = model.upgrade()?;
+            let index = model.selected_filter.get()?;
+            let (frequency, gain_db) = model
+                .document
+                .borrow()
+                .as_ref()?
+                .filters
+                .get(index)
+                .map(|filter| (filter.frequency, filter.gain_db))?;
+            let (width, height) = (graph.width() as f64, graph.height() as f64);
+            let (x, y) = graph::filter_point_position(frequency, gain_db, width, height);
+            // Narrow graphs get a narrower panel; its top row wraps to fit.
+            let (minimum, natural, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
+            let panel_width = (natural as f64).min(width - 16.0).max(minimum as f64);
+            let (_, panel_height, _, _) =
+                panel.measure(gtk::Orientation::Vertical, panel_width as i32);
+            let panel_height = panel_height as f64;
+            let left = (x - panel_width / 2.0).clamp(8.0, (width - panel_width - 8.0).max(8.0));
+            let below = y + 20.0;
+            let top = if below + panel_height <= height - 8.0 {
+                below
+            } else {
+                (y - 20.0 - panel_height).max(8.0)
+            };
+            Some(gtk::gdk::Rectangle::new(
+                left as i32,
+                top as i32,
+                panel_width as i32,
+                panel_height as i32,
+            ))
+        }
+    });
     let syncing = Rc::new(Cell::new(false));
     for (button, filter_kind) in kind.buttons.iter().zip(BAND_KINDS) {
         button.connect_toggled({
@@ -3746,8 +3756,8 @@ fn build_band_editor(
         });
     }
     for (button, selection) in channels.buttons.iter().zip([
-        ChannelSelection::All,
         ChannelSelection::Left,
+        ChannelSelection::All,
         ChannelSelection::Right,
     ]) {
         button.connect_toggled({
@@ -3767,20 +3777,20 @@ fn build_band_editor(
             }
         });
     }
-    for (spin, parameter) in [(&frequency, 0), (&gain, 1), (&q, 2)] {
-        spin.connect_value_changed({
+    for (control, parameter) in [(&frequency, 0), (&gain, 1), (&q, 2)] {
+        control.knob.connect_value_changed({
             let model = model.clone();
             let buffer = buffer.clone();
             let graph = graph.clone();
             let syncing = syncing.clone();
-            move |spin| {
+            move |knob| {
                 if !syncing.get()
                     && let Some(index) = model.selected_filter.get()
                 {
                     update_filter(&model, &buffer, &graph, index, |filter| match parameter {
-                        0 => filter.frequency = spin.value(),
-                        1 => filter.gain_db = spin.value(),
-                        _ => filter.q = spin.value(),
+                        0 => filter.frequency = knob.value(),
+                        1 => filter.gain_db = knob.value(),
+                        _ => filter.q = knob.value(),
                     });
                 }
             }
@@ -3791,77 +3801,62 @@ fn build_band_editor(
         let buffer = buffer.clone();
         let graph = graph.clone();
         let syncing = syncing.clone();
-        move |switch| {
+        move |button| {
             if !syncing.get()
                 && let Some(index) = model.selected_filter.get()
             {
                 update_filter(&model, &buffer, &graph, index, |filter| {
-                    filter.enabled = switch.is_active()
+                    filter.enabled = button.is_active()
                 });
             }
         }
     });
-    for (button, offset) in [(&previous, -1_i32), (&next, 1), (&remove, 0)] {
-        button.connect_clicked({
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let graph = graph.clone();
-            let list = list.clone();
-            move |_| {
-                let Some(index) = model.selected_filter.get() else {
+    remove.connect_clicked({
+        let model = model.clone();
+        let buffer = buffer.clone();
+        let graph = graph.clone();
+        let list = list.clone();
+        move |_| {
+            let Some(index) = model.selected_filter.get() else {
+                return;
+            };
+            let snapshot = {
+                let mut document = model.document.borrow_mut();
+                let Some(document) = document.as_mut() else {
                     return;
                 };
-                let snapshot = {
-                    let mut document = model.document.borrow_mut();
-                    let Some(document) = document.as_mut() else {
-                        return;
-                    };
-                    if index >= document.filters.len() {
-                        return;
-                    }
-                    if offset == 0 {
-                        document.filters.remove(index);
-                        model.selected_filter.set(if document.filters.is_empty() {
-                            None
-                        } else {
-                            Some(index.min(document.filters.len() - 1))
-                        });
-                    } else {
-                        let target = index as i32 + offset;
-                        if target < 0 || target as usize >= document.filters.len() {
-                            return;
-                        }
-                        document.filters.swap(index, target as usize);
-                        model.selected_filter.set(Some(target as usize));
-                    }
-                    document.clone()
-                };
-                set_editor_text(&model, &buffer, &serialize_profile(&snapshot));
-                *model.analysis.borrow_mut() = Some(preview_analysis(&model, &snapshot));
-                rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
-                graph.queue_draw();
-            }
-        });
-    }
+                if index >= document.filters.len() {
+                    return;
+                }
+                document.filters.remove(index);
+                model.selected_filter.set(if document.filters.is_empty() {
+                    None
+                } else {
+                    Some(index.min(document.filters.len() - 1))
+                });
+                document.clone()
+            };
+            set_editor_text(&model, &buffer, &serialize_profile(&snapshot));
+            *model.analysis.borrow_mut() = Some(preview_analysis(&model, &snapshot));
+            rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
+            graph.queue_draw();
+        }
+    });
     *model.bands.borrow_mut() = Some(BandUi {
-        root: root.clone(),
-        title,
+        root,
+        overlay: overlay.clone(),
         kind,
         channels,
-        frequency,
-        gain,
-        q,
+        frequency: frequency.knob,
+        gain: gain.knob,
+        q: q.knob,
         enabled,
-        previous,
-        next,
         tiles: Vec::new(),
-        range: Cell::new(12.0),
         syncing,
     });
-    root
 }
 
-/// Refresh values in place, keeping keyboard focus and an in-progress fader drag.
+/// Refresh values in place, keeping keyboard focus and an in-progress knob drag.
 fn sync_band_ui(model: &Model) {
     let document = model.document.borrow();
     let Some(profile) = document.as_ref() else {
@@ -3873,48 +3868,29 @@ fn sync_band_ui(model: &Model) {
     };
     ui.syncing.set(true);
     let selected = model.selected_filter.get();
-    // Normal EQ gets a useful ±12 dB travel; larger edits expand every fader
-    // together so their zero points and gain distances stay comparable.
-    let range = profile
-        .filters
-        .iter()
-        .map(|f| f.gain_db.abs())
-        .fold(12.0, f64::max);
-    let range = ((range / 12.0).ceil() * 12.0).max(ui.range.get());
-    ui.range.set(range);
     for (index, (tile, filter)) in ui.tiles.iter().zip(&profile.filters).enumerate() {
-        let active = selected == Some(index);
-        tile.select.set_active(active);
-        if active {
-            tile.root.add_css_class("selected");
-        } else {
-            tile.root.remove_css_class("selected");
-        }
+        tile.select.set_active(selected == Some(index));
         if filter.enabled {
-            tile.root.remove_css_class("disabled-band");
+            tile.select.remove_css_class("disabled-band");
         } else {
-            tile.root.add_css_class("disabled-band");
+            tile.select.add_css_class("disabled-band");
         }
-        tile.scale.set_range(-range, range);
-        tile.scale.set_value(filter.gain_db);
-        tile.gain.set_text(&signed_db(filter.gain_db, 1));
-        tile.frequency
-            .set_text(&compact_band_frequency(filter.frequency));
+        glyph::set_kind(&tile.glyph, filter.kind);
+        tile.label.set_text(&format!(
+            "{} {}",
+            index + 1,
+            compact_band_frequency(filter.frequency)
+        ));
         let kind = BAND_KINDS
             .iter()
             .position(|kind| *kind == filter.kind)
             .unwrap_or_default();
-        let ears = match filter.channels {
-            ChannelSelection::All => "L+R",
-            ChannelSelection::Left => "L",
-            ChannelSelection::Right => "R",
-        };
-        tile.kind
-            .set_text(&format!("{} · {ears}", BAND_KIND_LABELS[kind]));
-        tile.root.set_tooltip_text(Some(&format!(
-            "Band {} · {} · Q {:.3}{}",
+        tile.select.set_tooltip_text(Some(&format!(
+            "Band {} · {} · {} · {} dB · Q {:.2}{}",
             index + 1,
+            BAND_KIND_NAMES[kind],
             format_band_frequency(filter.frequency),
+            signed_db(filter.gain_db, 1),
             filter.q,
             if filter.enabled { "" } else { " · off" }
         )));
@@ -3922,16 +3898,14 @@ fn sync_band_ui(model: &Model) {
     let filter = selected.and_then(|index| profile.filters.get(index));
     ui.root.set_visible(filter.is_some());
     if let Some(filter) = filter {
-        let index = selected.unwrap_or_default();
-        ui.title.set_text(&format!("Band {:02}", index + 1));
         let kind = BAND_KINDS
             .iter()
             .position(|kind| *kind == filter.kind)
             .unwrap_or_default();
         ui.kind.buttons[kind].set_active(true);
         ui.channels.buttons[match filter.channels {
-            ChannelSelection::All => 0,
-            ChannelSelection::Left => 1,
+            ChannelSelection::Left => 0,
+            ChannelSelection::All => 1,
             ChannelSelection::Right => 2,
         }]
         .set_active(true);
@@ -3939,9 +3913,19 @@ fn sync_band_ui(model: &Model) {
         ui.gain.set_value(filter.gain_db);
         ui.q.set_value(filter.q);
         ui.enabled.set_active(filter.enabled);
-        ui.previous.set_sensitive(index > 0);
-        ui.next.set_sensitive(index + 1 < profile.filters.len());
+        // Gain and Q mean nothing for every type; dim what does not apply.
+        let has_gain = matches!(
+            filter.kind,
+            FilterKind::Peaking | FilterKind::LowShelf | FilterKind::HighShelf
+        );
+        ui.gain.set_sensitive(has_gain);
+        if filter.enabled {
+            ui.root.remove_css_class("disabled-band");
+        } else {
+            ui.root.add_css_class("disabled-band");
+        }
     }
+    ui.overlay.queue_allocate();
     ui.syncing.set(false);
 }
 
@@ -3960,17 +3944,17 @@ fn rebuild_filter_list(
     buffer: &gtk::TextBuffer,
     graph: &gtk::DrawingArea,
 ) {
-    if !profile.filters.is_empty()
-        && model
-            .selected_filter
-            .get()
-            .is_none_or(|i| i >= profile.filters.len())
-    {
-        model.selected_filter.set(Some(0));
-    } else if profile.filters.is_empty() {
+    let _ = buffer;
+    if profile.filters.is_empty() {
         model.selected_filter.set(None);
+    } else if model
+        .selected_filter
+        .get()
+        .is_some_and(|i| i >= profile.filters.len())
+    {
+        model.selected_filter.set(Some(profile.filters.len() - 1));
     }
-    // Autosaves and graph edits need value updates, not new slider widgets.
+    // Autosaves and graph edits need value updates, not new chips.
     let reuse = model
         .bands
         .borrow()
@@ -3991,106 +3975,58 @@ fn rebuild_filter_list(
         .map(|ui| ui.syncing.clone())
         .unwrap_or_default();
     let mut tiles = Vec::new();
-    let mut group: Option<gtk::ToggleButton> = None;
     for (index, filter) in profile.filters.iter().enumerate() {
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 5);
-        root.add_css_class("band-fader");
-        let select = gtk::ToggleButton::with_label(&format!("{:02}", index + 1));
-        select.add_css_class("fader-select");
+        let select = gtk::ToggleButton::new();
+        select.add_css_class("band-chip");
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let symbol = glyph::widget(filter.kind, 20, 12);
+        let label = gtk::Label::new(None);
+        content.append(&symbol);
+        content.append(&label);
+        select.set_child(Some(&content));
         select.update_property(&[gtk::accessible::Property::Label(&format!(
             "Select band {}",
             index + 1
         ))]);
-        if let Some(first) = &group {
-            select.set_group(Some(first));
-        } else {
-            group = Some(select.clone());
-        }
-        root.append(&select);
-        let gain = gtk::Label::new(None);
-        gain.add_css_class("fader-gain");
-        root.append(&gain);
-        let scale = gtk::Scale::with_range(gtk::Orientation::Vertical, -12.0, 12.0, 0.1);
-        scale.set_inverted(true);
-        scale.set_draw_value(false);
-        scale.set_has_origin(true);
-        scale.set_size_request(-1, 124);
-        scale.set_halign(gtk::Align::Center);
-        scale.add_mark(0.0, gtk::PositionType::Left, None);
-        scale.add_css_class("band-slider");
-        scale.update_property(&[gtk::accessible::Property::Label(&format!(
-            "Band {} gain",
-            index + 1
-        ))]);
-        root.append(&scale);
-        let frequency = gtk::Label::new(Some(&compact_band_frequency(filter.frequency)));
-        frequency.add_css_class("fader-frequency");
-        root.append(&frequency);
-        let kind = gtk::Label::new(None);
-        kind.add_css_class("fader-kind");
-        root.append(&kind);
         select.connect_toggled({
             let model = model.clone();
             let graph = graph.clone();
             let syncing = syncing.clone();
             move |button| {
-                if !syncing.get() && button.is_active() {
-                    model.selected_filter.set(Some(index));
+                if syncing.get() {
+                    return;
+                }
+                // A second click on the selected chip closes its panel.
+                let selected = model.selected_filter.get() == Some(index);
+                if button.is_active() || selected {
+                    model
+                        .selected_filter
+                        .set((button.is_active()).then_some(index));
                     sync_band_ui(&model);
                     graph.queue_draw();
                 }
             }
         });
-        scale.connect_value_changed({
-            let model = model.clone();
-            let buffer = buffer.clone();
-            let graph = graph.clone();
-            let syncing = syncing.clone();
-            move |scale| {
-                if !syncing.get() {
-                    model.selected_filter.set(Some(index));
-                    update_filter(&model, &buffer, &graph, index, |filter| {
-                        filter.gain_db = scale.value()
-                    });
-                }
-            }
-        });
-        let click = gtk::GestureClick::new();
-        click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        click.connect_pressed({
-            let model = model.clone();
-            let graph = graph.clone();
-            move |_, _, _, _| {
-                model.selected_filter.set(Some(index));
-                sync_band_ui(&model);
-                graph.queue_draw();
-            }
-        });
-        root.add_controller(click);
-        list.insert(&root, -1);
+        list.insert(&select, -1);
         tiles.push(BandTile {
-            root,
             select,
-            gain,
-            frequency,
-            kind,
-            scale,
+            glyph: symbol,
+            label,
         });
     }
     if let Some(ui) = model.bands.borrow_mut().as_mut() {
         ui.tiles = tiles;
     }
     for graphic in &profile.graphic_eqs {
-        let row = gtk::Label::new(Some(&format!("GraphicEQ\n{} points", graphic.points.len())));
-        row.add_css_class("band-fader");
-        list.insert(&row, -1);
+        let chip = gtk::Label::new(Some(&format!(
+            "GraphicEQ · {} points",
+            graphic.points.len()
+        )));
+        chip.add_css_class("band-chip");
+        list.insert(&chip, -1);
     }
     if profile.filters.is_empty() && profile.graphic_eqs.is_empty() {
-        let empty = gtk::Label::new(Some(
-            "Add a band or click the response graph to start shaping your EQ.",
-        ));
-        empty.set_wrap(true);
-        empty.set_max_width_chars(34);
+        let empty = gtk::Label::new(Some("Click the graph to add a band"));
         empty.add_css_class("level-code");
         list.insert(&empty, -1);
     }
@@ -4182,19 +4118,6 @@ fn ellipsized_string_factory(max_chars: i32) -> gtk::SignalListItemFactory {
     factory
 }
 
-fn spin_field(label: &str, unit: &str, spin: &gtk::SpinButton) -> gtk::Box {
-    let field = gtk::Box::new(gtk::Orientation::Vertical, 5);
-    field.set_hexpand(true);
-    field.set_size_request(120, -1);
-    let heading = gtk::Label::new(Some(&format!("{label} · {}", unit.to_uppercase())));
-    heading.set_xalign(0.0);
-    heading.add_css_class("section-label");
-    field.append(&heading);
-    spin.set_hexpand(true);
-    field.append(spin);
-    field
-}
-
 fn format_band_frequency(frequency: f64) -> String {
     if frequency >= 1000.0 {
         format!("{:.2} kHz", frequency / 1000.0)
@@ -4231,7 +4154,7 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Rc<Compar
         .cloned()
     else {
         ui.menu.set_sensitive(false);
-        ui.menu.set_label("COMPARE");
+        ui.menu.set_label("A/B");
         ui.stack.set_visible_child_name("setup");
         ui.status.set_text("No output selected");
         return;
@@ -4410,7 +4333,7 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Rc<Compar
                 .unwrap_or_default()
                 + 1;
             ui.menu.set_label(&format!(
-                "COMPARE · {active_position}/{}",
+                "A/B · {active_position}/{}",
                 comparison.profile_ids.len()
             ));
             ui.menu.set_tooltip_text(Some(&format!(
@@ -4419,7 +4342,7 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Rc<Compar
             ui.status
                 .set_text(&format!("LEVEL MATCHED · {active_name}"));
         } else {
-            ui.menu.set_label("COMPARE · PAUSED");
+            ui.menu.set_label("A/B · PAUSED");
             ui.menu
                 .set_tooltip_text(Some("This output's comparison bank is paused"));
             ui.status.set_text("PAUSED · choose a profile to resume");
@@ -4428,7 +4351,7 @@ fn refresh_comparison_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &Rc<Compar
         ui.save.set_label("START COMPARISON");
         ui.delete.set_sensitive(false);
         ui.stack.set_visible_child_name("setup");
-        ui.menu.set_label("COMPARE");
+        ui.menu.set_label("A/B");
         ui.menu.set_tooltip_text(Some(
             "Compare profiles at a shared BS.1770 K-weighted pink-noise level",
         ));
@@ -4501,27 +4424,16 @@ fn install_comparison_shortcuts(
     window.add_controller(controller);
 }
 
-fn install_editor_shortcut(
-    window: &adw::ApplicationWindow,
-    mode_stack: &adw::ViewStack,
-    editor_stack: &gtk::Stack,
-) {
+fn install_editor_shortcut(window: &adw::ApplicationWindow, text_toggle: &gtk::ToggleButton) {
     let controller = gtk::EventControllerKey::new();
     controller.connect_key_pressed({
-        let mode_stack = mode_stack.clone();
-        let editor_stack = editor_stack.clone();
+        let text_toggle = text_toggle.clone();
         move |_, key, _, modifiers| {
             let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
             if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) || character != Some('e') {
                 return gtk::glib::Propagation::Proceed;
             }
-            mode_stack.set_visible_child_name("filters");
-            let next = if editor_stack.visible_child_name().as_deref() == Some("text") {
-                "visual"
-            } else {
-                "text"
-            };
-            editor_stack.set_visible_child_name(next);
+            text_toggle.set_active(!text_toggle.is_active());
             gtk::glib::Propagation::Stop
         }
     });
@@ -4643,15 +4555,29 @@ fn update_device_controls(
     bypass.set_sensitive(
         pending_bypassed.is_none() && has_ab_source && matches!(device.channels, 1 | 2),
     );
-    // The accent is for actions that put a profile on the output.
-    if matches!(
-        assign.label().as_deref(),
-        Some("Apply selected profile" | "Replace with selected" | "Retry profile")
-    ) {
+    // The accent is for actions that put a profile on the output. The bar
+    // shows a short verb; the full action is its name and tooltip.
+    let action = assign
+        .label()
+        .map(|label| label.to_string())
+        .unwrap_or_default();
+    let (short, primary) = match action.as_str() {
+        "Apply selected profile" => ("Apply", true),
+        "Replace with selected" => ("Replace", true),
+        "Retry profile" => ("Retry", true),
+        "Unassign from output" => ("Unassign", false),
+        "Set selected as normal profile" => ("Make default", false),
+        other => (other, false),
+    };
+    if primary {
         assign.add_css_class("primary");
     } else {
         assign.remove_css_class("primary");
     }
+    assign.set_tooltip_text(Some(&action));
+    assign.update_property(&[gtk::accessible::Property::Label(&action)]);
+    let short = short.to_owned();
+    assign.set_label(&short);
     std::mem::drop(pending_bypass);
     update_live_indicators(model);
 }
@@ -5006,32 +4932,30 @@ fn install_css() {
             font-size: 13px;
         }
 
-        .instrument-header {
-            background-color: #0b0b0c;
-            border-bottom: 1px solid #232326;
-            box-shadow: none;
-            min-height: 52px;
-        }
-
         .brand,
         .header-status,
-        .header-data,
         .panel-title,
         .section-label,
-        .rail-label,
-        .frame-title,
         .readouts,
-        .readout-key,
         .console-status,
-        .tile-value-number,
-        .level-code {
+        .level-code,
+        .knob-value,
+        .knob-caption {
             font-family: monospace;
+        }
+
+        /* Header: the preset bar */
+        .instrument-header {
+            background-color: #0b0b0c;
+            border-bottom: 1px solid #222225;
+            box-shadow: none;
+            min-height: 50px;
         }
 
         .brand {
             font-weight: 800;
             letter-spacing: 1px;
-            margin-left: 4px;
+            margin: 0 10px 0 4px;
         }
 
         .header-status {
@@ -5040,22 +4964,96 @@ fn install_css() {
             letter-spacing: 0.4px;
         }
 
-        .header-data {
-            font-size: 9px;
-            font-weight: 700;
-            opacity: 0.54;
-        }
-
-        /* Engine: an orange power button while the DSP runs. */
-        button.power {
-            min-width: 32px;
-            min-height: 32px;
-            padding: 0;
-            border-radius: 999px;
-            background-color: #242426;
-            color: #8b8b90;
+        .preset button,
+        .preset menubutton > button {
+            background-color: #1b1b1d;
             border: none;
             box-shadow: none;
+            min-height: 32px;
+        }
+
+        .preset > button {
+            color: #8b8b90;
+            padding: 0 8px;
+        }
+
+        .preset-menu > button {
+            font-family: monospace;
+            font-weight: 700;
+            min-width: 140px;
+            padding: 0 12px;
+        }
+
+        .preset.live .preset-menu > button {
+            color: #ff8c33;
+        }
+
+        button.bar-icon {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            color: #8b8b90;
+            min-height: 32px;
+            min-width: 32px;
+            padding: 0;
+        }
+
+        button.bar-icon:hover {
+            color: #ecebe6;
+        }
+
+        .bar-menu > button {
+            background-color: #1b1b1d;
+            border: none;
+            border-radius: 10px;
+            box-shadow: none;
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: 700;
+            min-height: 32px;
+            padding: 0 12px;
+            margin-left: 6px;
+        }
+
+        dropdown.output-dropdown > button {
+            background-color: #1b1b1d;
+            border: none;
+            border-radius: 10px;
+            box-shadow: none;
+            font-family: monospace;
+            font-size: 11.5px;
+            min-height: 32px;
+            padding: 0 10px;
+        }
+
+        button.assign-button {
+            background-color: #1b1b1d;
+            border: none;
+            border-radius: 10px;
+            box-shadow: none;
+            color: #ecebe6;
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: 700;
+            min-height: 32px;
+            padding: 0 12px;
+        }
+
+        button.assign-button.primary {
+            background-color: #ff7a1a;
+            color: #1a0d03;
+        }
+
+        button.power {
+            background-color: #242426;
+            border: none;
+            border-radius: 999px;
+            box-shadow: none;
+            color: #8b8b90;
+            min-height: 32px;
+            min-width: 32px;
+            padding: 0;
+            margin-left: 4px;
         }
 
         button.power:checked {
@@ -5066,7 +5064,7 @@ fn install_css() {
         .update-button {
             background-color: transparent;
             border: 1px solid rgba(255, 122, 26, 0.6);
-            border-radius: 12px;
+            border-radius: 10px;
             color: #ff8c33;
             font-family: monospace;
             font-size: 9px;
@@ -5074,150 +5072,26 @@ fn install_css() {
             padding: 5px 10px;
         }
 
-        .update-button:hover {
-            background-color: rgba(255, 122, 26, 0.14);
-        }
-
-        /* Left rail */
-        .rail-label {
-            color: #56565b;
-            font-size: 9.5px;
-            font-weight: 700;
-            letter-spacing: 0.8px;
-            margin: 6px 4px 0 4px;
-        }
-
-        .rail-tile {
-            background-color: #1b1b1d;
-            border-radius: 22px;
-            padding: 14px;
-        }
-
-        .tile-icon {
-            min-width: 46px;
-            min-height: 46px;
-            border-radius: 999px;
-            background-color: #242426;
-            color: #ecebe6;
-        }
-
-        entry.tile-title,
-        entry.tile-title:focus-within {
+        /* Preset popover */
+        entry.preset-name {
             background: transparent;
             border: none;
+            border-bottom: 1px solid #2a2a2d;
+            border-radius: 0;
             box-shadow: none;
             font-size: 17px;
             font-weight: 600;
-            min-height: 26px;
-            padding: 0;
+            padding: 2px 0;
         }
 
-        entry.tile-title:focus-within {
-            border-bottom: 1px solid #ff7a1a;
-            border-radius: 0;
+        entry.preset-name:focus-within {
+            border-bottom-color: #ff7a1a;
+            box-shadow: none;
         }
 
         .tile-subtitle {
             color: #8b8b90;
-            font-size: 12.5px;
-        }
-
-        .tile-value {
-            background-color: #242426;
-            border-radius: 999px;
-            padding: 7px 0;
-        }
-
-        .tile-value-number {
-            font-size: 17px;
-            font-weight: 600;
-        }
-
-        .tile-value-caption {
-            color: #8b8b90;
-            font-size: 11px;
-        }
-
-        /* Filters on this output: the watch's orange circle. */
-        button.filters-dot {
-            min-width: 54px;
-            min-height: 54px;
-            padding: 0;
-            border-radius: 999px;
-            background-color: #3a2414;
-            border: none;
-            box-shadow: none;
-        }
-
-        button.filters-dot:checked {
-            background-color: #ff7a1a;
-        }
-
-        /* The open profile, while it plays: a lit tile. */
-        .rail-tile.live {
-            background-color: #f3f2ee;
-            color: #121213;
-        }
-
-        .rail-tile.live .tile-icon {
-            background-color: #e2e1dc;
-            color: #121213;
-        }
-
-        .rail-tile.live entry.tile-title {
-            color: #121213;
-            caret-color: #121213;
-        }
-
-        .rail-tile.live .tile-subtitle,
-        .rail-tile.live .tile-value-caption {
-            color: #6b6b70;
-        }
-
-        .rail-tile.live .tile-value {
-            background-color: #e6e5e0;
-        }
-
-        dropdown.tile-dropdown > button,
-        dropdown.tile-dropdown > button:hover {
-            background: transparent;
-            border: none;
-            box-shadow: none;
-            font-size: 17px;
-            font-weight: 600;
-            min-height: 26px;
-            padding: 0;
-        }
-
-        dropdown.tile-dropdown {
-            min-width: 0;
-        }
-
-        .device-state {
-            color: #8b8b90;
-            font-family: monospace;
-            font-size: 10.5px;
-        }
-
-        button.tile-action {
-            background-color: #242426;
-            border: none;
-            border-radius: 14px;
-            box-shadow: none;
-            color: #ecebe6;
-            font-family: monospace;
-            font-size: 11px;
-            font-weight: 700;
-            padding: 9px 12px;
-        }
-
-        button.tile-action.primary {
-            background-color: #ff7a1a;
-            color: #1a0d03;
-        }
-
-        button.tile-action:disabled {
-            color: #56565b;
+            font-size: 12px;
         }
 
         list.profile-bank,
@@ -5226,19 +5100,16 @@ fn install_css() {
         }
 
         list.profile-bank > row {
-            background-color: #1b1b1d;
-            border-radius: 16px;
-            margin-bottom: 6px;
-            padding: 0 2px;
+            border-radius: 12px;
+            margin-bottom: 3px;
         }
 
         list.profile-bank > row:hover {
-            background-color: #222225;
+            background-color: #1f1f22;
         }
 
-        /* The profile open in the editor. */
         list.profile-bank > row:selected {
-            background-color: #2b2b2e;
+            background-color: #2a2a2d;
         }
 
         list.profile-bank > row.playing .subtitle {
@@ -5247,87 +5118,243 @@ fn install_css() {
         }
 
         .bank-actions button {
-            background-color: #1b1b1d;
+            background-color: #1f1f22;
             border: none;
-            border-radius: 14px;
+            border-radius: 10px;
             box-shadow: none;
-            min-height: 34px;
+            min-height: 32px;
         }
 
-        .tool-tile,
-        .tool-tile > button {
-            min-height: 74px;
+        button.popover-action {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            color: #8b8b90;
+            font-family: monospace;
+            font-size: 11px;
         }
 
-        button.tool-tile,
-        .tool-tile > button {
-            background-color: #1b1b1d;
-            border: none;
-            border-radius: 20px;
-            box-shadow: none;
+        button.popover-action:hover {
             color: #ecebe6;
-            font-size: 12.5px;
-            font-weight: 500;
         }
 
-        button.tool-tile.round {
-            min-width: 74px;
-            border-radius: 999px;
+        /* The graph stage */
+        .graph-stage {
+            padding: 6px 10px 0 4px;
+        }
+
+        .readouts {
+            background-color: rgba(11, 11, 12, 0.82);
+            border-radius: 8px;
+            color: #8b8b90;
+            font-size: 10.5px;
+            padding: 3px 8px;
+        }
+
+        .device-state,
+        .console-status {
+            color: #6e6e73;
+            font-family: monospace;
+            font-size: 10.5px;
+        }
+
+        /* The selected band's floating panel */
+        .band-panel {
+            background-color: rgba(24, 24, 27, 0.97);
+            border: 1px solid #3a3a3e;
+            border-radius: 16px;
+            box-shadow: 0 14px 34px rgba(0, 0, 0, 0.55);
+            padding: 10px 12px 8px 12px;
+        }
+
+        .band-panel.disabled-band knob {
+            opacity: 0.45;
+        }
+
+        .kind-picker button,
+        .ear-picker button {
+            background-color: #242427;
+            border: none;
+            box-shadow: none;
+            color: #8b8b90;
+            min-height: 26px;
+            padding: 0 6px;
+        }
+
+        .kind-picker button:checked,
+        .ear-picker button:checked {
+            background-color: #3a3a3e;
+            color: #ecebe6;
+        }
+
+        .ear-picker button {
+            font-family: monospace;
+            font-size: 10px;
+            font-weight: 700;
+        }
+
+        button.band-power,
+        button.band-remove {
+            background-color: #242427;
+            border: none;
+            border-radius: 8px;
+            box-shadow: none;
+            color: #8b8b90;
+            min-height: 26px;
+            min-width: 26px;
             padding: 0;
         }
 
-        button.tool-tile:hover,
-        .tool-tile > button:hover {
-            background-color: #232326;
-        }
-
-        button.tool-tile.on,
-        .tool-tile.on > button {
+        button.band-power:checked {
             background-color: #ff7a1a;
             color: #1a0d03;
         }
 
-        /* Frames with their titles set into the rule (after btop). */
-        .titled-frame {
-            border: 1px solid #3a3a3e;
-            border-radius: 14px;
-            padding: 20px 16px 12px 16px;
-        }
-
-        .frame-title {
-            background-color: #0b0b0c;
+        button.band-remove:hover {
             color: #ecebe6;
-            font-size: 12px;
-            padding: 0 6px;
         }
 
-        .frame-end {
-            background-color: #0b0b0c;
-            padding: 0 4px;
+        knob {
+            min-width: 40px;
+            min-height: 40px;
         }
 
-        .readout-row {
-            padding: 2px 4px 0 40px;
+        .knob-value {
+            font-size: 11.5px;
+            font-weight: 600;
         }
 
-        .readouts,
-        .readout-key {
-            color: #8b8b90;
-            font-size: 11px;
-        }
-
-        .readout-key {
-            font-size: 9.5px;
+        .knob-caption {
+            color: #56565b;
+            font-size: 9px;
             letter-spacing: 0.6px;
         }
 
-        .level-code {
-            color: #8b8b90;
-            font-size: 10px;
+        /* Footer: bypass and listening, bands, macros, editors */
+        .footer {
+            background-color: #0b0b0c;
+            border-top: 1px solid #222225;
+            padding: 8px 14px;
         }
 
+        button.footer-toggle,
+        .listen-group button {
+            background-color: #1b1b1d;
+            border: none;
+            box-shadow: none;
+            color: #ecebe6;
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: 700;
+            min-height: 34px;
+            padding: 0 12px;
+        }
+
+        button.footer-toggle {
+            border-radius: 10px;
+        }
+
+        .listen-group button {
+            border-radius: 0;
+        }
+
+        .listen-group button:first-child {
+            border-radius: 10px 0 0 10px;
+        }
+
+        .listen-group menubutton > button {
+            border-radius: 0 10px 10px 0;
+            border-left: 1px solid #0b0b0c;
+            padding: 0 8px;
+        }
+
+        button.footer-toggle:checked {
+            background-color: #ff7a1a;
+            color: #1a0d03;
+        }
+
+        .band-chips,
+        .band-chips > flowboxchild {
+            background: transparent;
+            padding: 0;
+        }
+
+        button.band-chip,
+        label.band-chip {
+            background-color: #1b1b1d;
+            border: none;
+            border-radius: 9px;
+            box-shadow: none;
+            color: #8b8b90;
+            font-family: monospace;
+            font-size: 10.5px;
+            min-height: 30px;
+            padding: 0 9px;
+        }
+
+        button.band-chip:checked {
+            background-color: #ecebe6;
+            color: #111;
+        }
+
+        button.band-chip.disabled-band {
+            opacity: 0.45;
+        }
+
+        button.band-chip.add {
+            background: transparent;
+            border: 1px dashed #3a3a3e;
+            padding: 0 6px;
+        }
+
+        .footer-menu > button,
+        button.footer-flat {
+            background: transparent;
+            border: none;
+            border-radius: 10px;
+            box-shadow: none;
+            color: #8b8b90;
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: 700;
+            min-height: 32px;
+            padding: 0 10px;
+        }
+
+        .footer-menu > button:hover,
+        button.footer-flat:hover {
+            color: #ecebe6;
+        }
+
+        button.footer-flat:checked,
+        .footer-menu.on > button {
+            color: #ff8c33;
+        }
+
+        .text-page {
+            padding: 12px 16px;
+        }
+
+        .code-editor {
+            background-color: #121213;
+            border: 1px solid #2a2a2d;
+            border-radius: 14px;
+        }
+
+        textview {
+            background-color: #121213;
+            color: #e7e7e2;
+            font-family: monospace;
+            padding: 14px;
+        }
+
+        textview.invalid-draft {
+            color: #ff9b88;
+        }
+
+        /* Shared */
         .panel-title {
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 700;
             letter-spacing: 0.7px;
         }
@@ -5339,36 +5366,24 @@ fn install_css() {
             opacity: 0.46;
         }
 
-        .comparison-menu > button {
-            border-radius: 14px;
-            font-family: monospace;
+        .level-code {
+            color: #8b8b90;
             font-size: 10px;
-            font-weight: 700;
-            padding: 7px 12px;
         }
 
-        .comparison-candidate {
+        .comparison-candidate,
+        .comparison-listen {
             background-color: #1b1b1d;
             border: 1px solid #2a2a2d;
-            border-radius: 12px;
-            padding: 6px 8px;
-            font-family: monospace;
+            border-radius: 10px;
             box-shadow: none;
+            font-family: monospace;
+            padding: 6px 8px;
         }
 
         .comparison-candidate:checked {
             background-color: rgba(255, 122, 26, 0.10);
             border-color: rgba(255, 122, 26, 0.72);
-            color: #f2f1ec;
-        }
-
-        .comparison-listen {
-            background-color: #1b1b1d;
-            border: 1px solid #2a2a2d;
-            border-radius: 12px;
-            padding: 8px 10px;
-            font-family: monospace;
-            box-shadow: none;
         }
 
         .comparison-listen.active {
@@ -5388,43 +5403,14 @@ fn install_css() {
             font-weight: 700;
         }
 
-        /* Editor pages, set into the bands frame. */
-        .editor-switcher button {
-            background: transparent;
-            border: 0;
-            border-radius: 10px;
-            box-shadow: none;
-            color: #8b8b90;
-            font-family: monospace;
-            font-size: 10.5px;
-            font-weight: 700;
-            min-height: 0;
-            padding: 5px 10px;
-        }
-
-        .editor-switcher button:checked {
-            background-color: #242426;
-            color: #ecebe6;
-        }
-
-        .code-editor {
-            background-color: #121213;
-            border: 1px solid #2a2a2d;
-            border-radius: 18px;
-        }
-
-        textview.invalid-draft {
-            color: #ff9b88;
-        }
-
         entry,
         spinbutton,
         dropdown > button {
             background-color: #1b1b1d;
-            color: #ecebe6;
             border: 1px solid #2a2a2d;
-            border-radius: 12px;
+            border-radius: 10px;
             box-shadow: none;
+            color: #ecebe6;
         }
 
         entry:focus,
@@ -5435,215 +5421,48 @@ fn install_css() {
         }
 
         button {
-            border-radius: 12px;
+            border-radius: 10px;
         }
 
         button.suggested-action {
             background-color: #ff7a1a;
-            color: #1a0d03;
             border-color: #ff8c33;
+            color: #1a0d03;
             font-family: monospace;
             font-weight: 700;
         }
 
         button.suggested-action:disabled {
             background-color: #242426;
-            color: #8b8b90;
             border-color: #2a2a2d;
+            color: #8b8b90;
         }
 
         switch:checked {
             background-color: #ff7a1a;
         }
 
-        switch {
-            min-width: 34px;
-            min-height: 18px;
-            border-radius: 999px;
-            padding: 2px;
-        }
-
-        switch slider {
-            min-width: 14px;
-            min-height: 14px;
-            border-radius: 999px;
-            margin: 0;
-        }
-
         separator {
-            background-color: #232326;
+            background-color: #222225;
         }
-
-        .filter-list,
-        .filter-list > row,
-        .filter-list > flowboxchild {
-            background: transparent;
-        }
-
-        .filter-list > flowboxchild {
-            padding: 0;
-            min-width: 0;
-        }
-
-        .band-fader {
-            min-width: 72px;
-            background-color: #1b1b1d;
-            border-radius: 18px;
-            padding: 7px 7px 10px;
-            color: #ecebe6;
-        }
-
-        .band-fader.selected {
-            background-color: #f3f2ee;
-            color: #121213;
-        }
-
-        .band-fader.disabled-band .fader-gain,
-        .band-fader.disabled-band .band-slider {
-            opacity: 0.35;
-        }
-
-        button.fader-select {
-            background: transparent;
-            box-shadow: none;
-            border: none;
-            min-height: 18px;
-            padding: 0;
-            color: #8b8b90;
-            font-family: monospace;
-            font-size: 9px;
-        }
-
-        .band-fader.selected button.fader-select {
-            color: #6b6b70;
-        }
-
-        .fader-gain,
-        .fader-frequency,
-        .fader-kind,
-        .band-editor-title {
-            font-family: monospace;
-        }
-
-        .fader-gain { font-size: 14px; font-weight: 700; }
-        .fader-frequency { font-size: 12px; }
-        .fader-kind { font-size: 9px; color: #8b8b90; }
-        .band-fader.selected .fader-kind { color: #6b6b70; }
-
-        scale.band-slider { padding: 10px 20px; }
-        scale.band-slider trough { min-width: 6px; background: #303033; border-radius: 3px; }
-        scale.band-slider highlight { background: #ff7a1a; border-radius: 3px; }
-        scale.band-slider slider {
-            min-width: 20px;
-            min-height: 20px;
-            margin: -7px;
-            background: #ecebe6;
-            border: none;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-        }
-        .band-fader.selected scale.band-slider trough { background: #d8d7d1; }
-        .band-fader.selected scale.band-slider slider { background: #121213; }
-        scale.band-slider marks indicator { background: #56565b; min-width: 5px; }
-
-        .band-editor { border-top: 1px solid #2a2a2d; padding-top: 10px; }
-        .band-editor-title { font-size: 11px; color: #8b8b90; }
-        .listening-controls button,
-        .graph-listen button,
-        .graph-listen dropdown > button {
-            font-family: monospace;
-            font-size: 10px;
-            min-height: 24px;
-            padding: 5px 8px;
-        }
-        .listening-controls spinbutton { min-height: 28px; }
-        .listening-controls spinbutton text { font-family: monospace; font-size: 11px; }
-
-        .band-editor .band-kinds button { min-width: 12px; padding: 6px; font-size: 10px; }
-        .band-kinds { margin-top: 12px; }
-        .band-editor .segmented { margin-top: 12px; }
-        .band-editor .segmented button { min-height: 24px; }
-        .band-editor .band-readout { margin-top: 0; }
 
         .convolution-card {
-            background-color: #1b1b1d;
-            border: none;
-            border-radius: 20px;
-            padding: 18px;
+            background-color: transparent;
+            padding: 6px;
         }
 
         .convolution-name {
             font-family: monospace;
-            font-size: 17px;
+            font-size: 15px;
             font-weight: 600;
         }
 
-        .filter-index {
-            min-width: 28px;
-            min-height: 28px;
-            border-radius: 999px;
-            font-family: monospace;
-            font-size: 9px;
-            font-weight: 800;
-            padding: 0 8px;
-        }
-
-        .filter-index:checked {
-            background-color: #ecebe6;
-            color: #121213;
-        }
-
-        .band-frequency {
-            font-family: monospace;
-            font-size: 16px;
-            font-weight: 500;
-        }
-
-        .filter-switch {
-            min-width: 36px;
-            min-height: 20px;
-        }
-
-        .filter-switch slider {
-            min-width: 16px;
-            min-height: 16px;
-            border-radius: 999px;
-        }
-
-        .band-readout text {
-            font-family: monospace;
-            font-size: 13px;
-        }
-
-        .band-add {
-            background-color: transparent;
-            color: #8b8b90;
-            border: 1px solid #3a3a3e;
-            border-radius: 12px;
-            font-family: monospace;
-            font-weight: 700;
-            padding: 9px 14px;
-        }
-
-        .band-add:hover {
-            color: #ecebe6;
-            border-color: #56565b;
-        }
-
-        .reset-filters {
-            background: transparent;
-            color: #8b8b90;
-            font-family: monospace;
-            font-size: 10px;
-            font-weight: 700;
-            padding: 7px 12px;
-        }
-
         .tone-play {
-            min-width: 64px;
-            min-height: 64px;
-            border-radius: 999px;
             background-color: #242426;
             border: none;
+            border-radius: 999px;
+            min-height: 56px;
+            min-width: 56px;
             padding: 0;
         }
 
@@ -5653,27 +5472,27 @@ fn install_css() {
         }
 
         .tone-readout {
-            background-color: #242426;
-            border-radius: 18px;
-            min-width: 150px;
-            padding: 10px 16px;
+            background-color: #1f1f22;
+            border-radius: 14px;
+            min-width: 130px;
+            padding: 8px 14px;
         }
 
         .tone-value {
             font-family: monospace;
-            font-size: 22px;
+            font-size: 20px;
             font-weight: 600;
         }
 
         .segmented button {
             background-color: #1b1b1d;
             border: 1px solid #2a2a2d;
+            box-shadow: none;
             color: #8b8b90;
             font-family: monospace;
             font-size: 10px;
             font-weight: 700;
-            padding: 6px 12px;
-            box-shadow: none;
+            padding: 6px 10px;
         }
 
         .segmented button:checked {
@@ -5683,41 +5502,33 @@ fn install_css() {
         }
 
         .tone-fix {
-            background-color: #242426;
+            background-color: #1f1f22;
             border: none;
-            border-radius: 14px;
+            border-radius: 12px;
             font-family: monospace;
             font-weight: 700;
-            min-width: 76px;
-            padding: 10px 14px;
+            min-width: 70px;
+            padding: 8px 12px;
         }
 
-        .tone-fix:hover {
-            background-color: #2b2b2e;
-        }
-
-        .console-status {
-            color: #8b8b90;
-            font-size: 10px;
-            padding: 2px 6px;
+        .graph-listen button,
+        .graph-listen dropdown > button {
+            font-family: monospace;
+            font-size: 11px;
         }
 
         popover > contents {
             background-color: #151516;
             border: 1px solid #2a2a2d;
-            border-radius: 20px;
-            box-shadow: 0 16px 38px rgba(0, 0, 0, 0.45);
-        }
-
-        list.boxed-list,
-        list.boxed-list > row {
-            background-color: #1b1b1d;
+            border-radius: 16px;
+            box-shadow: 0 16px 38px rgba(0, 0, 0, 0.5);
+            padding: 10px;
         }
 
         scale trough {
             background-color: #242426;
-            min-height: 6px;
             border-radius: 3px;
+            min-height: 6px;
         }
 
         scale highlight {
@@ -5727,24 +5538,17 @@ fn install_css() {
 
         scale slider {
             background-color: #ecebe6;
-            min-width: 20px;
-            min-height: 20px;
             border-radius: 999px;
             box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
+            min-height: 18px;
+            min-width: 18px;
         }
 
         scrollbar slider {
             background-color: #3a3a3e;
             border-radius: 999px;
-            min-width: 5px;
-            min-height: 5px;
-        }
-
-        textview {
-            background-color: #121213;
-            color: #e7e7e2;
-            font-family: monospace;
-            padding: 14px;
+            min-height: 4px;
+            min-width: 4px;
         }
         "#,
     );
@@ -5917,12 +5721,6 @@ fn header_markup(status: &serde_json::Value, model: &Model) -> String {
         if let Some(rate) = number("sample_rate") {
             parts.push(format!("{} kHz", accent(&format!("{:.1}", rate / 1000.0))));
         }
-        if let Some(latency) = number("latency_ms") {
-            parts.push(format!("{} ms", accent(&format!("{latency:.1}"))));
-        }
-        if let Some(cpu) = number("cpu_percent_of_deadline") {
-            parts.push(format!("CPU {}", accent(&format!("{cpu:.0}%"))));
-        }
     } else if model.engine_off.get() {
         parts.push("ENGINE OFF".to_owned());
     }
@@ -5933,62 +5731,6 @@ fn header_markup(status: &serde_json::Value, model: &Model) -> String {
         ));
     }
     parts.join("  <span foreground='#3a3a3e'>│</span>  ")
-}
-
-/// A round icon badge for the start of a tile.
-fn tile_icon(name: &str) -> gtk::Box {
-    let badge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    badge.add_css_class("tile-icon");
-    badge.set_hexpand(false);
-    badge.set_valign(gtk::Align::Center);
-    let image = gtk::Image::from_icon_name(name);
-    image.set_hexpand(true);
-    image.set_halign(gtk::Align::Center);
-    badge.append(&image);
-    badge
-}
-
-fn rail_label(text: &str) -> gtk::Label {
-    let label = gtk::Label::new(Some(text));
-    label.set_xalign(0.0);
-    label.add_css_class("rail-label");
-    label
-}
-
-/// A panel outlined by a thin rule, its numbered title set into the top edge
-/// (after btop), with an optional widget set into the right of that edge.
-fn titled_frame(
-    number: u32,
-    title: &str,
-    child: &impl IsA<gtk::Widget>,
-    end: Option<&gtk::Widget>,
-) -> gtk::Overlay {
-    let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    frame.add_css_class("titled-frame");
-    frame.set_margin_top(14);
-    frame.append(child);
-    let overlay = gtk::Overlay::new();
-    overlay.set_child(Some(&frame));
-    let label = gtk::Label::new(None);
-    label.set_markup(&format!(
-        "<span foreground='{ACCENT}' size='70%' rise='4000'>{number}</span>{}",
-        gtk::glib::markup_escape_text(title)
-    ));
-    label.add_css_class("frame-title");
-    label.set_halign(gtk::Align::Start);
-    label.set_valign(gtk::Align::Start);
-    label.set_margin_start(16);
-    label.set_margin_top(5);
-    overlay.add_overlay(&label);
-    if let Some(end) = end {
-        end.add_css_class("frame-end");
-        end.set_halign(gtk::Align::End);
-        end.set_valign(gtk::Align::Start);
-        end.set_margin_end(16);
-        overlay.add_overlay(end);
-        overlay.set_measure_overlay(end, true);
-    }
-    overlay
 }
 
 fn refresh_profiles(model: &Rc<Model>, list: &gtk::ListBox) {

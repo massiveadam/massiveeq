@@ -226,22 +226,39 @@ Profiles live in `~/.local/share/massiveeq/profiles/`; assignments and manual
 trims live in `~/.config/massiveeq/state.json`. Unassigned and unsupported
 multichannel devices are never intercepted.
 
+## Editing bands
+
+The graph is the editor, as in plugin EQs. Click empty space to add a band
+and drag a band's node to set its frequency and gain; scroll over it to
+change Q. The selected band opens a panel beside its node: the filter type,
+drawn as its curve shape (peak, shelves, passes, band pass, notch, all-pass),
+left/both/right ears, frequency, gain, and Q knobs, an on/off switch, and
+delete. Knobs follow the mouse vertically (Shift is finer), take the mouse
+wheel and arrow keys, and reset on double-click. Escape closes the panel. The
+chips along the footer list every band and select it; **＋** adds one.
+
+The header holds the profile bank (◀ ▾ ▶), undo and redo, **A/B**, the
+output picker with its assign action, and the engine switch. The footer
+holds **FILTERS**, **LISTEN**, the bands, the **Bass**, **Tilt**, and
+**Output** knobs, and **TEXT**, **IR**, and **CURVES**.
+
 ## Tuning by ear: the tone finder
 
-The **Tone** page beside Visual and Text plays a test signal through the
+**LISTEN** in the footer plays a test signal through the
 selected output's current EQ: a sine, or pink noise across the full range,
 one octave, or a third of an octave around the chosen frequency, to the left
-ear, right ear, or both. Sweep the frequency (a marker follows on the graph)
+ear, right ear, or both; the menu beside it chooses which, and holds the
+sweep. Sweep the frequency (a marker follows on the graph)
 and listen for spots that jump out or vanish. **Cut** or **Boost** by 1 or
 3 dB adds a peak filter there, as wide as what you were hearing, or adjusts
 the filter already within a twelfth of an octave. Every signal plays at the
 same RMS level, capped at −12 dBFS; start quiet. The tone stops when you
-leave the page, close the window, or within five seconds if the editor goes
-away.
+turn LISTEN off, open the text editor, close the window, or within five
+seconds if the editor goes away.
 
 ## Measurement and target curves
 
-**Curves** in the graph header shows a headphone measurement and a target
+**CURVES** in the footer shows a headphone measurement and a target
 behind the EQ for the open profile. Files are plain text or CSV with one
 `frequency, dB` pair per line, as exported by AutoEQ, Squiglink, and REW;
 headers and comments are skipped. A target with exactly three numbers per
@@ -253,11 +270,12 @@ of exported profile text.
 
 ## Comparing profiles
 
-Open **Compare** in the Signal Route strip, choose between two and nine
+Open **A/B** in the header, choose between two and nine
 candidates, and select **Start Comparison**. The panel then becomes a set of
 listening buttons; selecting one immediately switches to that candidate. `Off`
 can be included as a dry candidate. Banks are remembered independently for
-each output and do not replace its normal assigned profile.
+each output and do not replace its normal assigned profile. The same menu
+auditions the profile's starting sound against the current edit.
 
 Level matching predicts the expected [ITU-R BS.1770-5](https://www.itu.int/rec/R-REC-BS.1770-5-202311-I/en)
 K-weighted mean-square energy of stationary pink noise after the complete
@@ -279,10 +297,10 @@ candidates switch through the live 8 ms crossfade without replacing the
 PipeWire endpoint. Processed profiles with incompatible convolution latency
 cannot be placed in the same bank.
 
-The Parametric page can switch between **Visual** filter cards and the canonical
-Equalizer APO-style **Text** profile. Both edit the same draft and autosave
-after 300 ms. Invalid text remains visible for correction while the last valid
-audio chain continues playing. `Ctrl+E` toggles the two editor views.
+**TEXT** in the footer swaps the graph for the canonical Equalizer APO-style
+profile text. Both edit the same draft and autosave after 300 ms. Invalid
+text remains visible for correction while the last valid audio chain
+continues playing. `Ctrl+E` toggles the two views.
 
 ## Text compatibility
 
@@ -343,7 +361,7 @@ the last valid audio chain continues playing.
 
 ## Diagnostics
 
-The engine readout above the graph shows the PipeWire graph rate and whether
+The status strip in the header shows the PipeWire graph rate and whether
 playing audio arrives at that rate (`SOURCE NATIVE`) or is converted
 (`SOURCE 44.1 kHz → RESAMPLED`). Its tooltip explains the cause; most often
 PipeWire is allowed only one rate, which `default.clock.allowed-rates` fixes.

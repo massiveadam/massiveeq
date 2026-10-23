@@ -21,7 +21,7 @@ PY
 import sys
 sys.path.insert(0,sys.argv[1]);import ui
 for name,value in [('Bass',4),('Tilt',-3)]:
-    actual=ui.find(name,'spin button').get_value_iface().get_current_value()
+    actual=ui.find(name,'slider').get_value_iface().get_current_value()
     assert actual==value,(name,actual,value)
 print('PASS: repeated bass/tilt edits retain their readouts and reuse the same shelves')
 PY
@@ -29,13 +29,25 @@ PY
   sleep 1
   shot listening-undo.png
   ui click "Redo" button
-  sleep 1
+  # Saving is debounced; wait for the service's copy rather than a fixed delay.
+  for _ in $(seq 1 25); do
+    meq ListProfiles | jq -e '.[] | select(.name == "HD 650") | .text | contains("Fc 1000.00 Hz Gain -1.50")' >/dev/null && break
+    sleep 0.2
+  done
   meq ListProfiles | jq -e '.[] | select(.name == "HD 650") | .text | contains("Fc 1000.00 Hz Gain -1.50")' >/dev/null
   echo 'PASS: undo and redo return the complete grouped edit'
+  # Starting sound lives in the A/B menu; tone controls in the listen menu.
+  ui click "A/B" "toggle button"
+  sleep 0.5
   ui click "Hear starting sound" "toggle button"
   sleep 0.7
   shot listening-start.png
   ui click "Hear starting sound" "toggle button"
+  # Close A/B first; one menu opens at a time.
+  ui click "A/B" "toggle button"
+  sleep 0.3
+  ui click "Sweep and signal" "toggle button"
+  sleep 0.5
   ui setnamedvalue "Graph tone frequency" 0.4
   ui click "Listen" "toggle button"
   sleep 0.7
@@ -52,17 +64,20 @@ assert a>.41 and abs(a-b)<.001, (a,b)
 print('PASS: sweep advances logarithmically, then holds its frequency when paused',a,b)
 PY
   shot listening-sweep.png
-  ui click "−1 dB here" button
+  ui click "−1 dB" button
   sleep 1
   ui click "Listen" "toggle button"
-  sleep 0.7
+  # A stop can wait behind a save already in flight after the correction.
+  for _ in $(seq 1 15); do
+    test "$(pw-dump | jq '[.[] | select(.info.props."node.name"? == "massiveeq.tone")] | length')" = 0 && break
+    sleep 0.2
+  done
   test "$(pw-dump | jq '[.[] | select(.info.props."node.name"? == "massiveeq.tone")] | length')" = 0
   echo 'PASS: graph listening, correction at held frequency, and stop'
-  if ! ui click "CURVES" "toggle button" 2>/dev/null; then
-    ui click "Profiles and tools" "toggle button"
-    sleep 0.5
-    ui click "CURVES" "toggle button"
-  fi
+  # Close the sweep menu first; one menu opens at a time.
+  ui click "Sweep and signal" "toggle button"
+  sleep 0.3
+  ui click "CURVES" "toggle button"
   sleep 0.4
   ui click "Measurement details" button
   sleep 0.5

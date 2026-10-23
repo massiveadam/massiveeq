@@ -309,28 +309,6 @@ fn draw_filter_points(
         let label_width = extents.map_or(0.0, |value| value.width());
         cr.move_to(x - label_width / 2.0, y + 3.5);
         let _ = cr.show_text(&label);
-
-        if is_selected {
-            let text = format_filter_readout(filter);
-            cr.select_font_face(
-                "Monospace",
-                cairo::FontSlant::Normal,
-                cairo::FontWeight::Normal,
-            );
-            cr.set_font_size(11.0);
-            let extents = cr.text_extents(&text).ok();
-            let text_width = extents.map_or(0.0, |value| value.width());
-            let box_width = text_width + 20.0;
-            let box_height = 26.0;
-            let box_x = (x - box_width / 2.0).clamp(LEFT, width - RIGHT - box_width);
-            let box_y = if y > TOP + 46.0 { y - 40.0 } else { y + 18.0 };
-            rounded_rectangle(cr, box_x, box_y, box_width, box_height, 8.0);
-            cr.set_source_rgba(0.14, 0.14, 0.15, 0.98);
-            let _ = cr.fill();
-            cr.set_source_rgba(0.93, 0.92, 0.90, 0.98);
-            cr.move_to(box_x + 10.0, box_y + 17.0);
-            let _ = cr.show_text(&text);
-        }
     }
 }
 
@@ -548,39 +526,6 @@ fn draw_tone_marker(cr: &cairo::Context, frequency: f64, width: f64, height: f64
     let _ = cr.show_text(&label);
 }
 
-fn rounded_rectangle(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, radius: f64) {
-    cr.new_sub_path();
-    cr.arc(
-        x + w - radius,
-        y + radius,
-        radius,
-        -std::f64::consts::FRAC_PI_2,
-        0.0,
-    );
-    cr.arc(
-        x + w - radius,
-        y + h - radius,
-        radius,
-        0.0,
-        std::f64::consts::FRAC_PI_2,
-    );
-    cr.arc(
-        x + radius,
-        y + h - radius,
-        radius,
-        std::f64::consts::FRAC_PI_2,
-        std::f64::consts::PI,
-    );
-    cr.arc(
-        x + radius,
-        y + radius,
-        radius,
-        std::f64::consts::PI,
-        std::f64::consts::PI * 1.5,
-    );
-    cr.close_path();
-}
-
 pub fn point_position(frequency: f64, gain: f64, width: f64, height: f64) -> (f64, f64) {
     (x_for(frequency, width), y_for(gain, height))
 }
@@ -673,15 +618,6 @@ fn frequency_label(frequency: f64) -> &'static str {
         10000 => "10k",
         _ => "20 kHz",
     }
-}
-
-fn format_filter_readout(filter: &Filter) -> String {
-    let frequency = if filter.frequency >= 1000.0 {
-        format!("{:.2} kHz", filter.frequency / 1000.0)
-    } else {
-        format!("{:.0} Hz", filter.frequency)
-    };
-    format!("{frequency}  {:+.1} dB  Q {:.2}", filter.gain_db, filter.q)
 }
 
 #[cfg(test)]
