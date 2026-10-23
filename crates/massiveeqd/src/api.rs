@@ -187,8 +187,9 @@ impl Service {
         Ok(result)
     }
 
-    /// Save a measurement or target curve with a profile; an empty path
-    /// removes it. Returns the profile's curves as JSON.
+    /// Save a measurement or target curve with a profile, or add a placement
+    /// of the measurement; an empty path removes it (all placements). Returns
+    /// the profile's curves as JSON.
     async fn set_curve(
         &self,
         id: &str,
@@ -196,21 +197,30 @@ impl Service {
         path: &str,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> fdo::Result<String> {
-        let kind = match kind {
-            "measurement" => massiveeq_core::CurveKind::Measurement,
-            "target" => massiveeq_core::CurveKind::Target,
+        let state = self.state.lock().await;
+        let source = (!path.is_empty()).then(|| std::path::Path::new(path));
+        let curves = match kind {
+            "measurement" => state.storage.set_curve(
+                &state.library,
+                id,
+                massiveeq_core::CurveKind::Measurement,
+                source,
+            ),
+            "target" => state.storage.set_curve(
+                &state.library,
+                id,
+                massiveeq_core::CurveKind::Target,
+                source,
+            ),
+            // Another placement of the measurement; an empty path clears them.
+            "placement" => state.storage.add_placement(&state.library, id, source),
             other => {
                 return Err(fdo::Error::InvalidArgs(format!(
                     "unknown curve kind {other:?}"
                 )));
             }
-        };
-        let state = self.state.lock().await;
-        let source = (!path.is_empty()).then(|| std::path::Path::new(path));
-        let curves = state
-            .storage
-            .set_curve(&state.library, id, kind, source)
-            .map_err(failed)?;
+        }
+        .map_err(failed)?;
         let result = serde_json::to_string(&curves).map_err(failed)?;
         Self::changed(&emitter, "profiles").await.map_err(failed)?;
         Ok(result)

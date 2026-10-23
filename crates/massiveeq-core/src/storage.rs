@@ -392,6 +392,10 @@ impl Storage {
                     fs::remove_file(sidecar)?;
                 }
                 atomic_write(&destination, text.as_bytes())?;
+                // Placements belong to the measurement they were taken with.
+                if kind == crate::CurveKind::Measurement {
+                    remove_placements(&directory)?;
+                }
             }
             None => {
                 if destination.exists() {
@@ -401,8 +405,58 @@ impl Storage {
                 if sidecar.exists() {
                     fs::remove_file(sidecar)?;
                 }
+                if kind == crate::CurveKind::Measurement {
+                    remove_placements(&directory)?;
+                }
             }
         }
+        Ok(self.curves(id))
+    }
+
+    /// Add another measurement of the same headphone, taken after putting it
+    /// on again, or with `None` remove every placement. Needs a measurement.
+    pub fn add_placement(
+        &self,
+        library: &Library,
+        id: &str,
+        source: Option<&Path>,
+    ) -> Result<crate::Curves, StorageError> {
+        if !library.profiles.contains_key(id) {
+            return Err(StorageError::MissingProfile(id.into()));
+        }
+        let directory = self.profile_dir(id).join("curves");
+        let Some(source) = source else {
+            remove_placements(&directory)?;
+            return Ok(self.curves(id));
+        };
+        if !directory
+            .join(crate::CurveKind::Measurement.file_name())
+            .exists()
+        {
+            return Err(StorageError::InvalidProfile(
+                "load a measurement before adding placements".into(),
+            ));
+        }
+        let existing = placement_files(&directory);
+        if existing.len() >= crate::MAX_PLACEMENTS {
+            return Err(StorageError::InvalidProfile(format!(
+                "a measurement can have at most {} placements",
+                crate::MAX_PLACEMENTS
+            )));
+        }
+        let text = fs::read_to_string(source)?;
+        crate::parse_curve(&text, crate::CurveKind::Measurement)
+            .map_err(StorageError::InvalidProfile)?;
+        let next = existing
+            .iter()
+            .filter_map(|path| placement_number(path))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        atomic_write(
+            &directory.join(format!("placement-{next:02}.txt")),
+            text.as_bytes(),
+        )?;
         Ok(self.curves(id))
     }
 
@@ -447,11 +501,27 @@ impl Storage {
         let read_metadata = |kind: crate::CurveKind| {
             serde_json::from_slice(&fs::read(directory.join(kind.metadata_file_name())).ok()?).ok()
         };
+        let measurement = read(crate::CurveKind::Measurement);
+        let placements = if measurement.is_some() {
+            placement_files(&directory)
+                .iter()
+                .filter_map(|path| {
+                    crate::parse_curve(
+                        &fs::read_to_string(path).ok()?,
+                        crate::CurveKind::Measurement,
+                    )
+                    .ok()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         crate::Curves {
-            measurement: read(crate::CurveKind::Measurement),
+            measurement,
             target: read(crate::CurveKind::Target),
             measurement_metadata: read_metadata(crate::CurveKind::Measurement),
             target_metadata: read_metadata(crate::CurveKind::Target),
+            placements,
         }
     }
 
@@ -558,6 +628,35 @@ const MAX_METADATA_SOURCE_LEN: usize = 2048;
 const MAX_METADATA_FIELD_LEN: usize = 256;
 
 /// Trim metadata strings and enforce their length bounds.
+/// A profile's placement files, oldest first.
+fn placement_files(directory: &Path) -> Vec<std::path::PathBuf> {
+    let mut files = fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| placement_number(path).is_some())
+        .collect::<Vec<_>>();
+    files.sort_by_key(|path| placement_number(path));
+    files
+}
+
+fn placement_number(path: &Path) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("placement-")?
+        .strip_suffix(".txt")?
+        .parse()
+        .ok()
+}
+
+fn remove_placements(directory: &Path) -> Result<(), StorageError> {
+    for path in placement_files(directory) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn validate_curve_metadata(
     metadata: crate::CurveMetadata,
 ) -> Result<crate::CurveMetadata, StorageError> {
@@ -934,6 +1033,52 @@ mod tests {
             ),
             Err(StorageError::InvalidProfile(_))
         ));
+    }
+
+    #[test]
+    fn placements_follow_their_measurement() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "HD 600").unwrap();
+        let source = temp.path().join("take.csv");
+        write_test_curve_source(&source);
+        // Placements need a measurement to belong to.
+        assert!(
+            storage
+                .add_placement(&library, &profile.id, Some(&source))
+                .is_err()
+        );
+        let measurement = crate::CurveKind::Measurement;
+        storage
+            .set_curve(&library, &profile.id, measurement, Some(&source))
+            .unwrap();
+        for _ in 0..2 {
+            storage
+                .add_placement(&library, &profile.id, Some(&source))
+                .unwrap();
+        }
+        assert_eq!(storage.curves(&profile.id).placements.len(), 2);
+        for _ in 2..crate::MAX_PLACEMENTS {
+            storage
+                .add_placement(&library, &profile.id, Some(&source))
+                .unwrap();
+        }
+        assert!(
+            storage
+                .add_placement(&library, &profile.id, Some(&source))
+                .is_err()
+        );
+        // A new measurement is a new headphone or session: placements go.
+        let curves = storage
+            .set_curve(&library, &profile.id, measurement, Some(&source))
+            .unwrap();
+        assert!(curves.placements.is_empty());
+        storage
+            .add_placement(&library, &profile.id, Some(&source))
+            .unwrap();
+        let curves = storage.add_placement(&library, &profile.id, None).unwrap();
+        assert!(curves.placements.is_empty() && curves.measurement.is_some());
     }
 
     #[test]

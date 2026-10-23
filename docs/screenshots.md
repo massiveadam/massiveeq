@@ -43,8 +43,14 @@ export, delete, and flatten every band. ◀ and ▶ step through profiles.
 
 ![CURVES menu](screenshots/curves-menu.png)
 
-**CURVES** loads a headphone measurement and a target or target range, and
-records where each came from.
+**CURVES** loads a headphone measurement and a target or target range, adds
+placements, and records where each came from.
+
+![Corrected measurement against preference bounds, with placements](screenshots/preference-bounds.png)
+
+Against preference bounds, the stretches where the corrected curve leaves the
+range are shaded magenta and listed above the graph. Four placements of the
+measurement are drawn as a band around their median.
 
 ## Impulse responses
 

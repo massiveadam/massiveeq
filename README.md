@@ -61,8 +61,9 @@ support contract.
   so each change sounds like exactly that change
 - **A/B**: audition the starting sound against your edit, or level-matched
   comparison banks of 2–9 profiles plus dry playback
-- Headphone measurement and target (or target-range) curves behind the EQ,
-  with the measurement shown as corrected by the current filters
+- Headphone measurement and target (or preference-bounds) curves behind the
+  EQ, with the measurement shown as corrected by the current filters, where it
+  leaves the bounds highlighted, and repeat placements shown as a band
 - Per-output **FILTERS** bypass; the graph dims while you hear unprocessed audio
 
 **Profiles and routing**
@@ -343,9 +344,35 @@ research that informed them.
 behind the EQ for the open profile. Files are plain text or CSV with one
 `frequency, dB` pair per line, as exported by AutoEQ, Squiglink, and REW;
 headers and comments are skipped. A target with exactly three numbers per
-line (`frequency, low, high`) is drawn as a range. Curves are aligned to
-0 dB across 300 Hz–3 kHz, and the measurement is drawn twice: as measured,
-and with the profile's current EQ applied (per ear when the ears differ).
+line (`frequency, low, high`) is drawn as a range, such as preference
+bounds. Curves are aligned to 0 dB at 630 Hz ± one octave, as
+[GraphWorks](https://graph.headphones.com) aligns them, so bounds and
+measurements from there line up the same way. The measurement is drawn twice:
+as measured, and with the profile's current EQ applied (per ear when the ears
+differ).
+
+Against a range, the corrected curve is judged by where it leaves the bounds,
+not by its distance from a single line. Each stretch outside is shaded in
+magenta and listed above the graph with how far out it goes, for example
+`2.1k–3.4k +2.3`. Anything inside the bounds is a defensible tuning; following
+[Headphones.com's re-analysis of Harman's research](https://headphones.com/blogs/features/what-headphone-sound-profiles-do-people-like),
+listeners in the dominant group rated several quite different responses nearly
+as highly as the Harman target.
+
+**Add placement** adds more measurements of the same headphone, taken after
+putting it on again. The graph then shows the median with bands holding the
+middle half and 90% of placements, and corrects the median. A feature that
+moves a lot between placements is not worth EQ'ing precisely. Loading a new
+measurement clears its placements.
+
+Curve details record where each curve came from. The fixture is chosen from a
+list (B&K 5128, GRAS 43AG/45CA with the KB50xx pinna, B&K 4128, the IEC 711
+coupler) or typed in, and fixtures are recognised however they were written.
+Targets and bounds are made for one fixture's ears, so a measurement from
+another fixture, say a 711 coupler against 5128 bounds, is flagged rather than
+quietly compared. MassiveEQ does not bundle third-party targets or bounds;
+import the ones you have rights to use.
+
 Curves are saved with the profile in its `curves/` folder; they are not part
 of exported profile text.
 

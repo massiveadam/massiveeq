@@ -11,7 +11,9 @@ pub mod upgrade;
 
 pub use analysis::{ChannelAnalysis, ProfileAnalysis, analyze_profile, analyze_profile_preview};
 pub use curve::{
-    CurveCompensation, CurveKind, CurveMetadata, CurvePoint, CurveTransducer, Curves, parse_curve,
+    CurveCompensation, CurveKind, CurveMetadata, CurvePoint, CurveTransducer, Curves, Excursion,
+    FIXTURES, MAX_PLACEMENTS, MeasurementField, alignment_level, curve_at, excursions, fixture_key,
+    is_range, measurement_field, parse_curve,
 };
 pub use layout::{ImpulseLayout, ImpulseRoute, SURROUND_71_POSITIONS, validate_impulse};
 pub use model::*;
