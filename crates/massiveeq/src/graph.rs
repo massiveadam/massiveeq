@@ -27,7 +27,8 @@ fn range_db() -> f64 {
 const MIN_FREQUENCY: f64 = 20.0;
 const MAX_FREQUENCY: f64 = 20_000.0;
 const FINE_FREQUENCY_OCTAVES: f64 = 1.0 / 48.0;
-const COARSE_FREQUENCY_OCTAVES: f64 = 1.0 / 6.0;
+/// The band gain knob's range; arrow keys stay within it.
+pub const GAIN_LIMIT_DB: f64 = 24.0;
 const Q_STEP_FACTOR: f64 = 1.1;
 
 /// Things drawn on the graph besides the EQ response.
@@ -556,33 +557,37 @@ pub fn values_at_position(x: f64, y: f64, width: f64, height: f64) -> Option<(f6
     Some((frequency, gain))
 }
 
-pub fn nudge_filter(filter: &mut Filter, direction: NudgeDirection, shifted: bool) {
-    match (direction, shifted) {
-        (NudgeDirection::Up, false) => {
-            filter.gain_db = (filter.gain_db + 0.1).clamp(-range_db(), range_db());
-        }
-        (NudgeDirection::Down, false) => {
-            filter.gain_db = (filter.gain_db - 0.1).clamp(-range_db(), range_db());
-        }
-        (NudgeDirection::Up, true) => {
-            filter.q = (filter.q * Q_STEP_FACTOR).clamp(0.01, 1_000.0);
-        }
-        (NudgeDirection::Down, true) => {
-            filter.q = (filter.q / Q_STEP_FACTOR).clamp(0.01, 1_000.0);
-        }
-        (NudgeDirection::Left, shifted) | (NudgeDirection::Right, shifted) => {
-            let octaves = if shifted {
-                COARSE_FREQUENCY_OCTAVES
-            } else {
-                FINE_FREQUENCY_OCTAVES
-            };
-            let direction = if matches!(direction, NudgeDirection::Left) {
-                -1.0
-            } else {
+/// Arrow keys on the selected band: Up/Down for gain in 0.1 dB (Shift: 1 dB),
+/// Left/Right for frequency, Shift+Left/Right for Q. `repeat` scales a held
+/// key's step so holding it goes faster.
+pub fn nudge_filter(filter: &mut Filter, direction: NudgeDirection, shifted: bool, repeat: f64) {
+    match direction {
+        NudgeDirection::Up | NudgeDirection::Down => {
+            let sign = if direction == NudgeDirection::Up {
                 1.0
+            } else {
+                -1.0
             };
-            filter.frequency = (filter.frequency * 2.0_f64.powf(direction * octaves))
+            let step = if shifted { 1.0 } else { 0.1 };
+            // Never pull an imported gain beyond the knob's range back in.
+            let limit = GAIN_LIMIT_DB.max(filter.gain_db.abs());
+            let gain = filter.gain_db + sign * step * repeat;
+            // Land on the step grid so 0.1 dB steps read cleanly.
+            filter.gain_db = ((gain / step).round() * step).clamp(-limit, limit);
+        }
+        NudgeDirection::Left | NudgeDirection::Right => {
+            let sign = if direction == NudgeDirection::Right {
+                1.0
+            } else {
+                -1.0
+            };
+            if shifted {
+                filter.q = (filter.q * Q_STEP_FACTOR.powf(sign * repeat)).clamp(0.01, 1_000.0);
+            } else {
+                filter.frequency = (filter.frequency
+                    * 2.0_f64.powf(sign * FINE_FREQUENCY_OCTAVES * repeat))
                 .clamp(MIN_FREQUENCY, MAX_FREQUENCY);
+            }
         }
     }
 }
@@ -670,15 +675,33 @@ mod tests {
             channels: ChannelSelection::All,
         };
 
-        nudge_filter(&mut filter, NudgeDirection::Up, false);
-        assert!((filter.gain_db - 0.1).abs() < f64::EPSILON);
-        nudge_filter(&mut filter, NudgeDirection::Right, false);
-        let fine_frequency = filter.frequency;
-        nudge_filter(&mut filter, NudgeDirection::Right, true);
-        assert!(filter.frequency / fine_frequency > 1.1);
-        nudge_filter(&mut filter, NudgeDirection::Up, true);
-        assert!((filter.q - 1.1).abs() < f64::EPSILON);
-        nudge_filter(&mut filter, NudgeDirection::Down, true);
-        assert!((filter.q - 1.0).abs() < 0.000_001);
+        nudge_filter(&mut filter, NudgeDirection::Up, false, 1.0);
+        assert!((filter.gain_db - 0.1).abs() < 1e-9);
+        nudge_filter(&mut filter, NudgeDirection::Up, true, 1.0);
+        assert!((filter.gain_db - 1.0).abs() < 1e-9, "{}", filter.gain_db);
+        nudge_filter(&mut filter, NudgeDirection::Down, false, 1.0);
+        assert!((filter.gain_db - 0.9).abs() < 1e-9);
+        // Held keys take bigger steps, still on the 0.1 dB grid.
+        nudge_filter(&mut filter, NudgeDirection::Up, false, 5.0);
+        assert!((filter.gain_db - 1.4).abs() < 1e-9);
+        for _ in 0..40 {
+            nudge_filter(&mut filter, NudgeDirection::Up, true, 1.0);
+        }
+        assert_eq!(filter.gain_db, GAIN_LIMIT_DB);
+
+        nudge_filter(&mut filter, NudgeDirection::Right, false, 1.0);
+        assert!(filter.frequency > 1_000.0 && filter.frequency < 1_020.0);
+        nudge_filter(&mut filter, NudgeDirection::Left, false, 1.0);
+        assert!((filter.frequency - 1_000.0).abs() < 1e-6);
+        assert_eq!(filter.q, 1.0, "plain arrows leave Q alone");
+
+        nudge_filter(&mut filter, NudgeDirection::Right, true, 1.0);
+        assert!((filter.q - 1.1).abs() < 1e-9);
+        nudge_filter(&mut filter, NudgeDirection::Left, true, 1.0);
+        assert!((filter.q - 1.0).abs() < 1e-9);
+        assert!(
+            (filter.frequency - 1_000.0).abs() < 1e-6,
+            "Shift+Left/Right leave frequency alone"
+        );
     }
 }

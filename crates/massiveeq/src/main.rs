@@ -532,13 +532,10 @@ fn build_ui(app: &adw::Application) {
     graph.set_focus_on_click(true);
     graph.set_accessible_role(gtk::AccessibleRole::Group);
     graph.add_css_class("response-graph");
-    graph.set_tooltip_text(Some(
-        "Double-click to add a band. Click a band to select it; drag to move it; scroll over it for Q. Arrows edit the selected band; Shift+Up/Down edits Q; Escape closes its panel.",
-    ));
     graph.update_property(&[
         gtk::accessible::Property::Label("Frequency response graph"),
         gtk::accessible::Property::Description(
-            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Double-click empty graph space to add a filter. Use arrow keys to edit the selected filter; hold Shift for Q or larger frequency steps.",
+            "Logarithmic 20 hertz to 20 kilohertz response from minus 10 to plus 10 decibels. Double-click empty graph space to add a filter. Up and Down change the selected filter's gain by 0.1 decibels, or 1 with Shift; Left and Right change its frequency, or its Q with Shift.",
         ),
     ]);
     graph.set_vexpand(true);
@@ -2137,7 +2134,11 @@ fn wire_actions(
     graph.add_controller(gesture);
 
     let keyboard = gtk::EventControllerKey::new();
+    // The last nudge key, when it was pressed, and how many repeats in a row:
+    // holding a key speeds it up.
+    let held = Rc::new(Cell::new(None::<(gtk::gdk::Key, Instant, u32)>));
     keyboard.connect_key_pressed({
+        let held = held.clone();
         let model = model.clone();
         let buffer = buffer.clone();
         let graph = graph.clone();
@@ -2159,8 +2160,25 @@ fn wire_actions(
                 return gtk::glib::Propagation::Proceed;
             };
             let shifted = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            let now = Instant::now();
+            let count = match held.get() {
+                Some((last, at, count))
+                    if last == key && now.duration_since(at) < Duration::from_millis(250) =>
+                {
+                    count + 1
+                }
+                _ => 0,
+            };
+            held.set(Some((key, now, count)));
+            // Fine steps speed up after about a third and a full second of
+            // auto-repeat; Shift steps are already coarse.
+            let repeat = match (shifted, count) {
+                (true, _) | (false, 0..10) => 1.0,
+                (false, 10..30) => 2.0,
+                (false, _) => 5.0,
+            };
             update_filter(&model, &buffer, &graph, index, |filter| {
-                graph::nudge_filter(filter, direction, shifted);
+                graph::nudge_filter(filter, direction, shifted, repeat);
             });
             if let Some(filter) = model
                 .document
@@ -2178,6 +2196,7 @@ fn wire_actions(
             gtk::glib::Propagation::Stop
         }
     });
+    keyboard.connect_key_released(move |_, _, _, _| held.set(None));
     graph.add_controller(keyboard);
 
     // Scroll over the selected band (or anywhere, with it selected and the
@@ -3753,6 +3772,44 @@ fn build_band_editor(
     root.append(&knobs);
     root.set_visible(false);
     overlay.add_overlay(&root);
+    // Clicks on the panel leave keyboard focus on the graph, so the arrow
+    // keys keep editing the selected band.
+    for button in kind.buttons.iter().chain(&channels.buttons) {
+        button.set_focus_on_click(false);
+    }
+    enabled.set_focus_on_click(false);
+    remove.set_focus_on_click(false);
+
+    // The panel follows its node, but holds still while the pointer is on it
+    // or one of its knobs is dragged: a panel moving under the pointer would
+    // carry a knob away mid-drag and send the mouse wheel to the graph.
+    let hovered = Rc::new(Cell::new(false));
+    let dragging = Rc::new(Cell::new(false));
+    let placed = Rc::new(Cell::new(None::<(usize, gtk::gdk::Rectangle)>));
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_enter({
+        let hovered = hovered.clone();
+        move |_, _, _| hovered.set(true)
+    });
+    motion.connect_leave({
+        let hovered = hovered.clone();
+        let overlay = overlay.clone();
+        move |_| {
+            hovered.set(false);
+            overlay.queue_allocate();
+        }
+    });
+    root.add_controller(motion);
+    for control in [&frequency, &gain, &q] {
+        let dragging = dragging.clone();
+        let overlay = overlay.clone();
+        control.knob.connect_dragging(move |active| {
+            dragging.set(active);
+            if !active {
+                overlay.queue_allocate();
+            }
+        });
+    }
     // Sit just below the node, or above it near the bottom, inside the graph.
     overlay.connect_get_child_position({
         let model = Rc::downgrade(model);
@@ -3764,6 +3821,12 @@ fn build_band_editor(
             }
             let model = model.upgrade()?;
             let index = model.selected_filter.get()?;
+            if (hovered.get() || dragging.get())
+                && let Some((placed_index, rectangle)) = placed.get()
+                && placed_index == index
+            {
+                return Some(rectangle);
+            }
             let (frequency, gain_db) = model
                 .document
                 .borrow()
@@ -3786,12 +3849,14 @@ fn build_band_editor(
             } else {
                 (y - 20.0 - panel_height).max(8.0)
             };
-            Some(gtk::gdk::Rectangle::new(
+            let rectangle = gtk::gdk::Rectangle::new(
                 left as i32,
                 top as i32,
                 panel_width as i32,
                 panel_height as i32,
-            ))
+            );
+            placed.set(Some((index, rectangle)));
+            Some(rectangle)
         }
     });
     let syncing = Rc::new(Cell::new(false));
@@ -4067,6 +4132,8 @@ fn rebuild_filter_list(
                         .set((button.is_active()).then_some(index));
                     sync_band_ui(&model);
                     graph.queue_draw();
+                    // Arrow keys edit the band just selected.
+                    graph.grab_focus();
                 }
             }
         });

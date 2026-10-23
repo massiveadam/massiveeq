@@ -17,6 +17,9 @@ pub enum Taper {
     Log,
 }
 
+/// Told `true` when a knob drag starts and `false` when it ends.
+type DragWatcher = Box<dyn Fn(bool)>;
+
 mod imp {
     use super::*;
 
@@ -28,6 +31,9 @@ mod imp {
         /// Fill from the centre rather than from the minimum (gain, tilt).
         pub bipolar: Cell<bool>,
         pub drag_start: Cell<f64>,
+        /// Pointer height in window coordinates when the drag began.
+        pub drag_origin: Cell<Option<f64>>,
+        pub drag_watchers: RefCell<Vec<DragWatcher>>,
     }
 
     #[glib::object_subclass]
@@ -47,16 +53,20 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
             let knob = self.obj();
+            // Reachable with Tab, but a click leaves focus where it was, so
+            // the graph's arrow keys keep editing the selected band.
             knob.set_focusable(true);
-            knob.set_focus_on_click(true);
+            knob.set_focus_on_click(false);
 
             let drag = gtk::GestureDrag::new();
             drag.connect_drag_begin({
                 let knob = knob.downgrade();
-                move |_, _, _| {
+                move |gesture, _, _| {
                     if let Some(knob) = knob.upgrade() {
-                        knob.imp().drag_start.set(knob.fraction());
-                        knob.grab_focus();
+                        let imp = knob.imp();
+                        imp.drag_start.set(knob.fraction());
+                        imp.drag_origin.set(window_y(gesture));
+                        knob.notify_dragging(true);
                     }
                 }
             });
@@ -66,6 +76,13 @@ mod imp {
                     let Some(knob) = knob.upgrade() else {
                         return;
                     };
+                    // Measure travel in window coordinates: the knob may sit
+                    // on a panel that moves, and a widget-relative offset
+                    // would then feed the knob's own movement back into it.
+                    let dy = match (knob.imp().drag_origin.get(), window_y(gesture)) {
+                        (Some(origin), Some(now)) => now - origin,
+                        _ => dy,
+                    };
                     let fine = gesture
                         .current_event_state()
                         .contains(gtk::gdk::ModifierType::SHIFT_MASK);
@@ -74,6 +91,20 @@ mod imp {
                     knob.set_fraction(knob.imp().drag_start.get() - dy / travel);
                 }
             });
+            let done = std::rc::Rc::new({
+                let knob = knob.downgrade();
+                move || {
+                    if let Some(knob) = knob.upgrade() {
+                        knob.imp().drag_origin.set(None);
+                        knob.notify_dragging(false);
+                    }
+                }
+            });
+            drag.connect_drag_end({
+                let done = done.clone();
+                move |_, _, _| done()
+            });
+            drag.connect_cancel(move |_, _| done());
             knob.add_controller(drag);
 
             let scroll = gtk::EventControllerScroll::new(
@@ -164,6 +195,12 @@ mod imp {
     }
 }
 
+/// The pointer's height in the window's surface coordinates.
+fn window_y(gesture: &gtk::GestureDrag) -> Option<f64> {
+    let event = gesture.last_event(gesture.current_sequence().as_ref())?;
+    event.position().map(|(_, y)| y)
+}
+
 glib::wrapper! {
     pub struct Knob(ObjectSubclass<imp::Knob>)
         @extends gtk::Widget,
@@ -248,6 +285,24 @@ impl Knob {
             adjustment.upper(),
             self.imp().taper.get(),
         ));
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.imp().drag_origin.get().is_some()
+    }
+
+    /// Call `callback` with `true` when a drag starts and `false` when it ends.
+    pub fn connect_dragging(&self, callback: impl Fn(bool) + 'static) {
+        self.imp()
+            .drag_watchers
+            .borrow_mut()
+            .push(Box::new(callback));
+    }
+
+    fn notify_dragging(&self, dragging: bool) {
+        for watcher in self.imp().drag_watchers.borrow().iter() {
+            watcher(dragging);
+        }
     }
 
     fn step(&self, amount: f64) {
