@@ -170,6 +170,34 @@ pub fn attenuate_for_comparison(
     Ok(())
 }
 
+/// Fixes a compiled profile's output gain at `gain_db` instead of its
+/// perceptual match and safety. The tone generator holds the gain from when
+/// the tone started, so changing one band changes only that band's level.
+/// `headroom_db` is how far below full scale the test signal itself stays:
+/// the gain still drops if the EQ peak would otherwise clip that signal.
+pub fn hold_output_gain(
+    profile: &mut CompiledProfile,
+    gain_db: f64,
+    headroom_db: f64,
+) -> Result<(), CompileError> {
+    if !gain_db.is_finite() || !headroom_db.is_finite() {
+        return Err(CompileError::NonFiniteResponse);
+    }
+    let analysis = &mut profile.analysis;
+    let peak = analysis.final_peak_db - analysis.effective_gain_db;
+    let ceiling = -1.0 - peak + headroom_db.max(0.0);
+    let effective = gain_db.min(ceiling);
+    let change = db_to_linear(effective - analysis.effective_gain_db) as f32;
+    for channel in &mut profile.channels {
+        channel.gain_linear *= change;
+    }
+    analysis.safety_attenuation_db = effective - analysis.match_gain_db - analysis.manual_trim_db;
+    analysis.effective_gain_db = effective;
+    analysis.final_peak_db = peak + effective;
+    analysis.headroom_limited = gain_db > ceiling + 0.005;
+    Ok(())
+}
+
 pub fn perceived_output_level_db(profile: &CompiledProfile) -> f64 {
     profile.analysis.effective_gain_db - profile.analysis.match_gain_db
 }
@@ -546,6 +574,32 @@ mod tests {
             compile_profile(&profile, &CompileOptions::stereo(48_000, 256, "/tmp")).unwrap();
         assert!(compiled.analysis.final_peak_db <= -0.999);
         assert!(compiled.analysis.safety_attenuation_db < -50.0);
+    }
+
+    #[test]
+    fn held_gain_ignores_matching_until_the_test_signal_would_clip() {
+        let options = CompileOptions::stereo(48_000, 1024, ".");
+        let flat = compile_profile(&parse_text("Flat", ""), &options).unwrap();
+        let held = flat.analysis.effective_gain_db;
+        let compile = |text: &str| compile_profile(&parse_text("Edit", text), &options).unwrap();
+        // Normally a boost turns everything else down; held, it does not.
+        let mut boosted = compile("Filter: ON PK Fc 3000 Hz Gain 6 dB Q 2");
+        assert!(boosted.analysis.effective_gain_db < held - 1.0);
+        hold_output_gain(&mut boosted, held, 11.0).unwrap();
+        assert!((boosted.analysis.effective_gain_db - held).abs() < 1e-9);
+        assert!(!boosted.analysis.headroom_limited);
+        let gain = boosted.channels[0].gain_linear as f64;
+        assert!((20.0 * gain.log10() - held).abs() < 1e-4);
+        // A cut leaves the rest of the range where it was, too.
+        let mut cut = compile("Filter: ON PK Fc 3000 Hz Gain -6 dB Q 2");
+        hold_output_gain(&mut cut, held, 11.0).unwrap();
+        assert!((cut.analysis.effective_gain_db - held).abs() < 1e-9);
+        // Past the signal's own headroom, the gain gives way.
+        let mut huge = compile("Filter: ON PK Fc 3000 Hz Gain 20 dB Q 2");
+        hold_output_gain(&mut huge, held, 11.0).unwrap();
+        assert!(huge.analysis.headroom_limited);
+        assert!(huge.analysis.final_peak_db <= 10.0 + 1e-6);
+        assert!(hold_output_gain(&mut cut, f64::NAN, 11.0).is_err());
     }
 
     #[test]

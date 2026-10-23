@@ -76,6 +76,10 @@ mod imp {
                     let Some(knob) = knob.upgrade() else {
                         return;
                     };
+                    // Claim the press once it moves, so a window handle around
+                    // the knob (the footer bar) cannot start moving the window.
+                    // Claiming at the press itself would deny double-click reset.
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
                     // Measure travel in window coordinates: the knob may sit
                     // on a panel that moves, and a widget-relative offset
                     // would then feed the knob's own movement back into it.
@@ -408,6 +412,9 @@ impl LabeledKnob {
         knob.update_property(&[gtk::accessible::Property::Label(caption)]);
         let value = gtk::Label::new(Some(&format(knob.value())));
         value.add_css_class("knob-value");
+        // A fixed width, so "-12.0" does not widen the column and shift the
+        // footer under a knob being dragged.
+        value.set_width_chars(6);
         let label = gtk::Label::new(Some(&caption.to_uppercase()));
         label.add_css_class("knob-caption");
         root.append(&knob);

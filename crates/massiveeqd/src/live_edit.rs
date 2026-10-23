@@ -22,6 +22,9 @@ pub struct Request {
     pub reference: Option<Reference>,
     #[serde(default)]
     pub hear_reference: bool,
+    /// Output gain to keep while the tone generator plays.
+    #[serde(default)]
+    pub hold_gain_db: Option<f64>,
 }
 
 pub type ReferenceCache =
@@ -33,6 +36,7 @@ pub struct Session {
     pub trim: f64,
     pub reference: Option<(ProfileDocument, f64)>,
     pub hear_reference: bool,
+    pub hold_gain_db: Option<f64>,
     pub renewed: Instant,
     pub reference_cache: ReferenceCache,
 }
@@ -70,11 +74,18 @@ impl Session {
             !request.hear_reference || reference.is_some(),
             "no starting sound captured"
         );
+        ensure!(
+            request
+                .hold_gain_db
+                .is_none_or(|held| held.is_finite() && (-60.0..=60.0).contains(&held)),
+            "invalid held gain"
+        );
         Ok(Self {
             draft,
             trim: request.trim,
             reference,
             hear_reference: request.hear_reference,
+            hold_gain_db: request.hold_gain_db,
             renewed: Instant::now(),
             reference_cache: Default::default(),
         })
@@ -100,6 +111,7 @@ mod tests {
             trim,
             reference: None,
             hear_reference: false,
+            hold_gain_db: None,
         };
         let edit = Session::parse(
             &storage,
@@ -116,6 +128,12 @@ mod tests {
         assert!(!edit.expired(edit.renewed + Duration::from_secs(4)));
         assert!(edit.expired(edit.renewed + LIVE_TIMEOUT));
         assert!(Session::parse(&storage, &library, &profile.id, request("", f64::NAN)).is_err());
+        let held = |value| Request {
+            hold_gain_db: Some(value),
+            ..request("", 0.0)
+        };
+        assert!(Session::parse(&storage, &library, &profile.id, held(-3.5)).is_ok());
+        assert!(Session::parse(&storage, &library, &profile.id, held(f64::INFINITY)).is_err());
         assert!(
             Session::parse(
                 &storage,

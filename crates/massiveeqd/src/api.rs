@@ -89,6 +89,7 @@ impl Service {
                 && previous.trim == edit.trim
                 && previous.reference == edit.reference
                 && previous.hear_reference == edit.hear_reference
+                && previous.hold_gain_db == edit.hold_gain_db
             {
                 previous.renewed = std::time::Instant::now();
                 return Ok(());

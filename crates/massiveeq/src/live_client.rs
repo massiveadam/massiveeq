@@ -24,6 +24,9 @@ pub struct Draft {
     pub trim: f64,
     pub reference: Option<Reference>,
     pub hear_reference: bool,
+    /// Output gain the service keeps while the tone generator plays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_gain_db: Option<f64>,
     #[serde(skip)]
     pub save: bool,
 }
@@ -274,6 +277,7 @@ mod tests {
             trim: 0.0,
             reference: None,
             hear_reference: false,
+            hold_gain_db: None,
             save,
         }
     }

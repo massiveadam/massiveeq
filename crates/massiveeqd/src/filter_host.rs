@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use massiveeq_core::{COMPARISON_BYPASS_ID, ComparisonSet, DeviceInfo, Library, Storage};
 use massiveeq_dsp::{
     CompileOptions, CompiledProfile, ProfileProcessor, attenuate_for_comparison,
-    compile_bypass_with_gain, compile_profile, perceived_output_level_db, widen_input,
+    compile_bypass_with_gain, compile_profile, hold_output_gain, perceived_output_level_db,
+    widen_input,
 };
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
@@ -347,6 +348,14 @@ fn compile_output_with_edits(
             settings.quantum,
             device.channels,
         );
+        // While the tone generator plays, the gain stays where it was when
+        // the tone started, for the starting sound too: A/B on a tone is then
+        // exactly the difference between the two curves at that frequency.
+        let tone_headroom = -1.0 - f64::from(crate::tone::MAX_LEVEL_DB);
+        if let Some(held) = edit.hold_gain_db {
+            hold_output_gain(&mut current, held, tone_headroom)?;
+            revision ^= stable_hash(&format!("hold-gain|{held}")).rotate_left(29);
+        }
         if let Some((reference, trim)) = &edit.reference {
             let mut original = compile_reference(
                 edit,
@@ -363,11 +372,15 @@ fn compile_output_with_edits(
             let width = current.input_channels.max(original.input_channels);
             widen_input(&mut current, width)?;
             widen_input(&mut original, width)?;
-            let current_level = perceived_output_level_db(&current);
-            let reference_level = perceived_output_level_db(&original);
-            let target = current_level.min(reference_level).min(0.0);
-            attenuate_for_comparison(&mut current, target - current_level)?;
-            attenuate_for_comparison(&mut original, target - reference_level)?;
+            if let Some(held) = edit.hold_gain_db {
+                hold_output_gain(&mut original, held, tone_headroom)?;
+            } else {
+                let current_level = perceived_output_level_db(&current);
+                let reference_level = perceived_output_level_db(&original);
+                let target = current_level.min(reference_level).min(0.0);
+                attenuate_for_comparison(&mut current, target - current_level)?;
+                attenuate_for_comparison(&mut original, target - reference_level)?;
+            }
             revision ^= profile_revision(
                 reference,
                 *trim,
@@ -871,6 +884,7 @@ mod tests {
                     trim: 0.0,
                 }),
                 hear_reference: false,
+                hold_gain_db: None,
             },
         )
         .unwrap();

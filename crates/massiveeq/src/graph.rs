@@ -285,20 +285,24 @@ fn draw_filter_points(
             std::f64::consts::TAU,
         );
         let _ = cr.fill_preserve();
+        let ear = match filter.channels {
+            ChannelSelection::Left => (0.33, 0.68, 0.94),
+            ChannelSelection::Right => (0.93, 0.31, 0.18),
+            ChannelSelection::All => (0.93, 0.92, 0.90),
+        };
         let outline = if is_selected {
             (0.93, 0.92, 0.90)
+        } else if filter.channels == ChannelSelection::All {
+            (0.72, 0.74, 0.74)
         } else {
-            match filter.channels {
-                ChannelSelection::Left => (0.33, 0.68, 0.94),
-                ChannelSelection::Right => (0.93, 0.31, 0.18),
-                ChannelSelection::All => (0.72, 0.74, 0.74),
-            }
+            ear
         };
         cr.set_source_rgba(outline.0, outline.1, outline.2, 0.98);
         cr.set_line_width(if is_selected { 2.3 } else { 1.5 });
         let _ = cr.stroke();
 
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.96);
+        // The number takes the band's ear colour, as its chip does.
+        cr.set_source_rgba(ear.0, ear.1, ear.2, 0.98);
         cr.set_font_size(10.0);
         cr.select_font_face(
             "Monospace",

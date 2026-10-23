@@ -16,11 +16,11 @@ node: low shelf, peak, or high shelf, the ears it applies to, frequency, gain,
 and Q knobs, an on/off switch, and delete. The footer lists every band, with
 the **Bass**, **Tilt**, and **Output** knobs beside them.
 
-## LISTEN: the tone finder
+## TONE GEN: the tone finder
 
-![LISTEN with the sweep and signal menu open](screenshots/listen-tone-finder.png)
+![TONE GEN with the sweep and signal menu open](screenshots/listen-tone-finder.png)
 
-**LISTEN** plays a sine or band of pink noise through the current EQ, and a
+**TONE GEN** plays a sine or band of pink noise through the current EQ, and a
 marker follows it on the graph. The menu beside it holds the sweep, level,
 signal, ears, and one-click corrections at the held frequency.
 

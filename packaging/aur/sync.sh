@@ -29,22 +29,28 @@ git clone --quiet "$fetch_url" "$scratch/aur"
 mkdir "$scratch/export"
 "$repo_root/packaging/aur/export.sh" "$scratch/export"
 
-normalized_copy() {
-  local source_dir=$1
-  local output_dir=$2
-
-  mkdir -p "$output_dir"
-  sed 's/^pkgver=.*/pkgver=__VCS_VERSION__/' \
-    "$source_dir/PKGBUILD" > "$output_dir/PKGBUILD"
-  sed 's/^[[:space:]]*pkgver = .*/\tpkgver = __VCS_VERSION__/' \
-    "$source_dir/.SRCINFO" > "$output_dir/.SRCINFO"
-  cp "$source_dir/massiveeq.install" "$output_dir/massiveeq.install"
+# Every new commit on main is published with its VCS version, so update
+# checkers that only compare AUR versions (cachy-update, arch-update, and AUR
+# helpers without devel checks) see a new MassiveEQ like any other package.
+srcinfo_version() {
+  sed -n 's/^[[:space:]]*pkgver = //p' "$1/.SRCINFO" | head -n 1
 }
+current_version=$(srcinfo_version "$scratch/aur")
+export_version=$(srcinfo_version "$scratch/export")
 
-normalized_copy "$scratch/aur" "$scratch/current-normalized"
-normalized_copy "$scratch/export" "$scratch/export-normalized"
+if [[ -n "$current_version" ]] && (( $(vercmp "$export_version" "$current_version") < 0 )); then
+  # A shallow checkout counts one commit; never publish a version that
+  # sorts below what users already have.
+  printf 'Refusing to publish %s below the AUR version %s.\n' \
+    "$export_version" "$current_version" >&2
+  exit 1
+fi
 
-if diff -qr "$scratch/current-normalized" "$scratch/export-normalized" >/dev/null; then
+unchanged=true
+for file in PKGBUILD .SRCINFO massiveeq.install; do
+  cmp -s "$scratch/aur/$file" "$scratch/export/$file" || unchanged=false
+done
+if [[ "$unchanged" == true ]]; then
   printf 'AUR package metadata is already current.\n'
   exit 0
 fi
@@ -81,6 +87,6 @@ git -C "$scratch/aur" config user.name "${AUR_GIT_NAME:-massiveadam}"
 git -C "$scratch/aur" config user.email \
   "${AUR_GIT_EMAIL:-massiveadam@users.noreply.github.com}"
 git -C "$scratch/aur" commit --quiet -m \
-  "${AUR_COMMIT_MESSAGE:-Sync packaging from MassiveEQ upstream}"
+  "${AUR_COMMIT_MESSAGE:-Update to $export_version}"
 git -C "$scratch/aur" remote set-url origin "$push_url"
 git -C "$scratch/aur" push origin HEAD:master

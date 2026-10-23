@@ -46,6 +46,10 @@ struct Model {
     bank_names_dirty: Cell<bool>,
     unsaved: Cell<bool>,
     hear_reference: Cell<bool>,
+    /// Output gain held while the tone generator plays, taken when it
+    /// started, so a band change is heard as itself rather than also moving
+    /// the whole output's level through matching and safety.
+    tone_hold: Cell<Option<f64>>,
     live_worker: live_client::LiveClient,
     live_revision: Cell<u64>,
     pending_live: RefCell<Option<gtk::glib::SourceId>>,
@@ -196,6 +200,7 @@ fn build_ui(app: &adw::Application) {
         bank_names_dirty: Cell::new(false),
         unsaved: Cell::new(false),
         hear_reference: Cell::new(false),
+        tone_hold: Cell::new(None),
         live_worker: live_client::LiveClient::new(client.clone()),
         live_revision: Cell::new(0),
         pending_live: RefCell::new(None),
@@ -636,19 +641,27 @@ fn build_ui(app: &adw::Application) {
     main_stack.add_named(&text_page, Some("text"));
 
     // Band chips select bands; the panel on the graph edits them.
+    // Chips wrap onto a second row when they outgrow the footer; past two
+    // rows the strip scrolls rather than growing the footer.
     let filter_list = gtk::FlowBox::new();
-    filter_list.set_orientation(gtk::Orientation::Vertical);
+    filter_list.set_orientation(gtk::Orientation::Horizontal);
     filter_list.set_min_children_per_line(1);
-    filter_list.set_max_children_per_line(1);
+    filter_list.set_max_children_per_line(64);
     filter_list.set_selection_mode(gtk::SelectionMode::None);
     filter_list.set_column_spacing(6);
+    filter_list.set_row_spacing(BAND_CHIP_SPACING as u32);
     filter_list.set_valign(gtk::Align::Center);
     filter_list.set_halign(gtk::Align::Start);
     filter_list.add_css_class("band-chips");
     let chips_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Never)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(2 * BAND_CHIP_HEIGHT + BAND_CHIP_SPACING)
         .propagate_natural_width(true)
+        // Not from the chips: the add button follows the last chip.
+        .hexpand(false)
+        .valign(gtk::Align::Center)
         .child(&filter_list)
         .build();
     let add_filter_button = gtk::Button::from_icon_name("list-add-symbolic");
@@ -663,6 +676,7 @@ fn build_ui(app: &adw::Application) {
         &graph,
         &filter_list,
         &graph_overlay,
+        &add_filter_button,
     );
 
     let convolution_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -769,7 +783,7 @@ fn build_ui(app: &adw::Application) {
     let listen_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
     listen_box.set_size_request(400, -1);
     listen_box.append(&graph_listen);
-    // LISTEN in the footer plays and stops; the page's own button would repeat it.
+    // TONE GEN in the footer plays and stops; the page's own button would repeat it.
     tone_ui.play.set_visible(false);
     listen_box.append(&tone_page);
     let listen_popover = gtk::Popover::new();
@@ -799,7 +813,6 @@ fn build_ui(app: &adw::Application) {
     let bands_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     bands_row.set_hexpand(true);
     bands_row.append(&chips_scroll);
-    bands_row.append(&add_filter_button);
     footer.append(&bands_row);
     let footer_end = gtk::Box::new(gtk::Orientation::Horizontal, 16);
     footer_end.set_valign(gtk::Align::Center);
@@ -921,11 +934,14 @@ fn build_ui(app: &adw::Application) {
                     if let Some(error) = result.error {
                         status.set_text(&error);
                     } else if result.saved.is_some() {
-                        status.set_text("Saved and applied · comparison level matched");
+                        status.set_text(if model.tone_hold.get().is_some() {
+                            "Saved and applied · level held for the tone"
+                        } else {
+                            "Saved and applied · comparison level matched"
+                        });
                     }
                     if let Some(analysis) = result.analysis {
-                        set_analysis_label(&analysis_label, &analysis);
-                        store_service_analysis(&model, analysis);
+                        store_service_analysis(&model, analysis, &analysis_label);
                         graph.queue_draw();
                     }
                 }
@@ -1363,8 +1379,7 @@ fn wire_actions(
                         rebuild_filter_list(&list, &document, &model, &buffer, &graph);
                         update_convolution_ui(&ui, &document);
                         if let Ok(analysis) = model.client.analyze(&id) {
-                            set_analysis_label(&analysis_label, &analysis);
-                            store_service_analysis(&model, analysis);
+                            store_service_analysis(&model, analysis, &analysis_label);
                         }
                         graph.queue_draw();
                         status.set_text("Convolution active");
@@ -1954,9 +1969,14 @@ fn wire_actions(
     // Where and when empty graph space was last pressed: a second press there
     // soon after is a double-click, which adds a band.
     let empty_press = Rc::new(Cell::new(None::<(Instant, f64, f64)>));
+    // The band last pressed and when: pressing it again soon deletes it.
+    let point_press = Rc::new(Cell::new(None::<(Instant, usize)>));
     let gesture = gtk::GestureDrag::new();
     gesture.connect_drag_begin({
         let empty_press = empty_press.clone();
+        let point_press = point_press.clone();
+        let buffer = buffer.clone();
+        let list = filter_list.clone();
         let tone_drag = tone_drag.clone();
         let model = model.clone();
         let state = drag_state.clone();
@@ -2005,10 +2025,32 @@ fn wire_actions(
                     let db = ((bx - x).powi(2) + (by - y).powi(2)).sqrt();
                     da.total_cmp(&db)
                 });
+            let double_click =
+                Duration::from_millis(gtk::Settings::default().map_or(400, |settings| {
+                    settings.gtk_double_click_time().max(1) as u64
+                }));
+            let now = Instant::now();
             if let Some((index, filter)) = closest {
                 let (point_x, point_y) =
                     graph::filter_point_position(filter.frequency, filter.gain_db, width, height);
                 if ((point_x - x).powi(2) + (point_y - y).powi(2)).sqrt() <= 34.0 {
+                    // Double-clicking a band deletes it, as double-clicking
+                    // empty space adds one.
+                    let again = point_press.take().is_some_and(|(at, last)| {
+                        last == index && now.duration_since(at) <= double_click
+                    });
+                    if again {
+                        if remove_band(&model, &buffer, &graph, &list, index) {
+                            model.selected_filter.set(None);
+                            sync_band_ui(&model);
+                            status.set_text(&format!(
+                                "Deleted band {} · Ctrl+Z restores it",
+                                index + 1
+                            ));
+                        }
+                        return;
+                    }
+                    point_press.set(Some((now, index)));
                     *state.borrow_mut() = Some((index, filter.frequency, filter.gain_db));
                     model.selected_filter.set(Some(index));
                     sync_band_ui(&model);
@@ -2017,13 +2059,9 @@ fn wire_actions(
                 }
             }
 
-            let double_click = gtk::Settings::default().map_or(400, |settings| {
-                settings.gtk_double_click_time().max(1) as u64
-            });
-            let now = Instant::now();
+            point_press.set(None);
             let is_double = empty_press.take().is_some_and(|(at, px, py)| {
-                now.duration_since(at) <= Duration::from_millis(double_click)
-                    && (px - x).hypot(py - y) <= 8.0
+                now.duration_since(at) <= double_click && (px - x).hypot(py - y) <= 8.0
             });
             if !is_double {
                 // A single click on empty space deselects, as in plugin EQs.
@@ -2133,12 +2171,42 @@ fn wire_actions(
     });
     graph.add_controller(gesture);
 
+    // Right-click a band to delete it.
+    let secondary = gtk::GestureClick::new();
+    secondary.set_button(gtk::gdk::BUTTON_SECONDARY);
+    secondary.connect_pressed({
+        let model = model.clone();
+        let buffer = buffer.clone();
+        let list = filter_list.clone();
+        let graph = graph.clone();
+        let status = status.clone();
+        move |click, _, x, y| {
+            let hit = model.document.borrow().as_ref().and_then(|document| {
+                band_at(document, x, y, graph.width() as f64, graph.height() as f64)
+            });
+            let Some(index) = hit else {
+                return;
+            };
+            click.set_state(gtk::EventSequenceState::Claimed);
+            let was_selected = model.selected_filter.get() == Some(index);
+            if remove_band(&model, &buffer, &graph, &list, index) {
+                if was_selected {
+                    model.selected_filter.set(None);
+                    sync_band_ui(&model);
+                }
+                status.set_text(&format!("Deleted band {} · Ctrl+Z restores it", index + 1));
+            }
+        }
+    });
+    graph.add_controller(secondary);
+
     let keyboard = gtk::EventControllerKey::new();
     // The last nudge key, when it was pressed, and how many repeats in a row:
     // holding a key speeds it up.
     let held = Rc::new(Cell::new(None::<(gtk::gdk::Key, Instant, u32)>));
     keyboard.connect_key_pressed({
         let held = held.clone();
+        let list = filter_list.clone();
         let model = model.clone();
         let buffer = buffer.clone();
         let graph = graph.clone();
@@ -2148,6 +2216,18 @@ fn wire_actions(
                 .intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK)
             {
                 return gtk::glib::Propagation::Proceed;
+            }
+            if matches!(
+                key,
+                gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete | gtk::gdk::Key::BackSpace
+            ) {
+                let Some(index) = model.selected_filter.get() else {
+                    return gtk::glib::Propagation::Proceed;
+                };
+                if remove_band(&model, &buffer, &graph, &list, index) {
+                    status.set_text(&format!("Deleted band {} · Ctrl+Z restores it", index + 1));
+                }
+                return gtk::glib::Propagation::Stop;
             }
             let direction = match key {
                 gtk::gdk::Key::Up => graph::NudgeDirection::Up,
@@ -2297,6 +2377,8 @@ fn load_profile(
     if let Some(timer) = model.pending_live.borrow_mut().take() {
         timer.remove();
     }
+    // A tone left playing holds the next profile's own match, not this one's.
+    model.tone_hold.set(None);
     if let Some(id) = model.current_id.borrow().as_ref() {
         model.live_worker.end(id);
     }
@@ -2326,8 +2408,7 @@ fn load_profile(
     let curves = model.client.curves(&profile.id).unwrap_or_default();
     update_curve_context(model, curves);
     if let Ok(analysis) = model.client.analyze(&profile.id) {
-        set_analysis_label(analysis_label, &analysis);
-        store_service_analysis(model, analysis);
+        store_service_analysis(model, analysis, analysis_label);
         graph.queue_draw();
     }
     model.loading.set(false);
@@ -2960,6 +3041,7 @@ fn wire_tone(
     ui.play.connect_toggled({
         let model = model.clone();
         let push = push.clone();
+        let analysis_label = analysis_label.clone();
         move |play| {
             play.set_icon_name(if play.is_active() {
                 "media-playback-stop-symbolic"
@@ -2970,6 +3052,19 @@ fn wire_tone(
                 model.live_worker.stop_tone();
             }
             push();
+            // Hold the gain from now until the tone stops, then resume matching.
+            model.tone_hold.set(None);
+            tone_hold(&model);
+            let preview = model
+                .document
+                .borrow()
+                .as_ref()
+                .map(|document| preview_analysis(&model, document));
+            if let Some(preview) = preview {
+                set_analysis_label(&analysis_label, &preview);
+                *model.analysis.borrow_mut() = Some(preview);
+            }
+            schedule_live(&model);
         }
     });
     for segmented in [&ui.signal, &ui.band, &ui.ears] {
@@ -3130,11 +3225,14 @@ fn build_graph_tone(tone: &Rc<ToneUi>) -> (adw::WrapBox, GraphToneUi) {
     {
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         content.append(&gtk::Image::from_icon_name("audio-volume-high-symbolic"));
-        content.append(&gtk::Label::new(Some("LISTEN")));
+        content.append(&gtk::Label::new(Some("TONE GEN")));
         play.set_child(Some(&content));
     }
-    play.set_tooltip_text(Some("Play a tone at the graph's tone line"));
-    play.update_property(&[gtk::accessible::Property::Label("Listen to graph tone")]);
+    play.set_tooltip_text(Some(
+        "Play a test tone at the graph's tone line. The output level holds while it plays, \
+         so a band change sounds like exactly that change. Pause music first.",
+    ));
+    play.update_property(&[gtk::accessible::Property::Label("Tone generator")]);
     let sweep = gtk::ToggleButton::with_label("Sweep");
     sweep.set_tooltip_text(Some(
         "Move a sine tone upward through the graph. Turn Sweep off to hold the current frequency.",
@@ -3316,6 +3414,7 @@ fn submit_live(model: &Rc<Model>, save: bool) {
             trim: snapshot.trim,
         });
     let hear_reference = reference.is_some() && model.hear_reference.get();
+    let hold_gain_db = tone_hold(model);
     let key = serde_json::to_string(&(
         &id,
         &document.name,
@@ -3323,6 +3422,7 @@ fn submit_live(model: &Rc<Model>, save: bool) {
         model.manual_trim.get(),
         &reference,
         hear_reference,
+        hold_gain_db,
     ))
     .unwrap_or_default();
     let revision = if model.last_submitted.borrow().as_ref() != Some(&key) {
@@ -3351,8 +3451,49 @@ fn submit_live(model: &Rc<Model>, save: bool) {
         trim: model.manual_trim.get(),
         reference,
         hear_reference,
+        hold_gain_db,
         save,
     });
+}
+
+/// The gain to hold while the tone generator plays: taken from the open
+/// profile's analysis the first time it is asked for after the tone starts.
+fn tone_hold(model: &Model) -> Option<f64> {
+    let playing = model
+        .graph_tone
+        .borrow()
+        .as_ref()
+        .is_some_and(|ui| ui.tone.play.is_active());
+    if !playing {
+        model.tone_hold.set(None);
+    } else if model.tone_hold.get().is_none() {
+        model.tone_hold.set(
+            model
+                .analysis
+                .borrow()
+                .as_ref()
+                .map(|analysis| analysis.effective_gain_db),
+        );
+    }
+    LEVEL_HELD.with(|held| held.set(model.tone_hold.get().is_some()));
+    model.tone_hold.get()
+}
+
+/// How far below full scale the loudest tone plays (the service's limit is
+/// -12 dBFS), so how far a held gain may exceed music's clipping safety.
+const TONE_HEADROOM_DB: f64 = 11.0;
+
+/// Shows the service's held gain in an analysis, as `hold_output_gain` does.
+fn apply_tone_hold(model: &Model, analysis: &mut ProfileAnalysis) {
+    let Some(held) = model.tone_hold.get() else {
+        return;
+    };
+    let peak = analysis.left.peak_db.max(analysis.right.peak_db);
+    let ceiling = -1.0 - peak + TONE_HEADROOM_DB;
+    analysis.effective_gain_db = held.min(ceiling);
+    analysis.safety_attenuation_db =
+        analysis.effective_gain_db - analysis.match_gain_db - analysis.manual_trim_db;
+    analysis.headroom_limited = held > ceiling + 0.005;
 }
 
 fn schedule_live(model: &Rc<Model>) {
@@ -3651,6 +3792,8 @@ fn build_listening_controls(
 struct BandTile {
     select: gtk::ToggleButton,
     glyph: gtk::DrawingArea,
+    /// The band number, coloured by ear as its node on the graph is.
+    number: gtk::Label,
     label: gtk::Label,
 }
 
@@ -3665,6 +3808,8 @@ struct BandUi {
     q: knob::Knob,
     enabled: gtk::ToggleButton,
     tiles: Vec<BandTile>,
+    /// Add band, kept as the last item among the chips so it wraps with them.
+    add: gtk::Button,
     syncing: Rc<Cell<bool>>,
 }
 
@@ -3675,6 +3820,9 @@ const BAND_KINDS: [FilterKind; 3] = [
     FilterKind::Peaking,
     FilterKind::HighShelf,
 ];
+/// Chip height and the gap between chip rows, matching the CSS.
+const BAND_CHIP_HEIGHT: i32 = 30;
+const BAND_CHIP_SPACING: i32 = 6;
 const BAND_KIND_LABELS: [&str; 3] = ["LS", "PK", "HS"];
 const BAND_KIND_NAMES: [&str; 3] = ["Low shelf", "Peak", "High shelf"];
 
@@ -3699,6 +3847,7 @@ fn build_band_editor(
     graph: &gtk::DrawingArea,
     list: &gtk::FlowBox,
     overlay: &gtk::Overlay,
+    add: &gtk::Button,
 ) {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root.add_css_class("band-panel");
@@ -3940,29 +4089,9 @@ fn build_band_editor(
         let graph = graph.clone();
         let list = list.clone();
         move |_| {
-            let Some(index) = model.selected_filter.get() else {
-                return;
-            };
-            let snapshot = {
-                let mut document = model.document.borrow_mut();
-                let Some(document) = document.as_mut() else {
-                    return;
-                };
-                if index >= document.filters.len() {
-                    return;
-                }
-                document.filters.remove(index);
-                model.selected_filter.set(if document.filters.is_empty() {
-                    None
-                } else {
-                    Some(index.min(document.filters.len() - 1))
-                });
-                document.clone()
-            };
-            set_editor_text(&model, &buffer, &serialize_profile(&snapshot));
-            *model.analysis.borrow_mut() = Some(preview_analysis(&model, &snapshot));
-            rebuild_filter_list(&list, &snapshot, &model, &buffer, &graph);
-            graph.queue_draw();
+            if let Some(index) = model.selected_filter.get() {
+                remove_band(&model, &buffer, &graph, &list, index);
+            }
         }
     });
     *model.bands.borrow_mut() = Some(BandUi {
@@ -3975,8 +4104,64 @@ fn build_band_editor(
         q: q.knob,
         enabled,
         tiles: Vec::new(),
+        add: add.clone(),
         syncing,
     });
+}
+
+/// The enabled band whose node is under (x, y) on the graph, if any.
+fn band_at(document: &ProfileDocument, x: f64, y: f64, width: f64, height: f64) -> Option<usize> {
+    let width = width.max(1.0);
+    let height = height.max(1.0);
+    document
+        .filters
+        .iter()
+        .enumerate()
+        .filter(|(_, filter)| filter.enabled)
+        .map(|(index, filter)| {
+            let (px, py) =
+                graph::filter_point_position(filter.frequency, filter.gain_db, width, height);
+            (index, (px - x).hypot(py - y))
+        })
+        .filter(|(_, distance)| *distance <= 16.0)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(index, _)| index)
+}
+
+/// Delete one band as its own undo step. The next band (or the last) stays
+/// selected only if this one was, so deleting from the graph or a chip
+/// does not open another band's panel. Returns whether a band was removed.
+fn remove_band(
+    model: &Rc<Model>,
+    buffer: &gtk::TextBuffer,
+    graph: &gtk::DrawingArea,
+    list: &gtk::FlowBox,
+    index: usize,
+) -> bool {
+    model.history.borrow_mut().checkpoint();
+    let snapshot = {
+        let mut document = model.document.borrow_mut();
+        let Some(document) = document.as_mut() else {
+            return false;
+        };
+        if index >= document.filters.len() {
+            return false;
+        }
+        document.filters.remove(index);
+        let selected = model.selected_filter.get();
+        model.selected_filter.set(match selected {
+            _ if document.filters.is_empty() => None,
+            Some(current) if current == index => Some(index.min(document.filters.len() - 1)),
+            Some(current) if current > index => Some(current - 1),
+            other => other,
+        });
+        document.clone()
+    };
+    set_editor_text(model, buffer, &serialize_profile(&snapshot));
+    *model.analysis.borrow_mut() = Some(preview_analysis(model, &snapshot));
+    rebuild_filter_list(list, &snapshot, model, buffer, graph);
+    graph.queue_draw();
+    true
 }
 
 /// Refresh values in place, keeping keyboard focus and an in-progress knob drag.
@@ -3999,13 +4184,21 @@ fn sync_band_ui(model: &Model) {
             tile.select.add_css_class("disabled-band");
         }
         glyph::set_kind(&tile.glyph, filter.kind);
-        tile.label.set_text(&format!(
-            "{} {}",
-            index + 1,
-            compact_band_frequency(filter.frequency)
-        ));
+        tile.number.set_text(&(index + 1).to_string());
+        for (class, channels) in [
+            ("left", ChannelSelection::Left),
+            ("right", ChannelSelection::Right),
+        ] {
+            if filter.channels == channels {
+                tile.number.add_css_class(class);
+            } else {
+                tile.number.remove_css_class(class);
+            }
+        }
+        tile.label
+            .set_text(&compact_band_frequency(filter.frequency));
         tile.select.set_tooltip_text(Some(&format!(
-            "Band {} · {} · {} · {} dB · Q {:.2}{}",
+            "Band {} · {} · {} · {} dB · Q {:.2}{}\nRight-click to delete",
             index + 1,
             kind_name(filter.kind),
             format_band_frequency(filter.frequency),
@@ -4072,7 +4265,6 @@ fn rebuild_filter_list(
     buffer: &gtk::TextBuffer,
     graph: &gtk::DrawingArea,
 ) {
-    let _ = buffer;
     if profile.filters.is_empty() {
         model.selected_filter.set(None);
     } else if model
@@ -4082,7 +4274,9 @@ fn rebuild_filter_list(
     {
         model.selected_filter.set(Some(profile.filters.len() - 1));
     }
+    let add = model.bands.borrow().as_ref().map(|ui| ui.add.clone());
     // Autosaves and graph edits need value updates, not new chips.
+    let count = profile.filters.len() as i32;
     let reuse = model
         .bands
         .borrow()
@@ -4090,7 +4284,9 @@ fn rebuild_filter_list(
         .is_some_and(|ui| ui.tiles.len() == profile.filters.len())
         && !profile.filters.is_empty()
         && profile.graphic_eqs.is_empty()
-        && list.child_at_index(profile.filters.len() as i32).is_none();
+        && list.child_at_index(count).and_then(|child| child.child())
+            == add.as_ref().map(|add| add.clone().upcast())
+        && list.child_at_index(count + 1).is_none();
     if reuse {
         sync_band_ui(model);
         return;
@@ -4108,8 +4304,11 @@ fn rebuild_filter_list(
         select.add_css_class("band-chip");
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let symbol = glyph::widget(filter.kind, 20, 12);
+        let number = gtk::Label::new(None);
+        number.add_css_class("band-number");
         let label = gtk::Label::new(None);
         content.append(&symbol);
+        content.append(&number);
         content.append(&label);
         select.set_child(Some(&content));
         select.update_property(&[gtk::accessible::Property::Label(&format!(
@@ -4137,10 +4336,34 @@ fn rebuild_filter_list(
                 }
             }
         });
+        // Right-click a chip to delete its band. Deferred, since deleting
+        // rebuilds the chips, this one included.
+        let secondary = gtk::GestureClick::new();
+        secondary.set_button(gtk::gdk::BUTTON_SECONDARY);
+        secondary.connect_pressed({
+            let model = model.clone();
+            let buffer = buffer.clone();
+            let graph = graph.clone();
+            let list = list.clone();
+            move |click, _, _, _| {
+                click.set_state(gtk::EventSequenceState::Claimed);
+                let (model, buffer, graph, list) =
+                    (model.clone(), buffer.clone(), graph.clone(), list.clone());
+                gtk::glib::idle_add_local_once(move || {
+                    let was_selected = model.selected_filter.get() == Some(index);
+                    if remove_band(&model, &buffer, &graph, &list, index) && was_selected {
+                        model.selected_filter.set(None);
+                        sync_band_ui(&model);
+                    }
+                });
+            }
+        });
+        select.add_controller(secondary);
         list.insert(&select, -1);
         tiles.push(BandTile {
             select,
             glyph: symbol,
+            number,
             label,
         });
     }
@@ -4159,6 +4382,9 @@ fn rebuild_filter_list(
         let empty = gtk::Label::new(Some("Double-click the graph to add a band"));
         empty.add_css_class("level-code");
         list.insert(&empty, -1);
+    }
+    if let Some(add) = add {
+        list.insert(&add, -1);
     }
     sync_band_ui(model);
 }
@@ -5434,6 +5660,32 @@ fn install_css() {
             color: #111;
         }
 
+        /* Band numbers take their node's ear colour. */
+        label.band-number {
+            color: #b8bdbd;
+            font-weight: 700;
+        }
+
+        label.band-number.left {
+            color: #54adf0;
+        }
+
+        label.band-number.right {
+            color: #ed4f2e;
+        }
+
+        button.band-chip:checked label.band-number {
+            color: #111;
+        }
+
+        button.band-chip:checked label.band-number.left {
+            color: #1c6fae;
+        }
+
+        button.band-chip:checked label.band-number.right {
+            color: #c23718;
+        }
+
         button.band-chip.disabled-band {
             opacity: 0.45;
         }
@@ -5700,7 +5952,10 @@ fn install_css() {
 
 /// Keep the service's analysis of the open profile, and remember what its
 /// impulse response alone contributes for later live previews.
-fn store_service_analysis(model: &Model, analysis: ProfileAnalysis) {
+/// Keep the service's exact analysis (with any tone hold) and show it.
+fn store_service_analysis(model: &Model, mut analysis: ProfileAnalysis, label: &gtk::Label) {
+    apply_tone_hold(model, &mut analysis);
+    set_analysis_label(label, &analysis);
     let ir_curve = model
         .document
         .borrow()
@@ -5732,6 +5987,7 @@ fn preview_analysis(model: &Model, document: &ProfileDocument) -> ProfileAnalysi
     let mut preview =
         analyze_profile_preview(document, model.sample_rate.get(), model.manual_trim.get());
     if document.convolutions.is_empty() {
+        apply_tone_hold(model, &mut preview);
         return preview;
     }
     if let Some(ir) = model.ir_curve.borrow().as_ref() {
@@ -5777,6 +6033,8 @@ fn interpolate_response(points: &[ResponsePoint], frequency: f64) -> f64 {
 thread_local! {
     /// The preamp value on the profile tile; set with every analysis.
     static PREAMP_READOUT: RefCell<Option<gtk::Label>> = const { RefCell::new(None) };
+    /// The tone generator is holding the gain; the readout says so.
+    static LEVEL_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
 const ACCENT: &str = "#ff7a1a";
@@ -5799,10 +6057,17 @@ fn set_analysis_label(label: &gtk::Label, analysis: &ProfileAnalysis) {
             value(signed_db(right_preamp, 2))
         )
     };
+    let levels = if LEVEL_HELD.with(Cell::get) {
+        "LEVEL HELD FOR TONE GEN".to_owned()
+    } else {
+        format!(
+            "MATCH {}     SAFETY {}",
+            value(signed_db(analysis.match_gain_db, 2)),
+            value(signed_db(analysis.safety_attenuation_db, 2))
+        )
+    };
     label.set_markup(&format!(
-        "PREAMP {preamp}     MATCH {}     SAFETY {}{}",
-        value(signed_db(analysis.match_gain_db, 2)),
-        value(signed_db(analysis.safety_attenuation_db, 2)),
+        "PREAMP {preamp}     {levels}{}",
         if analysis.headroom_limited {
             "     <span foreground='#ecebe6'>HEADROOM LIMITED</span>"
         } else {
