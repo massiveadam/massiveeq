@@ -61,7 +61,7 @@ pub fn response_graph(
     overlay: Rc<RefCell<Overlay>>,
 ) -> DrawingArea {
     let area = DrawingArea::builder()
-        .height_request(410)
+        .height_request(300)
         .hexpand(true)
         .build();
     area.set_draw_func(move |widget, context, width, height| {
@@ -123,7 +123,12 @@ pub fn response_graph(
                     (0.93, 0.31, 0.18, 0.96),
                 );
             }
+            let _ = context.save();
+            if overlay_state.has_curves() && width < 430.0 {
+                context.translate(0.0, 14.0);
+            }
             draw_channel_legend(context, width, stereo);
+            let _ = context.restore();
         }
 
         if let Some(profile) = document.borrow().as_ref() {
@@ -262,7 +267,7 @@ fn draw_filter_points(
         let is_selected = selected == Some(index);
         if is_selected {
             cr.new_sub_path();
-            cr.set_source_rgba(0.94, 0.29, 0.16, 0.24);
+            cr.set_source_rgba(0.93, 0.92, 0.90, 0.12);
             cr.arc(x, y, 17.0, 0.0, std::f64::consts::TAU);
             let _ = cr.fill();
         }
@@ -280,7 +285,7 @@ fn draw_filter_points(
         );
         let _ = cr.fill_preserve();
         let outline = if is_selected {
-            (0.94, 0.29, 0.16)
+            (0.93, 0.92, 0.90)
         } else {
             match filter.channels {
                 ChannelSelection::Left => (0.33, 0.68, 0.94),
@@ -304,28 +309,6 @@ fn draw_filter_points(
         let label_width = extents.map_or(0.0, |value| value.width());
         cr.move_to(x - label_width / 2.0, y + 3.5);
         let _ = cr.show_text(&label);
-
-        if is_selected {
-            let text = format_filter_readout(filter);
-            cr.select_font_face(
-                "Monospace",
-                cairo::FontSlant::Normal,
-                cairo::FontWeight::Normal,
-            );
-            cr.set_font_size(11.0);
-            let extents = cr.text_extents(&text).ok();
-            let text_width = extents.map_or(0.0, |value| value.width());
-            let box_width = text_width + 20.0;
-            let box_height = 26.0;
-            let box_x = (x - box_width / 2.0).clamp(LEFT, width - RIGHT - box_width);
-            let box_y = if y > TOP + 46.0 { y - 40.0 } else { y + 18.0 };
-            rounded_rectangle(cr, box_x, box_y, box_width, box_height, 8.0);
-            cr.set_source_rgba(0.94, 0.29, 0.16, 0.98);
-            let _ = cr.fill();
-            cr.set_source_rgba(0.06, 0.07, 0.08, 0.98);
-            cr.move_to(box_x + 10.0, box_y + 17.0);
-            let _ = cr.show_text(&text);
-        }
     }
 }
 
@@ -469,7 +452,7 @@ fn draw_curves(
         stroke(&raw, (0.62, 0.64, 0.64, 0.55), 1.3);
         if let Some(analysis) = analysis {
             let ears = if responses_match(&analysis.left.response, &analysis.right.response) {
-                vec![(&analysis.left.response, (1.0, 0.45, 0.35, 0.95))]
+                vec![(&analysis.left.response, (1.0, 0.48, 0.10, 0.95))]
             } else {
                 vec![
                     (&analysis.left.response, (0.45, 0.72, 0.86, 0.95)),
@@ -490,7 +473,10 @@ fn draw_curves(
         cairo::FontWeight::Bold,
     );
     cr.set_font_size(10.0);
-    let mut x = LEFT + 8.0;
+    let mut x = if width < 330.0 { LEFT } else { LEFT + 8.0 };
+    if width < 330.0 {
+        cr.set_font_size(8.5);
+    }
     let mut key = |label: &str, rgba: (f64, f64, f64)| {
         cr.set_source_rgba(rgba.0, rgba.1, rgba.2, 0.9);
         cr.rectangle(x, 11.0, 14.0, 3.0);
@@ -504,7 +490,7 @@ fn draw_curves(
     };
     if overlay.measurement.is_some() {
         key("MEASURED", (0.62, 0.64, 0.64));
-        key("WITH EQ", (1.0, 0.45, 0.35));
+        key("PREDICTED", (1.0, 0.48, 0.10));
     }
     if overlay.target.is_some() {
         key("TARGET", (0.80, 0.78, 0.72));
@@ -513,7 +499,7 @@ fn draw_curves(
 
 fn draw_tone_marker(cr: &cairo::Context, frequency: f64, width: f64, height: f64) {
     let x = x_for(frequency, width);
-    cr.set_source_rgba(0.90, 0.29, 0.18, 0.9);
+    cr.set_source_rgba(1.0, 0.48, 0.10, 0.9);
     cr.set_line_width(1.5);
     cr.set_dash(&[4.0, 4.0], 0.0);
     cr.move_to(x, TOP);
@@ -538,39 +524,6 @@ fn draw_tone_marker(cr: &cairo::Context, frequency: f64, width: f64, height: f64
     let left = (x + 6.0).min(width - RIGHT - text_width);
     cr.move_to(left, TOP + 12.0);
     let _ = cr.show_text(&label);
-}
-
-fn rounded_rectangle(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, radius: f64) {
-    cr.new_sub_path();
-    cr.arc(
-        x + w - radius,
-        y + radius,
-        radius,
-        -std::f64::consts::FRAC_PI_2,
-        0.0,
-    );
-    cr.arc(
-        x + w - radius,
-        y + h - radius,
-        radius,
-        0.0,
-        std::f64::consts::FRAC_PI_2,
-    );
-    cr.arc(
-        x + radius,
-        y + h - radius,
-        radius,
-        std::f64::consts::FRAC_PI_2,
-        std::f64::consts::PI,
-    );
-    cr.arc(
-        x + radius,
-        y + radius,
-        radius,
-        std::f64::consts::PI,
-        std::f64::consts::PI * 1.5,
-    );
-    cr.close_path();
 }
 
 pub fn point_position(frequency: f64, gain: f64, width: f64, height: f64) -> (f64, f64) {
@@ -665,15 +618,6 @@ fn frequency_label(frequency: f64) -> &'static str {
         10000 => "10k",
         _ => "20 kHz",
     }
-}
-
-fn format_filter_readout(filter: &Filter) -> String {
-    let frequency = if filter.frequency >= 1000.0 {
-        format!("{:.2} kHz", filter.frequency / 1000.0)
-    } else {
-        format!("{:.0} Hz", filter.frequency)
-    };
-    format!("{frequency}  {:+.1} dB  Q {:.2}", filter.gain_db, filter.q)
 }
 
 #[cfg(test)]

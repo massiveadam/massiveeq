@@ -9,7 +9,9 @@ pub mod pipewire;
 pub mod storage;
 
 pub use analysis::{ChannelAnalysis, ProfileAnalysis, analyze_profile, analyze_profile_preview};
-pub use curve::{CurveKind, CurvePoint, Curves, parse_curve};
+pub use curve::{
+    CurveCompensation, CurveKind, CurveMetadata, CurvePoint, CurveTransducer, Curves, parse_curve,
+};
 pub use layout::{ImpulseLayout, ImpulseRoute, SURROUND_71_POSITIONS, validate_impulse};
 pub use model::*;
 pub use parser::{ParseError, parse_file, parse_text, serialize_profile};

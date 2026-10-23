@@ -3,6 +3,7 @@ use massiveeq_core::{ComparisonSet, DeviceInfo, ProfileAnalysis, ProfileInfo};
 use std::collections::HashMap;
 use zbus::blocking::{Connection, Proxy};
 
+#[derive(Clone)]
 pub struct Client {
     connection: Connection,
 }
@@ -86,8 +87,33 @@ impl Client {
     pub fn set_curve(&self, id: &str, kind: &str, path: &str) -> Result<massiveeq_core::Curves> {
         self.call_json("SetCurve", &(id, kind, path))
     }
+    pub fn set_curve_metadata(
+        &self,
+        id: &str,
+        kind: massiveeq_core::CurveKind,
+        metadata: &massiveeq_core::CurveMetadata,
+    ) -> Result<massiveeq_core::Curves> {
+        let kind = match kind {
+            massiveeq_core::CurveKind::Measurement => "measurement",
+            massiveeq_core::CurveKind::Target => "target",
+        };
+        self.call_json(
+            "SetCurveMetadata",
+            &(id, kind, serde_json::to_string(metadata)?),
+        )
+    }
     pub fn put(&self, id: &str, name: &str, text: &str, trim: f64) -> Result<ProfileInfo> {
         self.call_json("PutProfile", &(id, name, text, trim))
+    }
+    pub fn preview_profile(&self, id: &str, request: &str) -> Result<()> {
+        self.proxy()?
+            .call("PreviewProfile", &(id, request))
+            .context("live audio preview failed")
+    }
+    pub fn end_preview(&self, id: &str) -> Result<()> {
+        self.proxy()?
+            .call("EndPreview", &(id,))
+            .context("ending live preview failed")
     }
     pub fn delete(&self, id: &str) -> Result<()> {
         self.proxy()?

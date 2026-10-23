@@ -45,6 +45,13 @@
 - Show whether playing audio is resampled, with the reason and the PipeWire
   setting that avoids it.
 
+- Edit bands on the graph, as in plugin EQs: the selected band opens a
+  floating panel beside its node with low shelf, peak, and high shelf (as on
+  Squiglink) drawn as symbols, ears, and frequency, gain, and Q knobs; scroll over a node for Q, Escape to close.
+  Band chips in the footer replace the fader bank. The header becomes a
+  preset bar (profile bank, undo/redo, A/B, output) and the footer holds
+  Filters, Listen, the bands, Bass/Tilt/Output knobs, and Text, IR, Curves.
+
 ### Fixed
 
 - Apply the narrow (under 720 px) layout. It never took effect because the

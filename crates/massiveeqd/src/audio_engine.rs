@@ -1,12 +1,14 @@
+use crate::latest_processor::LatestProcessor;
 use massiveeq_dsp::ProfileProcessor;
-use rtrb::{Consumer, Producer, PushError};
+use rtrb::{Producer, PushError};
+use std::sync::Arc;
 
 /// Owns all mutable DSP state on the PipeWire real-time thread. Every buffer
 /// and processor is created by the control thread before it reaches here.
 pub struct AudioEngine {
     active: Box<ProfileProcessor>,
     pending: Option<Box<ProfileProcessor>>,
-    updates: Consumer<Box<ProfileProcessor>>,
+    updates: Arc<LatestProcessor>,
     retired: Producer<Box<ProfileProcessor>>,
     retire_backlog: Option<Box<ProfileProcessor>>,
     /// Channels arriving from the sink; more than `outputs` for surround.
@@ -24,7 +26,7 @@ pub struct AudioEngine {
 impl AudioEngine {
     pub fn new(
         active: Box<ProfileProcessor>,
-        updates: Consumer<Box<ProfileProcessor>>,
+        updates: Arc<LatestProcessor>,
         retired: Producer<Box<ProfileProcessor>>,
         sample_rate: u32,
     ) -> Self {
@@ -62,7 +64,7 @@ impl AudioEngine {
         self.return_retired_chain();
         if self.pending.is_none()
             && self.retire_backlog.is_none()
-            && let Ok(next) = self.updates.pop()
+            && let Some(next) = self.updates.take()
         {
             self.pending = Some(next);
             self.fade_position = 0;
@@ -150,14 +152,39 @@ mod tests {
     use rtrb::RingBuffer;
 
     #[test]
+    fn resuming_audio_uses_the_newest_edit_after_many_idle_updates() {
+        let initial = compile_bypass(48000, 512, 2);
+        let updates = Arc::new(LatestProcessor::default());
+        let (retired, _consumer) = RingBuffer::new(4);
+        let mut engine = AudioEngine::new(
+            Box::new(ProfileProcessor::new(&initial).unwrap()),
+            updates.clone(),
+            retired,
+            48000,
+        );
+        for gain in 1..=32 {
+            let compiled = massiveeq_dsp::compile_bypass_with_gain(48000, 512, 2, -gain as f64);
+            updates.publish(Box::new(ProfileProcessor::new(&compiled).unwrap()));
+        }
+        let input = vec![1.0; 1024];
+        allocation_test_support::begin();
+        let output = engine.process(&input);
+        let last = *output.last().unwrap();
+        let allocations = allocation_test_support::end();
+        assert_eq!(allocations, 0);
+        assert!((last - 10.0_f32.powf(-32.0 / 20.0)).abs() < 1e-6);
+    }
+
+    #[test]
     fn processing_and_crossfade_do_not_allocate_or_free() {
         let compiled = compile_bypass(48_000, 128, 2);
         let active = Box::new(ProfileProcessor::new(&compiled).unwrap());
         let next = Box::new(ProfileProcessor::new(&compiled).unwrap());
-        let (mut update_producer, update_consumer) = RingBuffer::new(2);
+        let update_producer = Arc::new(LatestProcessor::default());
+        let update_consumer = update_producer.clone();
         let (retire_producer, mut retire_consumer) = RingBuffer::new(4);
         let mut engine = AudioEngine::new(active, update_consumer, retire_producer, 48_000);
-        update_producer.push(next).unwrap();
+        update_producer.publish(next);
         let input = vec![0.25_f32; 256];
 
         allocation_test_support::begin();
@@ -175,10 +202,11 @@ mod tests {
         massiveeq_dsp::widen_input(&mut compiled, 8).unwrap();
         let active = Box::new(ProfileProcessor::new(&compiled).unwrap());
         let next = Box::new(ProfileProcessor::new(&compiled).unwrap());
-        let (mut update_producer, update_consumer) = RingBuffer::new(2);
+        let update_producer = Arc::new(LatestProcessor::default());
+        let update_consumer = update_producer.clone();
         let (retire_producer, _retire_consumer) = RingBuffer::new(4);
         let mut engine = AudioEngine::new(active, update_consumer, retire_producer, 48_000);
-        update_producer.push(next).unwrap();
+        update_producer.publish(next);
         // 128 frames of 7.1 in, 128 frames of stereo out.
         let mut input = vec![0.0_f32; 128 * 8];
         input[0] = 1.0; // front left, first frame

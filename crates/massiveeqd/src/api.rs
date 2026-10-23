@@ -67,10 +67,84 @@ impl Service {
         let profile = storage
             .put_profile(&mut state.library, id, name, text, manual_trim_db)
             .map_err(failed)?;
-        refresh_locked(&mut state, true).await.map_err(failed)?;
+        refresh_locked(&mut state, false).await.map_err(failed)?;
         let result = serde_json::to_string(&profile).map_err(failed)?;
         Self::changed(&emitter, "profiles").await.map_err(failed)?;
         Ok(result)
+    }
+
+    /// Audition a validated draft without writing profile files. The editor
+    /// renews this lease; a crash returns outputs to their saved profiles.
+    async fn preview_profile(&self, id: &str, request: &str) -> fdo::Result<()> {
+        let request: crate::live_edit::Request = serde_json::from_str(request).map_err(failed)?;
+        let mut state = self.state.lock().await;
+        let mut edit =
+            crate::live_edit::Session::parse(&state.storage, &state.library, id, request)
+                .map_err(failed)?;
+        if let Some(previous) = state.live_edits.get_mut(id) {
+            if previous.reference == edit.reference {
+                edit.reference_cache = previous.reference_cache.clone();
+            }
+            if previous.draft == edit.draft
+                && previous.trim == edit.trim
+                && previous.reference == edit.reference
+                && previous.hear_reference == edit.hear_reference
+            {
+                previous.renewed = std::time::Instant::now();
+                return Ok(());
+            }
+        }
+        let previous = state.live_edits.insert(id.to_owned(), edit);
+        let crate::AppState {
+            storage,
+            library,
+            devices,
+            host,
+            live_edits,
+            ..
+        } = &mut *state;
+        host.reconcile(storage, library, devices, false, live_edits)
+            .await
+            .map_err(failed)?;
+        let error = host.errors_for_profile(library, devices, id);
+        if let Some(error) = error {
+            if let Some(previous) = previous {
+                state.live_edits.insert(id.to_owned(), previous);
+            } else {
+                state.live_edits.remove(id);
+            }
+            let crate::AppState {
+                storage,
+                library,
+                devices,
+                host,
+                live_edits,
+                ..
+            } = &mut *state;
+            let _ = host
+                .reconcile(storage, library, devices, false, live_edits)
+                .await;
+            return Err(fdo::Error::Failed(error));
+        }
+        Ok(())
+    }
+
+    async fn end_preview(&self, id: &str) -> fdo::Result<()> {
+        let mut state = self.state.lock().await;
+        if state.live_edits.remove(id).is_some() {
+            let crate::AppState {
+                storage,
+                library,
+                devices,
+                host,
+                live_edits,
+                ..
+            } = &mut *state;
+            host.reconcile(storage, library, devices, false, live_edits)
+                .await
+                .map_err(failed)?;
+        }
+        Ok(())
     }
 
     async fn import_profile(
@@ -102,6 +176,7 @@ impl Service {
         };
         let mut state = self.state.lock().await;
         let storage = state.storage.clone();
+        state.live_edits.remove(id);
         let profile = storage
             .set_convolution(&state.library, id, std::path::Path::new(path), channels)
             .map_err(failed)?;
@@ -138,6 +213,26 @@ impl Service {
         let result = serde_json::to_string(&curves).map_err(failed)?;
         Self::changed(&emitter, "profiles").await.map_err(failed)?;
         Ok(result)
+    }
+
+    async fn set_curve_metadata(
+        &self,
+        id: &str,
+        kind: &str,
+        metadata: &str,
+    ) -> fdo::Result<String> {
+        let kind = match kind {
+            "measurement" => massiveeq_core::CurveKind::Measurement,
+            "target" => massiveeq_core::CurveKind::Target,
+            _ => return Err(fdo::Error::InvalidArgs("unknown curve kind".into())),
+        };
+        let metadata = serde_json::from_str(metadata).map_err(failed)?;
+        let state = self.state.lock().await;
+        let curves = state
+            .storage
+            .set_curve_metadata(&state.library, id, kind, metadata)
+            .map_err(failed)?;
+        serde_json::to_string(&curves).map_err(failed)
     }
 
     async fn get_curves(&self, id: &str) -> fdo::Result<String> {
