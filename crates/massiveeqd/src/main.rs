@@ -177,7 +177,27 @@ async fn main() -> Result<()> {
         }
     });
 
-    shutdown_signal().await?;
+    // After a package upgrade, stop cleanly and become the new version once
+    // no tone is playing. An open editor renews its live draft every two
+    // seconds, so the new daemon picks the edit back up by itself.
+    let upgrade_state = state.clone();
+    let upgraded = tokio::select! {
+        result = shutdown_signal() => {
+            result?;
+            false
+        }
+        () = async move {
+            let mut timer = interval(Duration::from_secs(10));
+            loop {
+                timer.tick().await;
+                if massiveeq_core::upgrade::executable_replaced()
+                    && upgrade_state.lock().await.tone.is_none()
+                {
+                    break;
+                }
+            }
+        } => true,
+    };
     event_task.abort();
     health_task.abort();
     tone_task.abort();
@@ -187,6 +207,12 @@ async fn main() -> Result<()> {
     monitor.stop();
     state.lock().await.host.stop_all().await;
     drop(connection);
+    if upgraded {
+        eprintln!("massiveeqd: MassiveEQ was upgraded; restarting on the new version");
+        let error = massiveeq_core::upgrade::exec_new_version();
+        eprintln!("massiveeqd: could not start the new version: {error}");
+        std::process::exit(massiveeq_core::upgrade::UPGRADE_RESTART_EXIT);
+    }
     Ok(())
 }
 

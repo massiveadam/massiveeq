@@ -574,7 +574,15 @@ async fn main() -> Result<()> {
                 Some(action) => action,
                 None => break,
             },
-            _ = poll.tick() => Action::Refresh,
+            _ = poll.tick() => {
+                // Upgraded under us: become the new version.
+                if massiveeq_core::upgrade::executable_replaced() {
+                    let error = massiveeq_core::upgrade::exec_new_version();
+                    eprintln!("massiveeq-tray: could not start the new version: {error}");
+                    std::process::exit(massiveeq_core::upgrade::UPGRADE_RESTART_EXIT);
+                }
+                Action::Refresh
+            }
             _ = tokio::signal::ctrl_c() => break,
         };
 

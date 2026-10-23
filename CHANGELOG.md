@@ -80,6 +80,15 @@
 
 ### Fixed
 
+- Offer MassiveEQ updates in cachy-update, arch-update, and AUR helpers
+  without devel checks: the AUR package now carries each new upstream
+  version. It had been published from a shallow clone as `r1`, below every
+  installed build, so no update tool ever saw one.
+- After an upgrade, the audio service and tray restart on the new version by
+  themselves instead of running the old binaries until the next login, and
+  the editor's header button becomes RESTART.
+- The UPDATE button's **Update now** runs the installed AUR helper in a
+  terminal; the editor also re-checks for updates every six hours.
 - Dragging the Bass, Tilt, or Output knob no longer moves the window: the
   footer is a window handle, and knob drags now claim the pointer. Knob value
   labels keep a fixed width, so the footer does not shift as values change.

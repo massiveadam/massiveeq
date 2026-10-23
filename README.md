@@ -165,7 +165,9 @@ makepkg -si
 
 ### Updating
 
-Rebuild the rolling package whenever an update is available:
+Every change merged upstream is published to the AUR with a new version, so
+system update tools list MassiveEQ like any other package: cachy-update and
+arch-update, `yay -Syu`, `paru -Syu`, and the rest. To update it on its own:
 
 ```sh
 yay -S massiveeq-git
@@ -175,11 +177,16 @@ For a manual AUR checkout, run `git pull` in the `massiveeq-git` directory and
 then run `makepkg -si` again. Profiles, assignments, comparison banks, and
 active routing are stored outside the package and are retained across updates.
 
-The full editor checks once shortly after launch for a newer upstream revision.
-When one is available, a compact **Update** button appears in the header and
-offers to copy the recommended `yay -S massiveeq-git` command or open the AUR
-package page. The app never runs an AUR helper or requests administrator
-privileges by itself.
+The editor checks for a newer upstream revision shortly after launch and every
+six hours. When one is available, an **UPDATE** button appears in the header.
+**Update now** opens a terminal that runs your AUR helper (`paru`, `yay`, or
+`pikaur`, whichever is installed first) so you can review the build and enter
+your password there; **Copy command** copies it instead. The app never asks for
+administrator privileges itself.
+
+However an update is installed, the audio service and tray notice and restart
+on the new version by themselves (the service waits for a playing tone to stop),
+and the editor's header button becomes **RESTART**, which saves and reopens it.
 
 If an update installs but the old interface still opens, an earlier manual
 install is probably shadowing the package. `which -a massiveeq massiveeqd`

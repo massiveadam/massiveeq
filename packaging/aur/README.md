@@ -9,9 +9,20 @@ must retain that designation until the project is declared stable.
 The `Sync AUR` GitHub Actions workflow runs after a successful `CI` push build
 on `main`. It exports the current `PKGBUILD`, calculates its VCS version,
 regenerates `.SRCINFO`, and compares the result with the live
-`massiveeq-git` AUR repository. Packaging changes are committed and pushed;
-ordinary upstream code commits are intentionally ignored because AUR helpers
-already fetch the newest commit when rebuilding a `-git` package.
+`massiveeq-git` AUR repository. Every change, including the version of each
+new commit on `main`, is committed and pushed. A `-git` package's AUR version
+is normally left alone, but update checkers that only compare versions
+(cachy-update and arch-update, or `paru`/`yay -Qua` without devel checks)
+would then never offer MassiveEQ updates. The checkout keeps full history so
+`pkgver()` counts commits correctly, and the sync refuses to publish a version
+that sorts below the AUR's.
+
+After an upgrade, `massiveeqd` and `massiveeq-tray` notice that their binaries
+were replaced and restart themselves on the new version (the daemon waits until
+no tone is playing; an open editor re-sends its live draft). The editor's header button turns into
+**RESTART**. Its **UPDATE** state, shown when GitHub `main` is ahead of the
+running build, offers **Update now**, which runs the first installed AUR helper
+(`paru`, `yay`, or `pikaur`) in a terminal.
 
 The publisher requires one repository secret:
 
