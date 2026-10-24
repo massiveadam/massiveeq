@@ -35,6 +35,7 @@ The runner owns a separate D-Bus service and XDG configuration/data directories.
 
 ## Main user-facing features
 
+- Measurement merging has a dedicated native GTK scenario. From the development checkout run `SHOT_SIZE=1280x1100 SHOT_SCENARIO="$PWD/.agents/skills/verify-massiveeq/measurement-scenario.sh" /home/adam/Playground/devbox/massiveeq-shot.sh /home/adam/Playground/devbox/out/merge-complete.png 3`. It needs the existing devbox harness, its virtual-pointer helper, and `wtype` in the Arch container. It uses the real multi-file chooser, assigns an ambiguous ear, saves separate and merged views, reopens retained takes, tests removal/cancel and invalid-file handling, enables level matching by pointer, and resizes only its own dialog to 380 px. Fixtures and profile state are isolated by the harness.
 - Bass and tilt persist as portable shelves. Repeated edits retain readouts and do not duplicate shelves after serialization.
 - Undo/redo restore grouped edits. Hear starting sound auditions the captured reference.
 - Graph listening creates a tone stream. Sweep advances logarithmically, then holds its frequency when paused. Corrections apply at the held frequency. Stop removes the stream.

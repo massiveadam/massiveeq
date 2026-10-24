@@ -226,6 +226,28 @@ impl Service {
         Ok(result)
     }
 
+    async fn set_measurements(
+        &self,
+        id: &str,
+        request: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<String> {
+        if request.len() > 16_000_000 {
+            return Err(fdo::Error::InvalidArgs(
+                "Measurement import is too large".into(),
+            ));
+        }
+        let set: massiveeq_core::MeasurementSet = serde_json::from_str(request).map_err(failed)?;
+        let state = self.state.lock().await;
+        let curves = state
+            .storage
+            .set_measurements(&state.library, id, set)
+            .map_err(failed)?;
+        let result = serde_json::to_string(&curves).map_err(failed)?;
+        Self::changed(&emitter, "profiles").await.map_err(failed)?;
+        Ok(result)
+    }
+
     async fn set_curve_metadata(
         &self,
         id: &str,

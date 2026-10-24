@@ -394,6 +394,7 @@ impl Storage {
                 atomic_write(&destination, text.as_bytes())?;
                 // Placements belong to the measurement they were taken with.
                 if kind == crate::CurveKind::Measurement {
+                    remove_measurement_set(&directory)?;
                     remove_placements(&directory)?;
                 }
             }
@@ -406,6 +407,7 @@ impl Storage {
                     fs::remove_file(sidecar)?;
                 }
                 if kind == crate::CurveKind::Measurement {
+                    remove_measurement_set(&directory)?;
                     remove_placements(&directory)?;
                 }
             }
@@ -429,6 +431,11 @@ impl Storage {
             remove_placements(&directory)?;
             return Ok(self.curves(id));
         };
+        if directory.join("measurements.json").exists() {
+            return Err(StorageError::InvalidProfile(
+                "Open Measurements to add or remove per-ear takes.".into(),
+            ));
+        }
         if !directory
             .join(crate::CurveKind::Measurement.file_name())
             .exists()
@@ -474,6 +481,16 @@ impl Storage {
             return Err(StorageError::MissingProfile(id.into()));
         }
         let directory = self.profile_dir(id).join("curves");
+        if kind == crate::CurveKind::Measurement
+            && let Some(mut stored) = read_measurement_set(&directory)
+        {
+            stored.metadata = Some(validate_curve_metadata(metadata)?);
+            atomic_write(
+                &directory.join("measurements.json"),
+                &serde_json::to_vec(&stored)?,
+            )?;
+            return Ok(self.curves(id));
+        }
         if !directory.join(kind.file_name()).exists() {
             return Err(StorageError::InvalidProfile(format!(
                 "no {kind:?} curve is stored for this profile"
@@ -516,13 +533,69 @@ impl Storage {
         } else {
             Vec::new()
         };
-        crate::Curves {
+        let mut curves = crate::Curves {
             measurement,
             target: read(crate::CurveKind::Target),
             measurement_metadata: read_metadata(crate::CurveKind::Measurement),
             target_metadata: read_metadata(crate::CurveKind::Target),
             placements,
+            measurement_set: None,
+            measurement_channels: None,
+        };
+        if let Some(stored) = read_measurement_set(&directory)
+            && let Ok(averages) = stored.set.averages()
+        {
+            curves.measurement = Some(averages.merged());
+            curves.measurement_channels =
+                (stored.set.output == crate::MeasurementOutput::Separate).then_some(averages);
+            curves.measurement_metadata = stored.metadata;
+            curves.measurement_set = Some(stored.set);
+            curves.placements.clear();
         }
+        curves
+    }
+
+    /// Save original takes and options together. The derived average never
+    /// replaces its inputs; an invalid request leaves existing curves intact.
+    pub fn set_measurements(
+        &self,
+        library: &Library,
+        id: &str,
+        set: crate::MeasurementSet,
+    ) -> Result<crate::Curves, StorageError> {
+        if !library.profiles.contains_key(id) {
+            return Err(StorageError::MissingProfile(id.into()));
+        }
+        set.averages().map_err(StorageError::InvalidProfile)?;
+        let previous = self.curves(id);
+        let unchanged = previous
+            .measurement_set
+            .as_ref()
+            .is_some_and(|old| old.takes == set.takes)
+            || (previous.measurement_set.is_none()
+                && previous.measurement.as_ref().is_some_and(|measurement| {
+                    let old = std::iter::once(measurement)
+                        .chain(&previous.placements)
+                        .collect::<Vec<_>>();
+                    old.len() == set.takes.len()
+                        && old.iter().zip(&set.takes).all(|(points, take)| {
+                            take.ear == crate::MeasurementEar::Both && **points == take.points
+                        })
+                }));
+        let stored = StoredMeasurementSet {
+            set,
+            metadata: if unchanged {
+                previous.measurement_metadata
+            } else {
+                None
+            },
+        };
+        let directory = self.profile_dir(id).join("curves");
+        atomic_write(
+            &directory.join("measurements.json"),
+            &serde_json::to_vec(&stored)?,
+        )?;
+        Ok(self.curves(id))
     }
 
     pub fn export_profile(
@@ -650,6 +723,27 @@ fn placement_number(path: &Path) -> Option<u32> {
         .ok()
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredMeasurementSet {
+    set: crate::MeasurementSet,
+    metadata: Option<crate::CurveMetadata>,
+}
+
+fn read_measurement_set(directory: &Path) -> Option<StoredMeasurementSet> {
+    let stored: StoredMeasurementSet =
+        serde_json::from_slice(&fs::read(directory.join("measurements.json")).ok()?).ok()?;
+    stored.set.averages().ok()?;
+    Some(stored)
+}
+
+fn remove_measurement_set(directory: &Path) -> Result<(), StorageError> {
+    let path = directory.join("measurements.json");
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn remove_placements(directory: &Path) -> Result<(), StorageError> {
     for path in placement_files(directory) {
         fs::remove_file(path)?;
@@ -735,6 +829,135 @@ fn unique_asset_path(dir: &Path, file_name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_measurements_round_trip_and_do_not_change_eq_or_target() {
+        use crate::{
+            CurveKind, MeasurementEar, MeasurementOutput, MeasurementSet, MeasurementTake,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        let mut library = storage.load_library().unwrap();
+        let profile = storage.create_profile(&mut library, "Takes").unwrap();
+        let source = temp.path().join("target.txt");
+        fs::write(
+            &source,
+            (0..30)
+                .map(|i| format!("{} 0\n", 20.0 * 1000.0_f64.powf(i as f64 / 29.0)))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let before = storage
+            .set_curve(&library, &profile.id, CurveKind::Target, Some(&source))
+            .unwrap();
+        let points = crate::parse_curve(
+            &fs::read_to_string(&source).unwrap(),
+            CurveKind::Measurement,
+        )
+        .unwrap();
+        let mut set = MeasurementSet {
+            takes: vec![
+                MeasurementTake {
+                    name: "Left.txt".into(),
+                    ear: MeasurementEar::Left,
+                    points: points.clone(),
+                },
+                MeasurementTake {
+                    name: "Right.txt".into(),
+                    ear: MeasurementEar::Right,
+                    points,
+                },
+            ],
+            ..Default::default()
+        };
+        let curves = storage
+            .set_measurements(&library, &profile.id, set.clone())
+            .unwrap();
+        assert_eq!(curves.target, before.target);
+        assert_eq!(curves.measurement_set, Some(set.clone()));
+        assert!(curves.measurement_channels.is_some());
+        assert_eq!(
+            storage
+                .get_profile(library.profiles.get(&profile.id).unwrap())
+                .unwrap()
+                .text,
+            profile.text
+        );
+        let metadata = crate::CurveMetadata {
+            source: "My measurements".into(),
+            ..Default::default()
+        };
+        storage
+            .set_curve_metadata(
+                &library,
+                &profile.id,
+                CurveKind::Measurement,
+                metadata.clone(),
+            )
+            .unwrap();
+        set.output = MeasurementOutput::Merged;
+        let curves = storage
+            .set_measurements(&library, &profile.id, set.clone())
+            .unwrap();
+        assert!(curves.measurement_channels.is_none());
+        assert_eq!(curves.measurement_metadata, Some(metadata));
+        assert_eq!(curves.measurement_set.as_ref().unwrap().takes.len(), 2);
+        let saved = fs::read(
+            storage
+                .profile_dir(&profile.id)
+                .join("curves/measurements.json"),
+        )
+        .unwrap();
+        let mut invalid = set.clone();
+        invalid.takes.clear();
+        assert!(
+            storage
+                .set_measurements(&library, &profile.id, invalid)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(
+                storage
+                    .profile_dir(&profile.id)
+                    .join("curves/measurements.json")
+            )
+            .unwrap(),
+            saved
+        );
+        set.takes[0].points[0].low = 1.0;
+        set.takes[0].points[0].high = 1.0;
+        assert!(
+            storage
+                .set_measurements(&library, &profile.id, set)
+                .unwrap()
+                .measurement_metadata
+                .is_none()
+        );
+        assert!(
+            storage
+                .add_placement(&library, &profile.id, Some(&source))
+                .is_err()
+        );
+        let restarted = Storage::new(temp.path().join("data"), temp.path().join("config")).unwrap();
+        assert_eq!(
+            restarted
+                .curves(&profile.id)
+                .measurement_set
+                .unwrap()
+                .takes
+                .len(),
+            2
+        );
+        let replaced = storage
+            .set_curve(&library, &profile.id, CurveKind::Measurement, Some(&source))
+            .unwrap();
+        assert!(replaced.measurement_set.is_none());
+        storage
+            .set_curve(&library, &profile.id, CurveKind::Measurement, None)
+            .unwrap();
+        assert!(storage.curves(&profile.id).measurement.is_none());
+        assert!(storage.curves(&profile.id).target.is_some());
+    }
 
     fn write_test_wav(path: &Path) {
         write_test_wav_channels(path, 1);

@@ -108,6 +108,10 @@ pub struct Curves {
     /// placements; they share the measurement's provenance.
     #[serde(default)]
     pub placements: Vec<Vec<CurvePoint>>,
+    #[serde(default)]
+    pub measurement_set: Option<crate::MeasurementSet>,
+    #[serde(default)]
+    pub measurement_channels: Option<crate::MeasurementChannels>,
 }
 
 /// Placements kept beside the measurement, so 16 measurements in all.
@@ -368,6 +372,15 @@ pub struct Excursion {
 /// [`alignment_level`] (the range by its centre). Brushes narrower than a
 /// twelfth of an octave or under half a decibel are ignored.
 pub fn excursions(response: &dyn Fn(f64) -> f64, target: &[CurvePoint]) -> Vec<Excursion> {
+    excursions_at_level(response, target, alignment_level(response))
+}
+
+/// Compare at a shared alignment level, retaining differences between ears.
+pub fn excursions_at_level(
+    response: &dyn Fn(f64) -> f64,
+    target: &[CurvePoint],
+    response_offset: f64,
+) -> Vec<Excursion> {
     const POINTS: usize = 481;
     if !is_range(target) {
         return Vec::new();
@@ -376,7 +389,6 @@ pub fn excursions(response: &dyn Fn(f64) -> f64, target: &[CurvePoint]) -> Vec<E
         let (low, high) = curve_at(target, frequency);
         (low + high) / 2.0
     };
-    let response_offset = alignment_level(response);
     let target_offset = alignment_level(&center);
     let mut found: Vec<Excursion> = Vec::new();
     let mut open: Option<Excursion> = None;
@@ -481,6 +493,21 @@ pub fn measurement_field(takes: &[&[CurvePoint]]) -> Option<MeasurementField> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_alignment_keeps_real_channel_level_differences_against_bounds() {
+        let bounds = (0..20)
+            .map(|i| CurvePoint {
+                frequency: 20.0 * 1000.0_f64.powf(i as f64 / 19.0),
+                low: -1.0,
+                high: 1.0,
+            })
+            .collect::<Vec<_>>();
+        assert!(excursions(&|_| 4.0, &bounds).is_empty());
+        let outside = excursions_at_level(&|_| 4.0, &bounds, 0.0);
+        assert_eq!(outside.len(), 1);
+        assert!((outside[0].worst_db - 3.0).abs() < 1e-9);
+    }
 
     #[test]
     fn an_unknown_target_fixture_is_not_reported_as_a_matching_fixture() {
@@ -663,6 +690,7 @@ mod tests {
             measurement_metadata: None,
             target_metadata: None,
             placements: Vec::new(),
+            ..Default::default()
         };
         assert!(curves.context_note().contains("provenance is unknown"));
         curves.target = curves.measurement.clone();
@@ -684,6 +712,7 @@ mod tests {
             measurement_metadata: Some(declared_metadata()),
             target_metadata: Some(target),
             placements: Vec::new(),
+            ..Default::default()
         };
         let note = curves.context_note();
         assert!(note.contains("declared contexts differ"), "{note}");
@@ -711,6 +740,7 @@ mod tests {
             measurement_metadata: Some(declared_metadata()),
             target_metadata: Some(declared_metadata()),
             placements: Vec::new(),
+            ..Default::default()
         };
         let note = curves.context_note();
         assert!(note.contains("matching user-entered context"), "{note}");

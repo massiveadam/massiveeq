@@ -4,6 +4,7 @@ mod glyph;
 mod graph;
 mod knob;
 mod live_client;
+mod measurements;
 mod update;
 
 use adw::prelude::*;
@@ -2700,8 +2701,11 @@ fn update_curve_context(model: &Model, curves: massiveeq_core::Curves) {
     });
     if let Some(ui) = model.curves_ui.borrow().as_ref() {
         let count = curves.placements.len();
-        ui.add_placement
-            .set_sensitive(curves.measurement.is_some() && count < massiveeq_core::MAX_PLACEMENTS);
+        ui.add_placement.set_sensitive(
+            curves.measurement.is_some()
+                && curves.measurement_set.is_none()
+                && count < massiveeq_core::MAX_PLACEMENTS,
+        );
         ui.clear_placements.set_visible(count > 0);
         ui.clear_placements.set_label(&format!(
             "CLEAR {count} PLACEMENT{}",
@@ -2715,6 +2719,7 @@ fn update_curve_context(model: &Model, curves: massiveeq_core::Curves) {
         None => curves.measurement.clone(),
     };
     overlay.target = curves.target.clone();
+    overlay.measurement_channels = curves.measurement_channels.clone();
     overlay.field = field;
     *model.curves.borrow_mut() = curves;
 }
@@ -2756,7 +2761,7 @@ fn build_curves_menu() -> Rc<CurvesUi> {
         content.append(&button);
         button
     };
-    let load_measurement = button("LOAD MEASUREMENT…");
+    let load_measurement = button("Measurements…");
     let add_placement = button("ADD PLACEMENT…");
     add_placement.set_sensitive(false);
     add_placement.set_tooltip_text(Some(
@@ -2793,6 +2798,34 @@ fn wire_curves(
     graph: &gtk::DrawingArea,
     status: &gtk::Label,
 ) {
+    ui.load_measurement.connect_clicked({
+        let window = window.clone();
+        let model = model.clone();
+        let menu = ui.menu.clone();
+        let graph = graph.clone();
+        let status = status.clone();
+        move |_| {
+            menu.popdown();
+            let Some(id) = model.current_id.borrow().clone() else {
+                return;
+            };
+            let curves = model.curves.borrow().clone();
+            let applied = Rc::new({
+                let model = model.clone();
+                let graph = graph.clone();
+                let status = status.clone();
+                let id = id.clone();
+                move |curves| {
+                    if model.current_id.borrow().as_deref() == Some(id.as_str()) {
+                        update_curve_context(&model, curves);
+                        graph.queue_draw();
+                    }
+                    status.set_text("Measurements saved; original takes retained");
+                }
+            });
+            measurements::show(&window, model.client.clone(), id, &curves, applied);
+        }
+    });
     for (button, kind) in [
         (
             &ui.measurement_details,
@@ -2836,11 +2869,6 @@ fn wire_curves(
         }
     });
     for (button, kind, title) in [
-        (
-            &ui.load_measurement,
-            "measurement",
-            "Choose headphone measurement",
-        ),
         (&ui.load_target, "target", "Choose target curve or bounds"),
         (
             &ui.add_placement,
