@@ -102,6 +102,13 @@ impl Client {
             &(id, kind, serde_json::to_string(metadata)?),
         )
     }
+    pub fn set_measurements(
+        &self,
+        id: &str,
+        set: &massiveeq_core::MeasurementSet,
+    ) -> Result<massiveeq_core::Curves> {
+        self.call_json("SetMeasurements", &(id, serde_json::to_string(set)?))
+    }
     pub fn put(&self, id: &str, name: &str, text: &str, trim: f64) -> Result<ProfileInfo> {
         self.call_json("PutProfile", &(id, name, text, trim))
     }

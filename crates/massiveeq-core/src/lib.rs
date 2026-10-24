@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod curve;
 pub mod layout;
+pub mod measurement;
 pub mod model;
 pub mod parser;
 pub mod pipewire;
@@ -16,6 +17,10 @@ pub use curve::{
     is_range, measurement_field, parse_curve,
 };
 pub use layout::{ImpulseLayout, ImpulseRoute, SURROUND_71_POSITIONS, validate_impulse};
+pub use measurement::{
+    MAX_MEASUREMENT_POINTS, MAX_MEASUREMENT_TAKES, MeasurementChannels, MeasurementEar,
+    MeasurementOutput, MeasurementSet, MeasurementTake, measurement_ear_hint,
+};
 pub use model::*;
 pub use parser::{ParseError, parse_file, parse_text, serialize_profile};
 pub use storage::{

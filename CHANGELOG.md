@@ -4,6 +4,10 @@
 
 ### Added
 
+- Import several left/right measurement files in Curves → Measurements,
+  average takes per ear, or merge both ears with equal weight. Preview and
+  revise ear assignments, remove takes, and optionally match levels before
+  applying. Original takes remain stored for later changes.
 - Show where the corrected measurement leaves a target range (preference
   bounds): each stretch outside is shaded and listed with how far out it goes.
 - Add placements: more measurements of the same headphone after putting it on

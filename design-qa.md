@@ -83,3 +83,19 @@ The matching editor and daemon release binaries passed a test on benji's actual 
 - Cleanup verified the original service PID, installed binary hashes, saved-state hash, and physical output properties were unchanged. No candidate audio or tone nodes remained.
 
 The first automation attempts needed waits for asynchronous AT-SPI actions and the compact profile/tools menu. The successful run is `~/.local/state/massiveeq-testflight/20261022-listening/run4/evidence/` on benji. Its status, log, screenshots, and before/after WAV recordings are retained there. The repeatable project workflow is [.agents/skills/verify-massiveeq/SKILL.md](.agents/skills/verify-massiveeq/SKILL.md).
+
+## Measurement imports and ear averages, 2026-10-24
+
+On `feature/measurement-merge`, the release build and Clippy with warnings denied passed. Workspace release tests passed: 155 passed, one ignored DSP load benchmark. New tests cover unequal ear counts, different grids, log-frequency interpolation, optional alignment, invalid sets, filename hints, exact numeric JSON round trips, atomic persistence, reopening, provenance invalidation, old-file replacement, EQ/target preservation, shared-level bounds, and band-panel placement around both measurement lines.
+
+The native GTK scenario selected four synthetic CSVs through the actual multi-file picker. It required an explicit ear for an ambiguous filename, saved separate L/R averages, reopened all originals, switched to a merged view, removed a take and cancelled without changing stored data, rejected a malformed CSV without replacing data, and enabled level matching using real pointer input. The final run had no GTK criticals, Adwaita layout warnings, or panics.
+
+The Measurements dialog was independently resized to 380×900 and inspected. All file rows, ear selectors, removal controls, preview, and footer actions remain accessible. The main editor was left at desktop size during that check; resizing the whole application to 387 px exposed its pre-existing roughly 477 px toolbar minimum and is not claimed as supported by this feature.
+
+Repeat from the checkout:
+
+```bash
+SHOT_SIZE=1280x1100 SHOT_SCENARIO="$PWD/.agents/skills/verify-massiveeq/measurement-scenario.sh" /home/adam/Playground/devbox/massiveeq-shot.sh /home/adam/Playground/devbox/out/merge-complete.png 3
+```
+
+Evidence in `/home/adam/Playground/devbox/out/`: `merge-imported.png`, `merge-separate-preview.png`, `merge-separate-graph.png`, `merge-merged-preview.png`, `merge-merged-graph.png`, `merge-remove-draft.png`, `merge-invalid-file.png`, and `merge-narrow.png`. The [measurement import notes](docs/measurement-imports.md) describe the arithmetic and storage contract.

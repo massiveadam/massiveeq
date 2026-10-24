@@ -1,7 +1,7 @@
 use gtk4::{DrawingArea, cairo, prelude::*};
 use massiveeq_core::{
     ChannelSelection, CurvePoint, Excursion, Filter, MeasurementField, ProfileAnalysis,
-    ProfileDocument, alignment_level, analysis::ResponsePoint, curve_at, excursions, is_range,
+    ProfileDocument, alignment_level, analysis::ResponsePoint, curve_at, is_range,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -43,6 +43,7 @@ pub struct Overlay {
     pub target: Option<Vec<CurvePoint>>,
     /// The spread of the measurement and its placements, when there are any.
     pub field: Option<MeasurementField>,
+    pub measurement_channels: Option<massiveeq_core::MeasurementChannels>,
 }
 
 impl Overlay {
@@ -132,7 +133,11 @@ pub fn response_graph(
             if overlay_state.has_curves() && width < 430.0 {
                 context.translate(0.0, 14.0);
             }
-            draw_channel_legend(context, width, stereo);
+            draw_channel_legend(
+                context,
+                width,
+                stereo && overlay_state.measurement_channels.is_none(),
+            );
             let _ = context.restore();
         }
 
@@ -401,11 +406,15 @@ fn draw_curves(
         }
     };
     let everywhere = (0.0, f64::INFINITY);
-    let stroke = |values: &dyn Fn(f64) -> f64, rgba: (f64, f64, f64, f64), line: f64| {
-        trace(values, alignment_level(values), everywhere);
-        cr.set_source_rgba(rgba.0, rgba.1, rgba.2, rgba.3);
-        cr.set_line_width(line);
-        let _ = cr.stroke();
+    let stroke_at =
+        |values: &dyn Fn(f64) -> f64, offset: f64, rgba: (f64, f64, f64, f64), line: f64| {
+            trace(values, offset, everywhere);
+            cr.set_source_rgba(rgba.0, rgba.1, rgba.2, rgba.3);
+            cr.set_line_width(line);
+            let _ = cr.stroke();
+        };
+    let stroke = |values: &dyn Fn(f64) -> f64, rgba, line| {
+        stroke_at(values, alignment_level(values), rgba, line)
     };
     let band = |points: &[CurvePoint], offset: f64, rgba: (f64, f64, f64, f64)| {
         trace(
@@ -445,9 +454,27 @@ fn draw_curves(
             band(&field.outer, offset, (0.62, 0.64, 0.64, 0.10));
             band(&field.inner, offset, (0.62, 0.64, 0.64, 0.16));
         }
-        stroke(&raw, (0.62, 0.64, 0.64, 0.55), 1.3);
+        if let Some(channels) = &overlay.measurement_channels {
+            let offset = alignment_level(&raw);
+            stroke_at(
+                &|f| curve_at(&channels.left, f).0,
+                offset,
+                (0.45, 0.72, 0.86, 0.55),
+                1.3,
+            );
+            stroke_at(
+                &|f| curve_at(&channels.right, f).0,
+                offset,
+                (0.86, 0.52, 0.42, 0.55),
+                1.3,
+            );
+        } else {
+            stroke(&raw, (0.62, 0.64, 0.64, 0.55), 1.3);
+        }
         if let Some(analysis) = analysis {
-            let ears = if responses_match(&analysis.left.response, &analysis.right.response) {
+            let ears = if overlay.measurement_channels.is_none()
+                && responses_match(&analysis.left.response, &analysis.right.response)
+            {
                 vec![("", &analysis.left.response, (1.0, 0.48, 0.10, 0.95))]
             } else {
                 vec![
@@ -455,19 +482,42 @@ fn draw_curves(
                     ("R ", &analysis.right.response, (0.86, 0.52, 0.42, 0.95)),
                 ]
             };
+            let common_offset = overlay.measurement_channels.as_ref().map(|channels| {
+                alignment_level(&|f| {
+                    (curve_at(&channels.left, f).0
+                        + eq_at(&analysis.left.response, f)
+                        + curve_at(&channels.right, f).0
+                        + eq_at(&analysis.right.response, f))
+                        / 2.0
+                })
+            });
             for (ear, response, color) in ears {
-                let corrected = |frequency: f64| raw(frequency) + eq_at(response, frequency);
-                stroke(&corrected, color, 2.0);
+                let source = overlay
+                    .measurement_channels
+                    .as_ref()
+                    .map(|channels| {
+                        if ear == "L " {
+                            channels.left.as_slice()
+                        } else {
+                            channels.right.as_slice()
+                        }
+                    })
+                    .unwrap_or(measurement);
+                let corrected =
+                    |frequency: f64| curve_at(source, frequency).0 + eq_at(response, frequency);
+                let offset = common_offset.unwrap_or_else(|| alignment_level(&corrected));
+                stroke_at(&corrected, offset, color, 2.0);
                 let Some(target) = bounds else {
                     continue;
                 };
                 // Shade the gap between the curve and the bound it crosses.
-                let offset = alignment_level(&corrected);
                 let target_offset = alignment_level(&|frequency| {
                     let (low, high) = curve_at(target, frequency);
                     (low + high) / 2.0
                 });
-                for excursion in excursions(&corrected, target) {
+                for excursion in
+                    massiveeq_core::curve::excursions_at_level(&corrected, target, offset)
+                {
                     let within = (excursion.start, excursion.end);
                     trace(&corrected, offset, within);
                     for frequency in frequencies
@@ -519,7 +569,14 @@ fn draw_curves(
                 &format!("MEASURED ×{} PLACEMENTS", field.count),
                 (0.62, 0.64, 0.64),
             ),
-            None => key("MEASURED", (0.62, 0.64, 0.64)),
+            None => key(
+                if overlay.measurement_channels.is_some() {
+                    "MEASURED L/R"
+                } else {
+                    "MEASURED"
+                },
+                (0.62, 0.64, 0.64),
+            ),
         }
         key("PREDICTED", (1.0, 0.48, 0.10));
     }
@@ -614,12 +671,7 @@ pub fn line_points(
         .map(|index| 20.0 * 1000.0_f64.powf(index as f64 / (POINTS - 1) as f64))
         .collect::<Vec<_>>();
     let mut points = Vec::new();
-    let mut add = |values: &dyn Fn(f64) -> f64, aligned: bool| {
-        let offset = if aligned {
-            alignment_level(values)
-        } else {
-            0.0
-        };
+    let mut add = |values: &dyn Fn(f64) -> f64, offset: f64| {
         points.extend(frequencies.iter().map(|frequency| {
             (
                 x_for(*frequency, width),
@@ -637,25 +689,34 @@ pub fn line_points(
         })
         .unwrap_or_default();
     for response in &responses {
-        add(&|frequency| eq_at(response, frequency), false);
+        add(&|frequency| eq_at(response, frequency), 0.0);
     }
     if let Some(target) = &overlay.target {
-        add(
-            &|frequency| {
-                let (low, high) = curve_at(target, frequency);
-                (low + high) / 2.0
-            },
-            true,
-        );
+        let center = |frequency| {
+            let (low, high) = curve_at(target, frequency);
+            (low + high) / 2.0
+        };
+        add(&center, alignment_level(&center));
     }
     if let Some(measurement) = &overlay.measurement {
         let raw = |frequency: f64| curve_at(measurement, frequency).0;
-        add(&raw, true);
-        for response in &responses {
-            add(
-                &|frequency| raw(frequency) + eq_at(response, frequency),
-                true,
-            );
+        if let Some(channels) = &overlay.measurement_channels {
+            let offset = alignment_level(&raw);
+            add(&|f| curve_at(&channels.left, f).0, offset);
+            add(&|f| curve_at(&channels.right, f).0, offset);
+            if let Some(analysis) = analysis {
+                let left = |f| curve_at(&channels.left, f).0 + eq_at(&analysis.left.response, f);
+                let right = |f| curve_at(&channels.right, f).0 + eq_at(&analysis.right.response, f);
+                let offset = alignment_level(&|f| (left(f) + right(f)) / 2.0);
+                add(&left, offset);
+                add(&right, offset);
+            }
+        } else {
+            add(&raw, alignment_level(&raw));
+            for response in &responses {
+                let corrected = |frequency| raw(frequency) + eq_at(response, frequency);
+                add(&corrected, alignment_level(&corrected));
+            }
         }
     }
     points
@@ -762,6 +823,43 @@ fn frequency_label(frequency: f64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_placement_sees_both_measurement_lines_at_their_shared_level() {
+        let flat = |value| {
+            vec![
+                CurvePoint {
+                    frequency: 20.0,
+                    low: value,
+                    high: value,
+                },
+                CurvePoint {
+                    frequency: 20000.0,
+                    low: value,
+                    high: value,
+                },
+            ]
+        };
+        let overlay = Overlay {
+            measurement: Some(flat(0.0)),
+            measurement_channels: Some(massiveeq_core::MeasurementChannels {
+                left: flat(3.0),
+                right: flat(-3.0),
+            }),
+            ..Default::default()
+        };
+        let points = line_points(None, &overlay, 800.0, 400.0);
+        assert_eq!(points.len(), 240);
+        for gain in [3.0, -3.0] {
+            let expected = point_position(20.0, gain, 800.0, 400.0);
+            assert!(
+                points
+                    .iter()
+                    .any(|point| (point.0 - expected.0).abs() < 1e-9
+                        && (point.1 - expected.1).abs() < 1e-9)
+            );
+        }
+    }
 
     #[test]
     fn filter_handle_is_independent_of_output_preamp() {

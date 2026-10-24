@@ -41,6 +41,9 @@ support contract.
 
 ## Current features
 
+- In-app multi-file measurement imports with separate left/right averages,
+  an ear-balanced merged view, and retained original takes. See the
+  [measurement import workflow](docs/measurement-imports.md).
 **A plugin-style editor**
 
 - The graph is the editor, as in Pro-Q and other audio plugins: double-click
