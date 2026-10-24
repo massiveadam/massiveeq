@@ -2176,6 +2176,10 @@ fn wire_actions(
         let convolution_ui = convolution_ui.clone();
         move |_, _, _| {
             model.graph_dragging.set(false);
+            // The band panel held its side during the drag; place it afresh.
+            if let Some(overlay) = graph.parent() {
+                overlay.queue_allocate();
+            }
             let snapshot = model.document.borrow().clone();
             if state.borrow_mut().take().is_some()
                 && let Some(snapshot) = snapshot
@@ -3972,6 +3976,113 @@ fn kind_name(kind: FilterKind) -> &'static str {
     }
 }
 
+/// Where the band panel sits relative to its node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelSide {
+    Below,
+    Above,
+    Right,
+    Left,
+    /// At the top or bottom edge of the graph, clear of lines around the node.
+    Top,
+    Bottom,
+}
+
+/// Gap between the node and the panel, in px.
+const PANEL_GAP: f64 = 20.0;
+/// Keep the panel this far inside the graph, in px.
+const PANEL_MARGIN: f64 = 8.0;
+
+/// Top-left corner of the panel on `side` of `node`, kept inside the graph.
+fn panel_origin(
+    side: PanelSide,
+    node: (f64, f64),
+    size: (f64, f64),
+    area: (f64, f64),
+) -> (f64, f64) {
+    let (x, y) = node;
+    let (panel_width, panel_height) = size;
+    let (left, top) = match side {
+        PanelSide::Below => (x - panel_width / 2.0, y + PANEL_GAP),
+        PanelSide::Above => (x - panel_width / 2.0, y - PANEL_GAP - panel_height),
+        PanelSide::Right => (x + PANEL_GAP, y - panel_height / 2.0),
+        PanelSide::Left => (x - PANEL_GAP - panel_width, y - panel_height / 2.0),
+        // Below the legend and the gain readout.
+        PanelSide::Top => (x - panel_width / 2.0, 64.0),
+        PanelSide::Bottom => (x - panel_width / 2.0, area.1),
+    };
+    (
+        left.clamp(
+            PANEL_MARGIN,
+            (area.0 - panel_width - PANEL_MARGIN).max(PANEL_MARGIN),
+        ),
+        top.clamp(
+            PANEL_MARGIN,
+            (area.1 - panel_height - PANEL_MARGIN).max(PANEL_MARGIN),
+        ),
+    )
+}
+
+/// The side whose panel hides the least of the graph's lines. Lines near the
+/// node's frequency count most, a panel over the node itself is ruled out,
+/// and `previous` wins unless another side is clearly better.
+fn best_panel_side(
+    node: (f64, f64),
+    size: (f64, f64),
+    area: (f64, f64),
+    lines: &[(f64, f64)],
+    previous: Option<PanelSide>,
+) -> PanelSide {
+    let cost = |side: PanelSide| {
+        let (left, top) = panel_origin(side, node, size, area);
+        let (right, bottom) = (left + size.0, top + size.1);
+        let inside = |(x, y): (f64, f64), pad: f64| {
+            x >= left - pad && x <= right + pad && y >= top - pad && y <= bottom + pad
+        };
+        if inside(node, 12.0) {
+            return f64::INFINITY;
+        }
+        let hidden = lines
+            .iter()
+            .filter(|point| inside(**point, 0.0))
+            .map(|(x, _)| {
+                // Within about a panel's width of the node, a line is the
+                // band's own region.
+                let distance = (x - node.0) / 180.0;
+                1.0 + 4.0 * (-distance * distance).exp()
+            })
+            .sum::<f64>();
+        // The order breaks ties: next to the node before the edges.
+        hidden
+            + match side {
+                PanelSide::Below => 0.0,
+                PanelSide::Above => 0.5,
+                PanelSide::Right => 1.0,
+                PanelSide::Left => 1.5,
+                PanelSide::Top => 3.0,
+                PanelSide::Bottom => 3.5,
+            }
+    };
+    let sides = [
+        PanelSide::Below,
+        PanelSide::Above,
+        PanelSide::Right,
+        PanelSide::Left,
+        PanelSide::Top,
+        PanelSide::Bottom,
+    ];
+    let best = sides
+        .into_iter()
+        .min_by(|a, b| cost(*a).total_cmp(&cost(*b)))
+        .unwrap_or(PanelSide::Below);
+    match previous {
+        Some(previous) if cost(previous).is_finite() && cost(previous) <= cost(best) + 8.0 => {
+            previous
+        }
+        _ => best,
+    }
+}
+
 /// Build the selected band's floating panel and place it on `overlay`, which
 /// holds the graph. It follows the band's node as it moves.
 fn build_band_editor(
@@ -4092,7 +4203,9 @@ fn build_band_editor(
             }
         });
     }
-    // Sit just below the node, or above it near the bottom, inside the graph.
+    // Sit beside the node wherever the panel hides the least of the curves,
+    // above all near the band's own frequency, which is what is being tuned.
+    let side = Rc::new(Cell::new(PanelSide::Below));
     overlay.connect_get_child_position({
         let model = Rc::downgrade(model);
         let graph = graph.clone();
@@ -4117,26 +4230,33 @@ fn build_band_editor(
                 .get(index)
                 .map(|filter| (filter.frequency, filter.gain_db))?;
             let (width, height) = (graph.width() as f64, graph.height() as f64);
-            let (x, y) = graph::filter_point_position(frequency, gain_db, width, height);
+            let node = graph::filter_point_position(frequency, gain_db, width, height);
             // Narrow graphs get a narrower panel; its top row wraps to fit.
             let (minimum, natural, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
             let panel_width = (natural as f64).min(width - 16.0).max(minimum as f64);
             let (_, panel_height, _, _) =
                 panel.measure(gtk::Orientation::Vertical, panel_width as i32);
-            let panel_height = panel_height as f64;
-            let left = (x - panel_width / 2.0).clamp(8.0, (width - panel_width - 8.0).max(8.0));
-            let below = y + 20.0;
-            let top = if below + panel_height <= height - 8.0 {
-                below
-            } else {
-                (y - 20.0 - panel_height).max(8.0)
-            };
-            let rectangle = gtk::gdk::Rectangle::new(
-                left as i32,
-                top as i32,
-                panel_width as i32,
-                panel_height as i32,
+            let size = (panel_width, panel_height as f64);
+            let lines = graph::line_points(
+                model.analysis.borrow().as_ref(),
+                &model.overlay.borrow(),
+                width,
+                height,
             );
+            let previous = (placed
+                .get()
+                .is_some_and(|(placed_index, _)| placed_index == index))
+            .then(|| side.get());
+            // Moving the node keeps the panel on its side rather than
+            // letting it hop around under the pointer.
+            let chosen = match previous {
+                Some(previous) if model.graph_dragging.get() => previous,
+                _ => best_panel_side(node, size, (width, height), &lines, previous),
+            };
+            side.set(chosen);
+            let (left, top) = panel_origin(chosen, node, size, (width, height));
+            let rectangle =
+                gtk::gdk::Rectangle::new(left as i32, top as i32, panel_width as i32, panel_height);
             placed.set(Some((index, rectangle)));
             Some(rectangle)
         }
@@ -6350,6 +6470,59 @@ mod tests {
         SourceRate, apply_tone_fix, can_add_filter, device_focus_target, displayed_device_bypass,
         engine_tooltip, preferred_device_index, source_rate, tone_frequency, tone_position,
     };
+    use super::{PanelSide, best_panel_side, panel_origin};
+
+    #[test]
+    fn band_panel_moves_off_the_lines_near_its_node() {
+        let area = (1200.0, 700.0);
+        let size = (440.0, 190.0);
+        let node = (600.0, 300.0);
+        // A flat line just below the node: the default spot would cover it.
+        let below = (0..120)
+            .map(|step| (step as f64 * 10.0, 400.0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            best_panel_side(node, size, area, &below, None),
+            PanelSide::Above
+        );
+        // Lines above and below too: a side placement covers less of them
+        // near the node.
+        let both = below
+            .iter()
+            .map(|(x, _)| (*x, 200.0))
+            .chain(below.iter().copied())
+            .collect::<Vec<_>>();
+        let side = best_panel_side(node, size, area, &both, None);
+        assert!(
+            matches!(side, PanelSide::Left | PanelSide::Right),
+            "{side:?}"
+        );
+        // With nothing in the way the panel stays below, and a previous side
+        // holds when it is no worse.
+        assert_eq!(
+            best_panel_side(node, size, area, &[], None),
+            PanelSide::Below
+        );
+        assert_eq!(
+            best_panel_side(node, size, area, &[], Some(PanelSide::Left)),
+            PanelSide::Left
+        );
+    }
+
+    #[test]
+    fn band_panel_never_covers_its_node() {
+        let area = (1200.0, 700.0);
+        let size = (440.0, 190.0);
+        for node in [(70.0, 60.0), (1150.0, 650.0), (600.0, 690.0), (40.0, 350.0)] {
+            let side = best_panel_side(node, size, area, &[], None);
+            let (left, top) = panel_origin(side, node, size, area);
+            let covered = node.0 >= left - 12.0
+                && node.0 <= left + size.0 + 12.0
+                && node.1 >= top - 12.0
+                && node.1 <= top + size.1 + 12.0;
+            assert!(!covered, "{node:?} {side:?}");
+        }
+    }
     use massiveeq_core::DeviceKey;
 
     fn output(id: &str, connected: bool, is_default: bool, profile: Option<&str>) -> DeviceInfo {

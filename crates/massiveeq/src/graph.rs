@@ -600,6 +600,67 @@ fn draw_tone_marker(cr: &cairo::Context, frequency: f64, width: f64, height: f64
     let _ = cr.show_text(&label);
 }
 
+/// Screen positions along every line drawn on the graph: the EQ response
+/// for each ear, and with curves loaded the measurement, the corrected
+/// measurement, and the target. Used to keep the band panel off them.
+pub fn line_points(
+    analysis: Option<&ProfileAnalysis>,
+    overlay: &Overlay,
+    width: f64,
+    height: f64,
+) -> Vec<(f64, f64)> {
+    const POINTS: usize = 120;
+    let frequencies = (0..POINTS)
+        .map(|index| 20.0 * 1000.0_f64.powf(index as f64 / (POINTS - 1) as f64))
+        .collect::<Vec<_>>();
+    let mut points = Vec::new();
+    let mut add = |values: &dyn Fn(f64) -> f64, aligned: bool| {
+        let offset = if aligned {
+            alignment_level(values)
+        } else {
+            0.0
+        };
+        points.extend(frequencies.iter().map(|frequency| {
+            (
+                x_for(*frequency, width),
+                y_for(values(*frequency) - offset, height),
+            )
+        }));
+    };
+    let responses = analysis
+        .map(|analysis| {
+            if responses_match(&analysis.left.response, &analysis.right.response) {
+                vec![&analysis.left.response]
+            } else {
+                vec![&analysis.left.response, &analysis.right.response]
+            }
+        })
+        .unwrap_or_default();
+    for response in &responses {
+        add(&|frequency| eq_at(response, frequency), false);
+    }
+    if let Some(target) = &overlay.target {
+        add(
+            &|frequency| {
+                let (low, high) = curve_at(target, frequency);
+                (low + high) / 2.0
+            },
+            true,
+        );
+    }
+    if let Some(measurement) = &overlay.measurement {
+        let raw = |frequency: f64| curve_at(measurement, frequency).0;
+        add(&raw, true);
+        for response in &responses {
+            add(
+                &|frequency| raw(frequency) + eq_at(response, frequency),
+                true,
+            );
+        }
+    }
+    points
+}
+
 pub fn point_position(frequency: f64, gain: f64, width: f64, height: f64) -> (f64, f64) {
     (x_for(frequency, width), y_for(gain, height))
 }

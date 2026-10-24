@@ -16,6 +16,10 @@
 
 ### Changed
 
+- The selected band's panel moves to whichever side of its node hides the
+  least of the curves near that band, using the empty top or bottom of the
+  graph when the space beside the node is busy, so it no longer covers the
+  region being tuned. It holds its place while the node is dragged.
 - Tilt is now a real tilt: a constant slope in dB per octave (±1.5) that
   pivots at 1 kHz and turns the whole 20 Hz–20 kHz response, instead of a
   step between two shelves at 1 kHz. It is one setting on the profile, not
