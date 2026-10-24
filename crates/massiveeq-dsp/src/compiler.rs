@@ -253,10 +253,7 @@ pub fn compile_profile(
     let mut channels = Vec::with_capacity(channel_ids.len());
     let mut source_preamps = Vec::with_capacity(channel_ids.len());
     for (output_index, channel) in channel_ids.iter().copied().enumerate() {
-        let active_filters = profile
-            .filters_for(channel)
-            .filter(|filter| filter.enabled)
-            .collect::<Vec<_>>();
+        let active_filters = profile.active_filters_for(channel);
         let biquads = active_filters
             .iter()
             .map(|filter| BiquadCoefficients::from_filter(filter, options.sample_rate as f64))

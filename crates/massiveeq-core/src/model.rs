@@ -8,6 +8,22 @@ use std::{collections::HashMap, path::PathBuf};
 pub const MAX_FILTERS_PER_CHANNEL: usize = 64;
 pub const MAX_GRAPHIC_POINTS: usize = 4096;
 pub const MAX_INCLUDE_DEPTH: usize = 16;
+/// Steepest tilt the editor offers, in dB per octave either way.
+pub const MAX_TILT_DB_PER_OCTAVE: f64 = 1.5;
+/// Pivot of the tilt: the response there stays at 0 dB.
+pub const TILT_PIVOT_HZ: f64 = 1000.0;
+/// Shelf centers two octaves apart and placed symmetrically around the pivot,
+/// so their tails cancel at 1 kHz. Low shelves below, high shelves above.
+const TILT_SHELVES: [(FilterKind, f64); 5] = [
+    (FilterKind::LowShelf, 31.25),
+    (FilterKind::LowShelf, 125.0),
+    (FilterKind::LowShelf, 500.0),
+    (FilterKind::HighShelf, 2000.0),
+    (FilterKind::HighShelf, 8000.0),
+];
+/// Shelf Q that keeps the cascade within about 0.15 dB of a straight slope
+/// from 25 Hz to 16 kHz.
+const TILT_Q: f64 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Channel {
@@ -128,6 +144,33 @@ pub struct ProfileDocument {
     pub graphic_eqs: Vec<GraphicEq>,
     pub convolutions: Vec<Convolution>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Constant spectral slope in dB per octave around [`TILT_PIVOT_HZ`],
+    /// applied across the whole range. Positive is brighter.
+    #[serde(default)]
+    pub tilt_db_per_octave: f64,
+}
+
+/// Shelves that approximate a constant `slope` in dB per octave pivoting at
+/// 1 kHz. Each shelf steps by two octaves' worth of slope.
+pub fn tilt_filters(slope: f64) -> Vec<Filter> {
+    if slope == 0.0 {
+        return Vec::new();
+    }
+    TILT_SHELVES
+        .iter()
+        .map(|&(kind, frequency)| Filter {
+            enabled: true,
+            kind,
+            frequency,
+            gain_db: if kind == FilterKind::LowShelf {
+                -2.0 * slope
+            } else {
+                2.0 * slope
+            },
+            q: TILT_Q,
+            channels: ChannelSelection::All,
+        })
+        .collect()
 }
 
 impl ProfileDocument {
@@ -139,6 +182,7 @@ impl ProfileDocument {
             graphic_eqs: Vec::new(),
             convolutions: Vec::new(),
             diagnostics: Vec::new(),
+            tilt_db_per_octave: 0.0,
         }
     }
 
@@ -161,6 +205,16 @@ impl ProfileDocument {
         self.filters
             .iter()
             .filter(move |filter| filter.channels.contains(channel))
+    }
+
+    /// Every enabled filter that shapes `channel`, including the shelves the
+    /// tilt expands into. This is what the DSP runs and the graph plots.
+    pub fn active_filters_for(&self, channel: Channel) -> Vec<Filter> {
+        self.filters_for(channel)
+            .filter(|filter| filter.enabled)
+            .cloned()
+            .chain(tilt_filters(self.tilt_db_per_octave))
+            .collect()
     }
 }
 

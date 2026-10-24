@@ -11,9 +11,17 @@
 - Choose the measurement fixture from a list (B&K 5128, GRAS KB50xx, B&K 4128,
   IEC 711) and recognise fixtures however they were typed; a measurement
   from another fixture than its target or bounds is named in the note.
+- Drag the line above the footer to make it taller and see more rows of
+  band chips; drag it back down to return the room to the graph.
 
 ### Changed
 
+- Tilt is now a real tilt: a constant slope in dB per octave (±1.5) that
+  pivots at 1 kHz and turns the whole 20 Hz–20 kHz response, instead of a
+  step between two shelves at 1 kHz. It is one setting on the profile, not
+  extra bands, and saves as five ordinary shelf filters so exported profiles
+  play the same in Equalizer APO. Profiles with the old 1 kHz shelf pair keep
+  it as two normal bands.
 - Align curves at 630 Hz ± one octave, as GraphWorks does, instead of across
   300 Hz–3 kHz.
 

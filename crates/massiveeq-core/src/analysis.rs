@@ -124,6 +124,7 @@ fn analyze_channel(
     frequencies: &[f64],
 ) -> ChannelAnalysis {
     let preamp_db = profile.preamp_for(channel);
+    let filters = profile.active_filters_for(channel);
     let response = frequencies
         .iter()
         .map(|frequency| {
@@ -132,7 +133,7 @@ fn analyze_channel(
             // are represented separately and must never move the graph while
             // a filter is being dragged.
             let mut gain = 0.0;
-            for filter in profile.filters_for(channel).filter(|filter| filter.enabled) {
+            for filter in &filters {
                 gain += filter_gain_db(filter, *frequency, sample_rate);
             }
             for eq in profile
@@ -328,6 +329,30 @@ fn db_to_power(db: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TILT_PIVOT_HZ;
+
+    #[test]
+    fn tilt_is_a_straight_slope_through_the_pivot() {
+        let mut profile = ProfileDocument::empty("tilt");
+        profile.tilt_db_per_octave = 1.0;
+        for sample_rate in [44_100.0, 48_000.0, 96_000.0] {
+            for octave in -5..=4 {
+                let frequency = TILT_PIVOT_HZ * 2f64.powi(octave);
+                let gain = profile
+                    .active_filters_for(Channel::Left)
+                    .iter()
+                    .map(|filter| filter_gain_db(filter, frequency, sample_rate))
+                    .sum::<f64>();
+                // The last shelf sits at 8 kHz, so the slope eases off a
+                // little toward the top octave.
+                let tolerance = if octave == 4 { 0.3 } else { 0.2 };
+                assert!(
+                    (gain - f64::from(octave)).abs() < tolerance,
+                    "{gain} dB at {frequency} Hz, {sample_rate} Hz"
+                );
+            }
+        }
+    }
     use crate::parser::parse_text;
 
     #[test]

@@ -48,8 +48,8 @@ support contract.
 - Low shelf, peak, and high shelf bands, as on Squiglink, each drawn as its
   curve shape; the selected band's knobs float beside its node
 - Per-ear bands (left, both, right), on/off per band, and undo/redo
-- **Bass**, **Tilt**, and **Output** knobs that write ordinary shelf filters
-  and trim
+- **Bass** (a 105 Hz shelf), **Tilt** (a whole-range slope in dB per octave
+  around 1 kHz), and **Output** knobs
 - A synchronized Equalizer APO text view (**TEXT**, `Ctrl+E`) with live
   validation
 - Resizes down to narrow windows; controls fold into the footer

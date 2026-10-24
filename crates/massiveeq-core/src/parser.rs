@@ -24,7 +24,14 @@ pub enum ParseError {
 struct ParserState {
     channels: ChannelSelection,
     visited: HashSet<PathBuf>,
+    /// Slope from a `# MassiveEQ tilt:` line and the index of the first
+    /// filter after it, where the generated shelves should follow.
+    tilt: Option<(f64, usize)>,
 }
+
+/// Comment that marks the generated tilt shelves in a saved profile. Other
+/// APO hosts ignore it and simply run the shelves as ordinary filters.
+const TILT_MARKER: &str = "# MassiveEQ tilt:";
 
 pub fn parse_file(path: impl AsRef<Path>) -> Result<ProfileDocument, ParseError> {
     let path = path.as_ref();
@@ -36,8 +43,10 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<ProfileDocument, ParseError>
     let mut state = ParserState {
         channels: ChannelSelection::All,
         visited: HashSet::new(),
+        tilt: None,
     };
     parse_path_into(path, 0, &mut state, &mut profile)?;
+    extract_tilt(&mut profile, state.tilt);
     enforce_limits(&mut profile);
     Ok(profile)
 }
@@ -47,8 +56,10 @@ pub fn parse_text(name: impl Into<String>, text: &str) -> ProfileDocument {
     let mut state = ParserState {
         channels: ChannelSelection::All,
         visited: HashSet::new(),
+        tilt: None,
     };
     parse_lines(text, Path::new("profile.txt"), 0, &mut state, &mut profile);
+    extract_tilt(&mut profile, state.tilt);
     enforce_limits(&mut profile);
     profile
 }
@@ -85,6 +96,15 @@ fn parse_lines(
     for (index, raw) in text.lines().enumerate() {
         let line_no = index + 1;
         let line = raw.trim();
+        if let Some(slope) = line
+            .strip_prefix(TILT_MARKER)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && value.abs() <= MAX_TILT_DB_PER_OCTAVE)
+        {
+            state.tilt = Some((slope, profile.filters.len()));
+            continue;
+        }
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -435,15 +455,39 @@ fn enforce_limits(profile: &mut ProfileDocument) {
     }
 }
 
+/// Turns the shelves after a tilt marker back into the profile's tilt. If
+/// they were edited by hand and no longer match, they stay ordinary filters.
+fn extract_tilt(profile: &mut ProfileDocument, marker: Option<(f64, usize)>) {
+    let Some((slope, start)) = marker else {
+        return;
+    };
+    let expected = tilt_filters(slope);
+    let end = start + expected.len();
+    let matches = profile.filters.get(start..end).is_some_and(|found| {
+        found.iter().zip(&expected).all(|(found, expected)| {
+            found.enabled
+                && found.kind == expected.kind
+                && found.channels == expected.channels
+                && (found.frequency - expected.frequency).abs() < 0.006
+                && (found.gain_db - expected.gain_db).abs() < 0.006
+                && (found.q - expected.q).abs() < 0.00006
+        })
+    });
+    if matches {
+        profile.filters.drain(start..end);
+        profile.tilt_db_per_octave = slope;
+    }
+}
+
 pub fn serialize_profile(profile: &ProfileDocument) -> String {
     // Filters keep their document order, so band numbers in the editor, the
     // graph, and this text agree; a Channel: line is written whenever the
     // channel changes.
     let mut out = format!("# MassiveEQ profile: {}\n", profile.name);
     let mut current = None;
-    let mut switch = |out: &mut String, channel: ChannelSelection| {
-        if current != Some(channel) {
-            current = Some(channel);
+    let switch = |out: &mut String, current: &mut Option<ChannelSelection>, channel| {
+        if *current != Some(channel) {
+            *current = Some(channel);
             let name = match channel {
                 ChannelSelection::All => "ALL",
                 ChannelSelection::Left => "L",
@@ -453,11 +497,11 @@ pub fn serialize_profile(profile: &ProfileDocument) -> String {
         }
     };
     for gain in &profile.preamps {
-        switch(&mut out, gain.channels);
+        switch(&mut out, &mut current, gain.channels);
         out.push_str(&format!("Preamp: {:.2} dB\n", gain.gain_db));
     }
     for (index, filter) in profile.filters.iter().enumerate() {
-        switch(&mut out, filter.channels);
+        switch(&mut out, &mut current, filter.channels);
         out.push_str(&format!(
             "Filter {}: {} {} Fc {:.2} Hz Gain {:.2} dB Q {:.4}\n",
             index + 1,
@@ -468,8 +512,26 @@ pub fn serialize_profile(profile: &ProfileDocument) -> String {
             filter.q
         ));
     }
+    let tilt = tilt_filters(profile.tilt_db_per_octave);
+    if !tilt.is_empty() {
+        out.push_str(&format!(
+            "\n{TILT_MARKER} {:.4} dB/oct around 1 kHz (the filters below apply it)\n",
+            profile.tilt_db_per_octave
+        ));
+        current = None;
+    }
+    for filter in &tilt {
+        switch(&mut out, &mut current, filter.channels);
+        out.push_str(&format!(
+            "Filter: ON {} Fc {:.2} Hz Gain {:.2} dB Q {:.4}\n",
+            filter.kind.apo_name(),
+            filter.frequency,
+            filter.gain_db,
+            filter.q
+        ));
+    }
     for eq in &profile.graphic_eqs {
-        switch(&mut out, eq.channels);
+        switch(&mut out, &mut current, eq.channels);
         let points = eq
             .points
             .iter()
@@ -479,7 +541,7 @@ pub fn serialize_profile(profile: &ProfileDocument) -> String {
         out.push_str(&format!("GraphicEQ: {points}\n"));
     }
     for convolution in &profile.convolutions {
-        switch(&mut out, convolution.channels);
+        switch(&mut out, &mut current, convolution.channels);
         out.push_str(&format!("Convolution: {}\n", convolution.path.display()));
     }
     out
@@ -522,6 +584,34 @@ Filter 3: OFF HSC Fc 8000 Hz Gain -1.5 dB Q 0.8
         assert_eq!(round.filters, profile.filters);
         assert_eq!(round.preamp_for(Channel::Left), -3.0);
         assert_eq!(round.preamp_for(Channel::Right), -3.0);
+    }
+
+    #[test]
+    fn tilt_round_trips_as_plain_apo_filters() {
+        let mut profile = parse_text(
+            "fixture",
+            "Channel: L\nFilter 1: ON PK Fc 220 Hz Gain -2 dB Q 1.2\nGraphicEQ: 20 0; 20000 0",
+        );
+        profile.tilt_db_per_octave = -0.35;
+        let text = serialize_profile(&profile);
+        // Any APO host sees five ordinary shelves on both channels.
+        assert_eq!(text.matches("Filter: ON ").count(), 5, "{text}");
+        let round = parse_text("fixture", &text);
+        assert!(round.is_activatable(), "{:?}", round.diagnostics);
+        assert_eq!(round.tilt_db_per_octave, -0.35);
+        assert_eq!(round.filters, profile.filters);
+        assert_eq!(round.graphic_eqs[0].channels, ChannelSelection::Left);
+        assert_eq!(round.active_filters_for(Channel::Right).len(), 5);
+    }
+
+    #[test]
+    fn hand_edited_tilt_shelves_stay_ordinary_filters() {
+        let mut profile = ProfileDocument::empty("fixture");
+        profile.tilt_db_per_octave = 0.5;
+        let text = serialize_profile(&profile).replace("Gain 1.00 dB", "Gain 1.50 dB");
+        let round = parse_text("fixture", &text);
+        assert_eq!(round.tilt_db_per_octave, 0.0);
+        assert_eq!(round.filters.len(), 5);
     }
 
     #[test]

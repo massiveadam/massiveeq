@@ -11,9 +11,9 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use massiveeq_core::{
     COMPARISON_BYPASS_ID, ChannelSelection, ComparisonSet, DeviceInfo, Filter, FilterKind,
-    ImpulseLayout, MAX_COMPARISON_PROFILES, MAX_FILTERS_PER_CHANNEL, ProfileAnalysis,
-    ProfileDocument, ProfileInfo, analysis::ResponsePoint, analyze_profile_preview, parse_text,
-    serialize_profile, sort_profiles,
+    ImpulseLayout, MAX_COMPARISON_PROFILES, MAX_FILTERS_PER_CHANNEL, MAX_TILT_DB_PER_OCTAVE,
+    ProfileAnalysis, ProfileDocument, ProfileInfo, analysis::ResponsePoint,
+    analyze_profile_preview, parse_text, serialize_profile, sort_profiles,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -645,7 +645,8 @@ fn build_ui(app: &adw::Application) {
 
     // Band chips select bands; the panel on the graph edits them.
     // Chips wrap onto a second row when they outgrow the footer; past two
-    // rows the strip scrolls rather than growing the footer.
+    // rows the strip scrolls rather than growing the footer, unless the
+    // footer is dragged taller, which shows more rows.
     let filter_list = gtk::FlowBox::new();
     filter_list.set_orientation(gtk::Orientation::Horizontal);
     filter_list.set_min_children_per_line(1);
@@ -653,18 +654,19 @@ fn build_ui(app: &adw::Application) {
     filter_list.set_selection_mode(gtk::SelectionMode::None);
     filter_list.set_column_spacing(6);
     filter_list.set_row_spacing(BAND_CHIP_SPACING as u32);
-    filter_list.set_valign(gtk::Align::Center);
+    filter_list.set_valign(gtk::Align::Start);
     filter_list.set_halign(gtk::Align::Start);
     filter_list.add_css_class("band-chips");
     let chips_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .propagate_natural_height(true)
+        .min_content_height(BAND_CHIP_HEIGHT)
         .max_content_height(2 * BAND_CHIP_HEIGHT + BAND_CHIP_SPACING)
         .propagate_natural_width(true)
         // Not from the chips: the add button follows the last chip.
         .hexpand(false)
-        .valign(gtk::Align::Center)
+        .vexpand(true)
         .child(&filter_list)
         .build();
     let add_filter_button = gtk::Button::from_icon_name("list-add-symbolic");
@@ -809,7 +811,7 @@ fn build_ui(app: &adw::Application) {
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 14);
     footer.add_css_class("footer");
     let footer_start = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    footer_start.set_valign(gtk::Align::Center);
+    footer_start.set_valign(gtk::Align::Start);
     footer_start.append(&device_bypass);
     footer_start.append(&listen_group);
     footer.append(&footer_start);
@@ -818,7 +820,7 @@ fn build_ui(app: &adw::Application) {
     bands_row.append(&chips_scroll);
     footer.append(&bands_row);
     let footer_end = gtk::Box::new(gtk::Orientation::Horizontal, 16);
-    footer_end.set_valign(gtk::Align::Center);
+    footer_end.set_valign(gtk::Align::Start);
     let macro_knobs = gtk::Box::new(gtk::Orientation::Horizontal, 14);
     footer_end.append(&macro_knobs);
     let editors = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -828,8 +830,20 @@ fn build_ui(app: &adw::Application) {
     editors.append(&curves_ui.menu);
     footer_end.append(&editors);
     footer.append(&footer_end);
-    toolbar.set_content(Some(&main_stack));
-    toolbar.add_bottom_bar(&footer);
+    // The line above the footer drags: up for more rows of band chips, down
+    // to give the graph the room back. The footer never shrinks below its
+    // own controls.
+    let footer_split = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .start_child(&main_stack)
+        .resize_start_child(true)
+        .shrink_start_child(false)
+        .end_child(&footer)
+        .resize_end_child(false)
+        .shrink_end_child(false)
+        .build();
+    footer_split.add_css_class("footer-split");
+    toolbar.set_content(Some(&footer_split));
     window.set_content(Some(&toolbar));
 
     // The status strip gives way first; narrow windows stack the footer.
@@ -3699,7 +3713,7 @@ fn sync_listening(model: &Model) {
     ui.reference.set_active(model.hear_reference.get());
     if let Some(document) = model.document.borrow().as_ref() {
         ui.bass.set_value(editing::bass_db(document));
-        ui.tilt.set_value(editing::tilt_db(document));
+        ui.tilt.set_value(editing::tilt_db_per_octave(document));
     }
     ui.syncing.set(false);
 }
@@ -3737,12 +3751,19 @@ fn build_listening_controls(
         "Broad low shelf at 105 Hz. This adjustment remains editable as a normal EQ band.",
     ));
     let tilt = knob::LabeledKnob::new(
-        knob::Knob::new(-12.0, 12.0, 0.0, knob::Taper::Linear, true),
+        knob::Knob::new(
+            -MAX_TILT_DB_PER_OCTAVE,
+            MAX_TILT_DB_PER_OCTAVE,
+            0.0,
+            knob::Taper::Linear,
+            true,
+        ),
         "Tilt",
-        |value| signed_db(value, 1),
+        |value| signed_db(value, 2),
     );
     tilt.knob.set_tooltip_text(Some(
-        "Positive is brighter; negative is warmer. Balanced low/high shelves around 1 kHz.",
+        "Slope in dB per octave across the whole range, pivoting at 1 kHz. \
+         Positive is brighter; negative is warmer. −0.5 is about +3 dB at 20 Hz and −2 dB at 20 kHz.",
     ));
     *model.listening.borrow_mut() = Some(ListeningUi {
         undo: undo.clone(),
@@ -5708,8 +5729,16 @@ fn install_css() {
         /* Footer: bypass and listening, bands, macros, editors */
         .footer {
             background-color: #0b0b0c;
-            border-top: 1px solid #222225;
             padding: 8px 14px;
+        }
+
+        paned.footer-split > separator {
+            background-color: #222225;
+            min-height: 1px;
+        }
+
+        paned.footer-split > separator:hover {
+            background-color: #ff7a1a;
         }
 
         button.footer-toggle,
