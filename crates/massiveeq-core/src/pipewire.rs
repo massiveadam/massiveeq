@@ -1,4 +1,6 @@
-use crate::{Channel, ChannelSelection, DeviceInfo, ProfileAnalysis, ProfileDocument};
+use crate::{
+    Channel, ChannelSelection, DeviceInfo, ProfileAnalysis, ProfileDocument, tilt_filters,
+};
 use std::{f64::consts::PI, path::Path};
 #[cfg(unix)]
 use std::{ffi::CString, os::unix::ffi::OsStrExt};
@@ -26,7 +28,8 @@ pub fn build_filter_config(
         inputs.push(format!("\"{gain_name}:In\""));
         let mut previous = gain_name;
 
-        for (filter_index, filter) in profile.filters_for(channel).enumerate() {
+        let tilt = tilt_filters(profile.tilt_db_per_octave);
+        for (filter_index, filter) in profile.filters_for(channel).chain(tilt.iter()).enumerate() {
             let name = format!("eq_{suffix}_{filter_index}");
             let mixer_name = format!("mix_{suffix}_{filter_index}");
             let (wet, dry) = if filter.enabled {
