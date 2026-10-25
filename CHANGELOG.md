@@ -29,6 +29,12 @@
 - Tone generator: the service runs the sweep itself, so it glides at an even
   rate instead of stepping every 25 ms and stalling while the editor is
   busy. Moving the frequency by hand also glides instead of jumping.
+- Tone generator: while the level is held for the tone, a −1 dBFS safety
+  limiter guards the output, so music or a notification playing alongside
+  cannot clip. The tone itself always stays below it and is never touched.
+- Tone generator: the tone has its own connection in the editor and its own
+  lock in the service, so moving it never waits behind a profile preview
+  and starting it never holds up other requests.
 - The selected band's panel moves to whichever side of its node hides the
   least of the curves near that band, using the empty top or bottom of the
   graph when the space beside the node is busy, so it no longer covers the

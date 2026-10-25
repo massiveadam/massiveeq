@@ -97,6 +97,11 @@ pub struct CompiledProfile {
     pub channels: Vec<CompiledChannel>,
     pub analysis: CompiledAnalysis,
     pub latency_frames: u32,
+    /// Catch anything over -1 dBFS at the output. Only a held tone-generator
+    /// gain needs it: that gain may run above what keeps full-scale music
+    /// clean, and the limiter keeps music or a notification from clipping
+    /// while never touching the quieter tone.
+    pub output_limit: bool,
 }
 
 pub fn compile_bypass(sample_rate: u32, quantum: u32, output_channels: u32) -> CompiledProfile {
@@ -147,6 +152,7 @@ pub fn compile_bypass_with_gain(
             headroom_limited: false,
         },
         latency_frames: 0,
+        output_limit: false,
     }
 }
 
@@ -191,6 +197,7 @@ pub fn hold_output_gain(
     for channel in &mut profile.channels {
         channel.gain_linear *= change;
     }
+    profile.output_limit = true;
     analysis.safety_attenuation_db = effective - analysis.match_gain_db - analysis.manual_trim_db;
     analysis.effective_gain_db = effective;
     analysis.final_peak_db = peak + effective;
@@ -363,6 +370,7 @@ pub fn compile_profile(
         channels,
         analysis,
         latency_frames,
+        output_limit: false,
     })
 }
 

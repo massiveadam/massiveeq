@@ -26,8 +26,6 @@ pub struct AppState {
     devices: Vec<DeviceInfo>,
     graph: device::GraphInfo,
     host: FilterHost,
-    /// Test tone for the editor's tone finder, renewed while it is open.
-    tone: Option<tone::Tone>,
     live_edits: live_edit::Sessions,
 }
 
@@ -98,10 +96,12 @@ async fn main() -> Result<()> {
         library,
         devices: Vec::new(),
         graph: device::GraphInfo::default(),
-        tone: None,
         live_edits: live_edit::Sessions::new(),
         host,
     }));
+    // The test tone lives outside the state lock, so retuning it never waits
+    // behind a profile compile and starting it never blocks other calls.
+    let tone: tone::ToneSlot = Arc::new(Mutex::new(None));
     // Own the control name before creating any PipeWire filters. A second
     // daemon must fail without touching the live audio graph.
     let connection = zbus::connection::Builder::session()?
@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
             "/org/massiveeq/Service1",
             Service {
                 state: state.clone(),
+                tone: tone.clone(),
             },
         )?
         .build()
@@ -147,6 +148,7 @@ async fn main() -> Result<()> {
 
     // A tone must never outlive the editor that asked for it.
     let tone_state = state.clone();
+    let expiring_tone = tone.clone();
     let tone_task = tokio::spawn(async move {
         let mut timer = interval(Duration::from_secs(1));
         loop {
@@ -169,8 +171,10 @@ async fn main() -> Result<()> {
                     .reconcile(storage, library, devices, false, live_edits)
                     .await;
             }
-            if guard.tone.as_ref().is_some_and(tone::Tone::expired)
-                && let Some(tone) = guard.tone.take()
+            drop(guard);
+            let mut playing = expiring_tone.lock().await;
+            if playing.as_ref().is_some_and(tone::Tone::expired)
+                && let Some(tone) = playing.take()
             {
                 tone.stop();
             }
@@ -180,7 +184,7 @@ async fn main() -> Result<()> {
     // After a package upgrade, stop cleanly and become the new version once
     // no tone is playing. An open editor renews its live draft every two
     // seconds, so the new daemon picks the edit back up by itself.
-    let upgrade_state = state.clone();
+    let upgrade_tone = tone.clone();
     let upgraded = tokio::select! {
         result = shutdown_signal() => {
             result?;
@@ -191,7 +195,7 @@ async fn main() -> Result<()> {
             loop {
                 timer.tick().await;
                 if massiveeq_core::upgrade::executable_replaced()
-                    && upgrade_state.lock().await.tone.is_none()
+                    && upgrade_tone.lock().await.is_none()
                 {
                     break;
                 }
@@ -201,7 +205,7 @@ async fn main() -> Result<()> {
     event_task.abort();
     health_task.abort();
     tone_task.abort();
-    if let Some(tone) = state.lock().await.tone.take() {
+    if let Some(tone) = tone.lock().await.take() {
         tone.stop();
     }
     monitor.stop();

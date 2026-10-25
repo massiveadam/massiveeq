@@ -443,6 +443,9 @@ impl Generator {
     }
 }
 
+/// The one tone the service may be playing, shared outside the state lock.
+pub type ToneSlot = Arc<tokio::sync::Mutex<Option<Tone>>>;
+
 /// A playing tone. Dropping it, or not renewing it, stops playback.
 pub struct Tone {
     shared: Arc<Shared>,
