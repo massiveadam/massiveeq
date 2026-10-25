@@ -4,6 +4,14 @@
 
 ### Added
 
+- Volume in MassiveEQ (footer → VOLUME, per output): the volume keys set
+  MassiveEQ's volume on an even decibel scale, 0.5 dB per 1%, while the
+  device keeps its own volume as the ceiling. The level survives restarts, and
+  the device is turned down in its place whenever MassiveEQ's sink goes away,
+  so stopping, upgrading or turning the option off is never louder.
+- Block volume jumps (same menu): undo any raise of more than 10% at once,
+  such as an app or Bluetooth headphones pushing the volume to 100%. Volume
+  keys still work, and the menu shows the last jump it blocked.
 - Import several left/right measurement files in Curves → Measurements,
   average takes per ear, or merge both ears with equal weight. Preview and
   revise ear assignments, remove takes, and optionally match levels before

@@ -1,9 +1,17 @@
+use crate::volume_guard::VolumeGuard;
 use anyhow::{Context, Result};
 use pipewire as pw;
-use pw::{proxy::ProxyT, types::ObjectType};
+use pw::{
+    proxy::ProxyT,
+    spa::{
+        self,
+        pod::{Pod, Value, ValueArray, deserialize::PodDeserializer},
+    },
+    types::ObjectType,
+};
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
         Arc,
@@ -46,14 +54,21 @@ pub struct DeviceMonitor {
     thread: Option<JoinHandle<Result<()>>>,
 }
 
+/// A volume to put back on a node, by name, after a blocked jump.
+pub type VolumeRevert = (String, f64);
+
 impl DeviceMonitor {
-    pub fn spawn(events: Sender<()>) -> Result<Self> {
+    pub fn spawn(
+        events: Sender<()>,
+        guard: Arc<VolumeGuard>,
+        reverts: Sender<VolumeRevert>,
+    ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("massiveeq-registry".into())
-            .spawn(move || run_monitor(events, thread_stop, started_tx))
+            .spawn(move || run_monitor(events, guard, reverts, thread_stop, started_tx))
             .context("failed to start the PipeWire registry monitor")?;
         match started_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => Ok(Self {
@@ -88,6 +103,8 @@ impl Drop for DeviceMonitor {
 
 fn run_monitor(
     events: Sender<()>,
+    guard: Arc<VolumeGuard>,
+    reverts: Sender<VolumeRevert>,
     stop: Arc<AtomicBool>,
     started: mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> Result<()> {
@@ -103,6 +120,8 @@ fn run_monitor(
         let removal_store = objects.clone();
         let global_events = events.clone();
         let changes = Rc::new(RefCell::new(RegistryChanges::default()));
+        let names: Rc<RefCell<HashMap<u32, String>>> = Rc::default();
+        let removed_names = names.clone();
         let added_changes = changes.clone();
         let removed_changes = changes;
         let _listener = registry
@@ -119,12 +138,40 @@ fn run_monitor(
                     ObjectType::Node => {
                         if let Ok(node) = registry.bind::<pw::node::Node, _>(object) {
                             let update_events = global_events.clone();
+                            let id = object.id;
+                            let info_names = names.clone();
+                            let param_names = names.clone();
+                            let guard = guard.clone();
+                            let reverts = reverts.clone();
                             let listener = node
                                 .add_listener_local()
-                                .info(move |_| {
+                                .info(move |info| {
+                                    if let Some(name) =
+                                        info.props().and_then(|props| props.get("node.name"))
+                                    {
+                                        info_names.borrow_mut().insert(id, name.to_owned());
+                                    }
                                     let _ = update_events.try_send(());
                                 })
+                                // Volume changes, as they happen: an app or a
+                                // Bluetooth device raising a guarded output's
+                                // volume is undone at once.
+                                .param(move |_, kind, _, _, param| {
+                                    if kind != spa::param::ParamType::Props {
+                                        return;
+                                    }
+                                    let Some(level) = param.and_then(props_volume_level) else {
+                                        return;
+                                    };
+                                    let Some(name) = param_names.borrow().get(&id).cloned() else {
+                                        return;
+                                    };
+                                    if let Some(restore) = guard.observe(&name, level) {
+                                        let _ = reverts.try_send((name, restore));
+                                    }
+                                })
                                 .register();
+                            node.subscribe_params(&[spa::param::ParamType::Props]);
                             object_store.borrow_mut().push((
                                 object.id,
                                 Box::new(node),
@@ -153,6 +200,7 @@ fn run_monitor(
                 }
             })
             .global_remove(move |id| {
+                removed_names.borrow_mut().remove(&id);
                 let removed = {
                     let mut objects = removal_store.borrow_mut();
                     objects
@@ -192,9 +240,51 @@ fn run_monitor(
     result
 }
 
+/// The desktop volume level of a node's Props: its loudest channel.
+fn props_volume_level(param: &Pod) -> Option<f64> {
+    let (_, value) = PodDeserializer::deserialize_any_from(param.as_bytes()).ok()?;
+    let Value::Object(object) = value else {
+        return None;
+    };
+    object
+        .properties
+        .into_iter()
+        .find_map(|property| match (property.key, property.value) {
+            (spa::sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(volumes))) => {
+                volumes
+                    .iter()
+                    .map(|volume| massiveeq_core::volume_level(*volume as f64))
+                    .reduce(f64::max)
+            }
+            _ => None,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_loudest_channel_volume_from_props() {
+        let props = Value::Object(spa::pod::Object {
+            type_: spa::utils::SpaTypes::ObjectParamProps.as_raw(),
+            id: spa::param::ParamType::Props.as_raw(),
+            properties: vec![
+                spa::pod::Property::new(spa::sys::SPA_PROP_mute, Value::Bool(false)),
+                spa::pod::Property::new(
+                    spa::sys::SPA_PROP_channelVolumes,
+                    Value::ValueArray(ValueArray::Float(vec![0.125, 0.064])),
+                ),
+            ],
+        });
+        let bytes =
+            spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &props)
+                .unwrap()
+                .0
+                .into_inner();
+        let level = props_volume_level(Pod::from_bytes(&bytes).unwrap()).unwrap();
+        assert!((level - 0.5).abs() < 1e-6);
+    }
 
     #[test]
     fn observer_clients_do_not_trigger_discovery_on_connect_or_disconnect() {

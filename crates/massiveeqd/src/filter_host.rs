@@ -1,4 +1,4 @@
-use crate::{device, native_filter::NativeFilter};
+use crate::{device, dsp_volume::DspVolume, native_filter::NativeFilter};
 use anyhow::{Context, Result};
 use massiveeq_core::{COMPARISON_BYPASS_ID, ComparisonSet, DeviceInfo, Library, Storage};
 use massiveeq_dsp::{
@@ -8,6 +8,7 @@ use massiveeq_dsp::{
 };
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::{
     process::Command,
     time::{Duration, sleep},
@@ -28,8 +29,13 @@ struct ActiveFilter {
     latency_frames: u32,
     /// Channels the sink takes in; more than the device's for a surround sink.
     input_channels: u32,
-    /// The sink is a visible 7.1 output that may be the system default.
-    surround: bool,
+    /// The sink is a visible output that may stand in as the system
+    /// default: a 7.1 sink, or one whose volume MassiveEQ applies.
+    visible: bool,
+    volume_in_dsp: bool,
+    /// The physical output's node, which takes the volume back when a DSP
+    /// volume sink goes away.
+    device_node_name: String,
 }
 
 impl FilterHost {
@@ -46,10 +52,20 @@ impl FilterHost {
         self.rate_changed = Some(events);
     }
 
-    pub async fn stop_all(&mut self) {
-        for (_, active) in self.filters.drain() {
+    /// Stop every sink. Outputs whose volume was in the DSP get it back on
+    /// the device, so nothing is louder while MassiveEQ is away; returns the
+    /// device volumes to raise them back to when MassiveEQ returns.
+    pub async fn stop_all(&mut self) -> Vec<(String, f64)> {
+        let mut ceilings = Vec::new();
+        for (key, active) in self.filters.drain() {
+            if let Some(volume) = volume_to_hand_back(&active)
+                && let Some(ceiling) = hand_back_volume(volume).await
+            {
+                ceilings.push((key, ceiling));
+            }
             active.filter.stop();
         }
+        ceilings
     }
 
     pub async fn reconcile(
@@ -89,7 +105,7 @@ impl FilterHost {
             .collect::<Vec<_>>();
         for key in stale {
             if let Some(active) = self.filters.remove(&key) {
-                if active.surround
+                if active.visible
                     && let Some(device) = devices
                         .iter()
                         .find(|device| device.connected && device.key.as_storage_key() == key)
@@ -100,6 +116,9 @@ impl FilterHost {
                         &device.node_name,
                     )
                     .await;
+                }
+                if let Some(volume) = volume_to_hand_back(&active) {
+                    hand_back_volume(volume).await;
                 }
                 active.filter.stop();
             }
@@ -112,6 +131,7 @@ impl FilterHost {
             if !desired.contains(&key) {
                 continue;
             }
+            let volume_in_dsp = library.volume.get(&key).is_some_and(|volume| volume.in_dsp);
             // PipeWire may run this output at another rate than the default,
             // to play the music natively; its chain must be built for that.
             let mut settings = graph;
@@ -135,6 +155,7 @@ impl FilterHost {
                     active.revision == revision
                         && active.sample_rate == settings.sample_rate
                         && active.quantum == settings.quantum
+                        && active.volume_in_dsp == volume_in_dsp
                 })
             {
                 if let Some(active) = self.filters.get_mut(&key) {
@@ -162,6 +183,7 @@ impl FilterHost {
                     (latency_frames, settings.sample_rate),
                 )
                 && active.input_channels == input_channels
+                && active.volume_in_dsp == volume_in_dsp
             {
                 match active.filter.update(processor) {
                     Ok(()) => {
@@ -180,9 +202,20 @@ impl FilterHost {
 
             // Rate, capacity and reported latency are PipeWire node properties.
             // Start the verified replacement before retiring the old endpoint.
-            // Normalizing below resets every MassiveEQ node to unity. A 7.1
-            // sink's volume belongs to the user, so keep and restore those.
+            // A visible sink's volume belongs to the user: a fresh node starts
+            // at 100%, so put the volume back on it.
             let surround_volumes = node_volumes(self.surround_node_names()).await;
+            let visible = surround || volume_in_dsp;
+            let dsp_volume = volume_in_dsp.then(|| {
+                let level = self
+                    .filters
+                    .get(&key)
+                    .and_then(|active| active.filter.volume.as_ref())
+                    .map(|volume| volume.level())
+                    .or_else(|| library.volume.get(&key).map(|volume| volume.level))
+                    .unwrap_or(1.0);
+                Arc::new(DspVolume::new(input_channels as usize, level))
+            });
             let replacement = match NativeFilter::spawn(
                 device.clone(),
                 processor,
@@ -190,6 +223,7 @@ impl FilterHost {
                 settings.quantum,
                 latency_frames,
                 self.rate_changed.clone(),
+                dsp_volume.clone(),
             ) {
                 Ok(filter) => filter,
                 Err(error) => {
@@ -198,7 +232,10 @@ impl FilterHost {
                 }
             };
             if let Some(old) = self.filters.remove(&key) {
-                if old.surround && !surround {
+                if !volume_in_dsp && let Some(volume) = volume_to_hand_back(&old) {
+                    hand_back_volume(volume).await;
+                }
+                if old.visible && !visible {
                     let _ = restore_physical_default_if_needed(
                         &old.filter.node_name,
                         &device.node_name,
@@ -216,22 +253,40 @@ impl FilterHost {
                     quantum: settings.quantum,
                     latency_frames,
                     input_channels,
-                    surround,
+                    visible,
+                    volume_in_dsp,
+                    device_node_name: device.node_name.clone(),
                 },
             );
             self.errors.remove(&key);
-            let _ = normalize_virtual_nodes().await;
+            let visible_names = self
+                .filters
+                .values()
+                .filter(|active| active.visible)
+                .map(|active| active.filter.node_name.clone())
+                .collect::<Vec<_>>();
+            let _ = normalize_virtual_nodes(&visible_names).await;
             for (name, volume) in &surround_volumes {
-                if self
-                    .filters
-                    .values()
-                    .any(|active| active.surround && &active.filter.node_name == name)
-                {
+                if self.filters.values().any(|active| {
+                    active.visible && !active.volume_in_dsp && &active.filter.node_name == name
+                }) {
                     let _ = set_node_volume(name, volume).await;
                 }
             }
             let node_name = self.filters[&key].filter.node_name.clone();
-            if surround {
+            if let Some(volume) = &dsp_volume {
+                // Show the saved level on the new sink, then take changes.
+                let _ = set_node_volume(
+                    &node_name,
+                    &NodeVolume {
+                        volume: format!("{:.4}", volume.level()),
+                        muted: false,
+                    },
+                )
+                .await;
+                volume.arm();
+            }
+            if visible {
                 // Apps choose their channel layout from the system output, so
                 // the 7.1 sink takes over while its device is the system output.
                 if device.is_default {
@@ -259,9 +314,25 @@ impl FilterHost {
     fn surround_node_names(&self) -> Vec<String> {
         self.filters
             .values()
-            .filter(|active| active.surround)
+            .filter(|active| active.visible && !active.volume_in_dsp)
             .map(|active| active.filter.node_name.clone())
             .collect()
+    }
+
+    /// The volume of each output whose sink applies it in the DSP.
+    pub fn dsp_volume_levels(&self) -> Vec<(String, f64)> {
+        self.filters
+            .iter()
+            .filter_map(|(key, active)| Some((key.clone(), active.filter.volume.as_ref()?.level())))
+            .collect()
+    }
+
+    /// MassiveEQ's sink for an output, when it is a visible system output.
+    pub fn sink_node_name(&self, device_key: &str) -> Option<&str> {
+        self.filters
+            .get(device_key)
+            .filter(|active| active.visible)
+            .map(|active| active.filter.node_name.as_str())
     }
 
     pub fn active_count(&self) -> usize {
@@ -289,6 +360,10 @@ impl FilterHost {
                     "dsp_latency_frames": active.latency_frames,
                     "dsp_latency_ms": active.latency_frames as f64 * 1000.0 / active.sample_rate as f64,
                     "revision": active.revision,
+                    "visible": active.visible,
+                    "volume_in_dsp": active.volume_in_dsp,
+                    "volume_level": active.filter.volume.as_ref().map(|volume| volume.level()),
+                    "volume_db": active.filter.volume.as_ref().and_then(|volume| massiveeq_core::level_db(volume.level())),
                     "input_overflows": active.filter.stats.input_overflows.load(std::sync::atomic::Ordering::Relaxed),
                     "output_underflows": active.filter.stats.output_underflows.load(std::sync::atomic::Ordering::Relaxed),
                     "invalid_buffers": active.filter.stats.invalid_buffers.load(std::sync::atomic::Ordering::Relaxed),
@@ -712,25 +787,51 @@ fn same_latency((frames, rate): (u32, u32), (other_frames, other_rate): (u32, u3
     (seconds(frames, rate) - seconds(other_frames, other_rate)).abs() <= 0.000_5
 }
 
-async fn normalize_virtual_nodes() -> Result<()> {
+async fn normalize_virtual_nodes(keep: &[String]) -> Result<()> {
     // Do this outside the RT thread. WirePlumber may restore an old virtual
     // node volume even though MassiveEQ's DSP gain is already explicit.
+    // Visible sinks keep theirs: it is the user's volume.
     sleep(Duration::from_millis(200)).await;
-    let status = Command::new("wpctl")
-        .args([
-            "set-volume",
-            "--pid",
-            &std::process::id().to_string(),
-            "1.0",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    let output = Command::new("pw-dump")
+        .output()
         .await
-        .context("failed to normalize MassiveEQ virtual node volume")?;
-    anyhow::ensure!(status.success(), "failed to set virtual nodes to unity");
+        .context("could not run pw-dump")?;
+    let objects: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).context("invalid pw-dump JSON")?;
+    for id in own_hidden_nodes(&objects, std::process::id(), keep) {
+        let status = Command::new("wpctl")
+            .args(["set-volume", &id.to_string(), "1.0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .context("failed to normalize MassiveEQ virtual node volume")?;
+        anyhow::ensure!(status.success(), "failed to set virtual nodes to unity");
+    }
     Ok(())
+}
+
+/// This process's PipeWire nodes, except the ones named in `keep`.
+fn own_hidden_nodes(objects: &[serde_json::Value], pid: u32, keep: &[String]) -> Vec<u64> {
+    objects
+        .iter()
+        .filter(|object| {
+            object.get("type").and_then(serde_json::Value::as_str)
+                == Some("PipeWire:Interface:Node")
+        })
+        .filter_map(|object| {
+            let props = object.pointer("/info/props")?;
+            let process = props.get("application.process.id")?;
+            let process = process
+                .as_u64()
+                .or_else(|| process.as_str()?.parse().ok())?;
+            let name = props.get("node.name")?.as_str()?;
+            (process == pid as u64 && !keep.iter().any(|kept| kept == name))
+                .then(|| object.get("id")?.as_u64())
+                .flatten()
+        })
+        .collect()
 }
 
 async fn restore_physical_default_if_needed(
@@ -845,6 +946,48 @@ async fn set_node_volume(node_name: &str, volume: &NodeVolume) -> Result<()> {
 }
 
 /// Make a MassiveEQ sink the system output.
+/// Before a DSP volume sink goes away, turn its device down by the sink's
+/// volume, so audio playing on is no louder. Returns the device's volume
+/// before, which is where MassiveEQ's volume scale starts.
+fn volume_to_hand_back(active: &ActiveFilter) -> Option<(String, f64)> {
+    Some((
+        active.device_node_name.clone(),
+        active.filter.volume.as_ref()?.level(),
+    ))
+}
+
+async fn hand_back_volume((device, level): (String, f64)) -> Option<f64> {
+    let ceiling = node_volume(&device).await?.volume.parse::<f64>().ok()?;
+    set_node_level(&device, handed_back_level(ceiling, level))
+        .await
+        .ok()?;
+    Some(ceiling)
+}
+
+/// The device volume (desktop scale, cubic) that sounds like `ceiling` with
+/// MassiveEQ's `level` on top.
+fn handed_back_level(ceiling: f64, level: f64) -> f64 {
+    massiveeq_core::level_db(level).map_or(0.0, |db| ceiling * 10.0_f64.powf(db / 60.0))
+}
+
+/// Set a node's volume, 0 to 1 on the desktop scale, as `wpctl` does.
+pub(crate) async fn set_node_level(node_name: &str, level: f64) -> Result<()> {
+    let id = node_id(node_name)
+        .await
+        .context("the output is not listed")?
+        .to_string();
+    let status = Command::new("wpctl")
+        .args(["set-volume", id.as_str(), &format!("{level:.4}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("failed to set the output volume")?;
+    anyhow::ensure!(status.success(), "failed to set the output volume");
+    Ok(())
+}
+
 async fn make_default(node_name: &str) -> Result<()> {
     let id = node_id(node_name)
         .await
@@ -1108,6 +1251,18 @@ mod tests {
                 .iter()
                 .all(|channel| { channel.biquads.is_empty() && channel.convolutions.is_empty() })
         );
+    }
+
+    #[test]
+    fn the_device_takes_the_dsp_volume_back_at_the_same_loudness() {
+        // Device at 100%, MassiveEQ at -30 dB: the device goes to -30 dB on
+        // its cubic scale, 0.316.
+        let level = super::handed_back_level(1.0, 0.4);
+        assert!((60.0 * level.log10() + 30.0).abs() < 1e-9);
+        // A device ceiling of 50% (-18 dB) stays under it.
+        let level = super::handed_back_level(0.5, 0.8);
+        assert!((60.0 * (level / 0.5).log10() + 10.0).abs() < 1e-9);
+        assert_eq!(super::handed_back_level(1.0, 0.0), 0.0);
     }
 
     #[test]

@@ -67,6 +67,9 @@ pub struct Library {
     pub global_bypass: bool,
     #[serde(default)]
     pub comparison_sets: HashMap<String, ComparisonSet>,
+    /// Per-output volume handling, by device storage key.
+    #[serde(default)]
+    pub volume: HashMap<String, crate::VolumeSettings>,
 }
 
 impl Default for Library {
@@ -79,6 +82,7 @@ impl Default for Library {
             remembered_devices: HashMap::new(),
             global_bypass: false,
             comparison_sets: HashMap::new(),
+            volume: HashMap::new(),
         }
     }
 }

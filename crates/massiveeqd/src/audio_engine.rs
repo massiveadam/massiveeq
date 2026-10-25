@@ -1,4 +1,7 @@
-use crate::latest_processor::LatestProcessor;
+use crate::{
+    dsp_volume::{DspVolume, MAX_CHANNELS},
+    latest_processor::LatestProcessor,
+};
 use massiveeq_dsp::ProfileProcessor;
 use rtrb::{Producer, PushError};
 use std::sync::{
@@ -17,6 +20,10 @@ pub struct AudioEngine {
     /// The rate PipeWire negotiated for the sink, 0 until it has. It follows
     /// the device when the graph switches rate for the music playing.
     stream_rate: Arc<AtomicU32>,
+    /// The sink's volume, when MassiveEQ applies it instead of PipeWire.
+    volume: Option<Arc<DspVolume>>,
+    /// Gains reached at the end of the last cycle, ramped from per cycle.
+    volume_gains: [f32; MAX_CHANNELS],
     /// Channels arriving from the sink; more than `outputs` for surround.
     inputs: usize,
     outputs: usize,
@@ -51,6 +58,8 @@ impl AudioEngine {
             retired,
             retire_backlog: None,
             stream_rate,
+            volume: None,
+            volume_gains: [1.0; MAX_CHANNELS],
             inputs,
             outputs,
             capacity,
@@ -61,6 +70,15 @@ impl AudioEngine {
             pending_output: vec![vec![0.0; capacity]; outputs],
             interleaved_output: vec![0.0; capacity * outputs],
         }
+    }
+
+    /// Apply `volume` to the sink's input, starting at its current gains.
+    pub fn with_volume(mut self, volume: Arc<DspVolume>) -> Self {
+        for (channel, gain) in self.volume_gains.iter_mut().enumerate() {
+            *gain = volume.gain(channel);
+        }
+        self.volume = Some(volume);
+        self
     }
 
     /// Processes interleaved F32 audio without allocation, locking, logging or
@@ -85,6 +103,18 @@ impl AudioEngine {
         for (frame_index, frame) in interleaved.chunks_exact(self.inputs).enumerate() {
             for (channel, sample) in frame.iter().enumerate() {
                 self.input[channel][frame_index] = *sample;
+            }
+        }
+        if let Some(volume) = &self.volume {
+            // Ramp across the cycle so a volume step never clicks.
+            for (channel, input) in self.input.iter_mut().enumerate().take(MAX_CHANNELS) {
+                let start = self.volume_gains[channel];
+                let target = volume.gain(channel);
+                let step = (target - start) / frames.max(1) as f32;
+                for (frame, sample) in input[..frames].iter_mut().enumerate() {
+                    *sample *= start + step * (frame + 1) as f32;
+                }
+                self.volume_gains[channel] = target;
             }
         }
         // A chain built for another rate would put every filter in the wrong
@@ -275,6 +305,44 @@ mod tests {
                 .iter()
                 .all(|sample| (sample - 0.5).abs() < 1e-6)
         );
+    }
+
+    #[test]
+    fn dsp_volume_ramps_to_its_decibel_step_without_allocating() {
+        let compiled = compile_bypass(48_000, 256, 2);
+        let updates = Arc::new(LatestProcessor::default());
+        let (retired, _consumer) = RingBuffer::new(4);
+        let volume = Arc::new(DspVolume::new(2, 1.0));
+        volume.arm();
+        let mut engine = AudioEngine::new(
+            Box::new(ProfileProcessor::new(&compiled).unwrap()),
+            updates,
+            retired,
+            Arc::new(AtomicU32::new(48_000)),
+            48_000,
+        )
+        .with_volume(volume.clone());
+        let input = vec![1.0_f32; 512];
+        assert!(engine.process(&input).iter().all(|sample| *sample == 1.0));
+        // A 5% key press down: 2.5 dB in all. PipeWire already applied its
+        // own 0.95³ to the input, so the DSP adds the rest.
+        volume.set_channel_volumes(&[0.95_f32.powi(3), 0.95_f32.powi(3)]);
+        let target = 10.0_f32.powf(-2.5 / 20.0) / 0.95_f32.powi(3);
+        allocation_test_support::begin();
+        let ramp = engine.process(&input);
+        let allocations = allocation_test_support::end();
+        assert_eq!(allocations, 0);
+        assert!(ramp[0] < 1.0 && ramp[0] > ramp[510]);
+        assert!((ramp[511] - target).abs() < 1e-4);
+        assert!(
+            engine
+                .process(&input)
+                .iter()
+                .all(|sample| (sample - target).abs() < 1e-4)
+        );
+        volume.set_muted(true);
+        engine.process(&input);
+        assert!(engine.process(&input).iter().all(|sample| *sample == 0.0));
     }
 
     #[test]

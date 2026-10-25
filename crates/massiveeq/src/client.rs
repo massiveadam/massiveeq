@@ -142,6 +142,16 @@ impl Client {
             .call("SetDeviceBypass", &(device_key, bypassed))
             .context("bypass failed")
     }
+    pub fn set_volume_options(
+        &self,
+        device_key: &str,
+        in_dsp: bool,
+        block_jumps: bool,
+    ) -> Result<()> {
+        self.proxy()?
+            .call("SetVolumeOptions", &(device_key, in_dsp, block_jumps))
+            .context("could not change the volume settings")
+    }
     /// Start or retune the test tone; repeat within five seconds to keep it playing.
     pub fn play_tone(&self, device_key: &str, settings: &serde_json::Value) -> Result<()> {
         self.proxy()?

@@ -2,11 +2,13 @@ mod api;
 mod audio_engine;
 mod device;
 mod device_monitor;
+mod dsp_volume;
 mod filter_host;
 mod latest_processor;
 mod live_edit;
 mod native_filter;
 mod tone;
+mod volume_guard;
 
 use anyhow::Result;
 use api::Service;
@@ -27,6 +29,7 @@ pub struct AppState {
     graph: device::GraphInfo,
     host: FilterHost,
     live_edits: live_edit::Sessions,
+    volume_guard: Arc<volume_guard::VolumeGuard>,
 }
 
 pub async fn refresh_locked(state: &mut AppState, force_restart: bool) -> Result<()> {
@@ -47,6 +50,51 @@ pub async fn refresh_locked(state: &mut AppState, force_restart: bool) -> Result
         )
         .await?;
     state.devices = devices;
+    // Keep the volume a DSP sink was left at, for the next start. A device
+    // turned down while MassiveEQ was stopped goes back up once its sink
+    // carries the volume again.
+    let mut volume_changed = false;
+    for (key, level) in state.host.dsp_volume_levels() {
+        let settings = state.library.volume.entry(key.clone()).or_default();
+        if (settings.level - level).abs() > 0.0005 {
+            settings.level = level;
+            volume_changed = true;
+        }
+        if let Some(ceiling) = settings.device_ceiling.take() {
+            volume_changed = true;
+            if let Some(device) = state
+                .devices
+                .iter()
+                .find(|device| device.key.as_storage_key() == key)
+            {
+                state.volume_guard.expect(&device.node_name, ceiling);
+                let _ = filter_host::set_node_level(&device.node_name, ceiling).await;
+            }
+        }
+    }
+    if volume_changed {
+        state.storage.save_library(&state.library)?;
+    }
+    let watched = state
+        .devices
+        .iter()
+        .filter(|device| {
+            device.connected
+                && state
+                    .library
+                    .volume
+                    .get(&device.key.as_storage_key())
+                    .is_some_and(|volume| volume.block_jumps)
+        })
+        .flat_map(|device| {
+            let sink = state
+                .host
+                .sink_node_name(&device.key.as_storage_key())
+                .map(str::to_owned);
+            std::iter::once(device.node_name.clone()).chain(sink)
+        })
+        .collect();
+    state.volume_guard.watch(watched);
     Ok(())
 }
 
@@ -98,6 +146,7 @@ async fn main() -> Result<()> {
         graph: device::GraphInfo::default(),
         live_edits: live_edit::Sessions::new(),
         host,
+        volume_guard: Arc::default(),
     }));
     // The test tone lives outside the state lock, so retuning it never waits
     // behind a profile compile and starting it never blocks other calls.
@@ -122,7 +171,15 @@ async fn main() -> Result<()> {
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
-    let monitor = device_monitor::DeviceMonitor::spawn(event_tx.clone())?;
+    let (revert_tx, mut revert_rx) = tokio::sync::mpsc::channel(16);
+    let volume_guard = state.lock().await.volume_guard.clone();
+    let monitor = device_monitor::DeviceMonitor::spawn(event_tx.clone(), volume_guard, revert_tx)?;
+    // Undo blocked volume jumps the way a mixer would set the volume.
+    let revert_task = tokio::spawn(async move {
+        while let Some((node_name, level)) = revert_rx.recv().await {
+            let _ = filter_host::set_node_level(&node_name, level).await;
+        }
+    });
     state
         .lock()
         .await
@@ -208,13 +265,23 @@ async fn main() -> Result<()> {
         } => true,
     };
     event_task.abort();
+    revert_task.abort();
     health_task.abort();
     tone_task.abort();
     if let Some(tone) = tone.lock().await.take() {
         tone.stop();
     }
     monitor.stop();
-    state.lock().await.host.stop_all().await;
+    {
+        let mut state = state.lock().await;
+        let ceilings = state.host.stop_all().await;
+        if !ceilings.is_empty() {
+            for (key, ceiling) in ceilings {
+                state.library.volume.entry(key).or_default().device_ceiling = Some(ceiling);
+            }
+            let _ = state.storage.save_library(&state.library);
+        }
+    }
     drop(connection);
     if upgraded {
         eprintln!("massiveeqd: MassiveEQ was upgraded; restarting on the new version");
@@ -248,6 +315,7 @@ async fn native_self_test(node_name: &str, seconds: u64) -> Result<()> {
         settings.sample_rate,
         settings.quantum,
         compiled.latency_frames,
+        None,
         None,
     )?;
     tokio::time::sleep(Duration::from_secs(seconds)).await;
