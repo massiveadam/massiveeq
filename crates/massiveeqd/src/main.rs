@@ -123,6 +123,11 @@ async fn main() -> Result<()> {
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
     let monitor = device_monitor::DeviceMonitor::spawn(event_tx.clone())?;
+    state
+        .lock()
+        .await
+        .host
+        .notify_rate_changes(event_tx.clone());
     let event_state = state.clone();
     let event_task = tokio::spawn(async move {
         while event_rx.recv().await.is_some() {
@@ -243,6 +248,7 @@ async fn native_self_test(node_name: &str, seconds: u64) -> Result<()> {
         settings.sample_rate,
         settings.quantum,
         compiled.latency_frames,
+        None,
     )?;
     tokio::time::sleep(Duration::from_secs(seconds)).await;
     let stats = serde_json::json!({

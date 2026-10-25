@@ -481,6 +481,9 @@ The status strip in the header shows the PipeWire graph rate and whether
 playing audio arrives at that rate (`SOURCE NATIVE`) or is converted
 (`SOURCE 44.1 kHz → RESAMPLED`). Its tooltip explains the cause; most often
 PipeWire is allowed only one rate, which `default.clock.allowed-rates` fixes.
+With several rates allowed, the output switches to each track's rate and
+MassiveEQ rebuilds its chain for that rate, so EQ, impulse responses and the
+test tone stay exact and nothing is resampled.
 
 `massiveeqd --self-test-node NODE_NAME` creates a temporary bypass filter for a
 specific PipeWire sink and reports buffer and processing statistics. The D-Bus

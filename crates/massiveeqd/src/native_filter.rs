@@ -10,7 +10,7 @@ use std::{
     mem,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -34,6 +34,8 @@ pub struct NativeFilter {
     thread: Option<JoinHandle<Result<()>>>,
     pub stats: Arc<NativeStats>,
     pub node_name: String,
+    /// The rate PipeWire negotiated for the sink, 0 until it has.
+    stream_rate: Arc<AtomicU32>,
 }
 
 impl NativeFilter {
@@ -43,11 +45,13 @@ impl NativeFilter {
         sample_rate: u32,
         quantum: u32,
         latency_frames: u32,
+        rate_changed: Option<tokio::sync::mpsc::Sender<()>>,
     ) -> Result<Self> {
         let updates = Arc::new(LatestProcessor::default());
         let update_consumer = updates.clone();
         let (retire_producer, retired) = RingBuffer::new(4);
-        let audio_capacity = quantum as usize * device.channels as usize * 16;
+        let audio_capacity =
+            quantum as usize * crate::audio_engine::RATE_HEADROOM * device.channels as usize * 4;
         let (audio_producer, audio_consumer) = RingBuffer::new(audio_capacity.max(1024));
         let stop = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(NativeStats::default());
@@ -56,6 +60,8 @@ impl NativeFilter {
         let thread_stop = stop.clone();
         let thread_stats = stats.clone();
         let thread_node_name = node_name.clone();
+        let stream_rate = Arc::new(AtomicU32::new(0));
+        let thread_rate = stream_rate.clone();
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name(format!("massiveeq-{safe_name:x}"))
@@ -73,6 +79,8 @@ impl NativeFilter {
                     sample_rate,
                     quantum,
                     latency_frames,
+                    thread_rate,
+                    rate_changed,
                     started_tx,
                 )
             })
@@ -85,6 +93,7 @@ impl NativeFilter {
                 thread: Some(thread),
                 stats,
                 node_name,
+                stream_rate,
             }),
             Ok(Err(message)) => {
                 stop.store(true, Ordering::Release);
@@ -102,6 +111,11 @@ impl NativeFilter {
         self.reap();
         self.updates.publish(processor);
         Ok(())
+    }
+
+    /// The rate the device runs at for this sink, once PipeWire has chosen it.
+    pub fn stream_rate(&self) -> Option<u32> {
+        Some(self.stream_rate.load(Ordering::Acquire)).filter(|rate| *rate > 0)
     }
 
     pub fn reap(&mut self) {
@@ -145,6 +159,8 @@ fn run_filter_pair(
     sample_rate: u32,
     quantum: u32,
     latency_frames: u32,
+    stream_rate: Arc<AtomicU32>,
+    rate_changed: Option<tokio::sync::mpsc::Sender<()>>,
     started: mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> Result<()> {
     let result = (|| -> Result<()> {
@@ -174,7 +190,6 @@ fn run_filter_pair(
         // requesting at least the session quantum for stable playback.
         let scheduling_latency_frames = scheduling_latency_frames(latency_frames, quantum);
         let latency = format!("{scheduling_latency_frames}/{sample_rate}");
-        let rate = format!("1/{sample_rate}");
         let channel_count = channels.to_string();
         let input_channel_count = input_channels.to_string();
         let description = if surround {
@@ -194,7 +209,6 @@ fn run_filter_pair(
             *pw::keys::NODE_VIRTUAL => "true",
             *pw::keys::NODE_LINK_GROUP => link_group.clone(),
             *pw::keys::NODE_GROUP => node_group.clone(),
-            *pw::keys::NODE_RATE => rate.clone(),
             *pw::keys::NODE_LATENCY => latency.clone(),
             *pw::keys::AUDIO_CHANNELS => input_channel_count,
             "audio.position" => input_position,
@@ -220,7 +234,6 @@ fn run_filter_pair(
             *pw::keys::NODE_DONT_RECONNECT => "true",
             *pw::keys::TARGET_OBJECT => device.node_name.clone(),
             *pw::keys::STREAM_DONT_REMIX => "true",
-            *pw::keys::NODE_RATE => rate,
             *pw::keys::NODE_LATENCY => latency,
             *pw::keys::AUDIO_CHANNELS => channel_count,
             "audio.position" => position.as_str(),
@@ -232,11 +245,21 @@ fn run_filter_pair(
 
         let capture = pw::stream::StreamBox::new(&core, "MassiveEQ input", capture_props)?;
         let playback = pw::stream::StreamBox::new(&core, "MassiveEQ output", playback_props)?;
-        let engine = AudioEngine::new(initial, updates, retired, sample_rate);
+        let engine = AudioEngine::new(initial, updates, retired, stream_rate.clone(), sample_rate);
         let capture_stats = stats.clone();
+        let capture_rate = stream_rate.clone();
         let _capture_listener = capture
             .add_local_listener_with_user_data(engine)
             .process(move |stream, engine| {
+                // Samples arrive at the rate the device's clock runs at, which
+                // PipeWire switches to suit the music when it is allowed to;
+                // the stream format keeps the rate it was first linked at.
+                if let Ok(time) = stream.time() {
+                    let rate = time.rate();
+                    if rate.num == 1 && rate.denom > 0 {
+                        capture_rate.store(rate.denom, Ordering::Relaxed);
+                    }
+                }
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
                 };
@@ -351,8 +374,9 @@ fn run_filter_pair(
             })
             .register()?;
 
-        let capture_format = audio_format(sample_rate, input_channels as u32)?;
-        let playback_format = audio_format(sample_rate, channels as u32)?;
+        // No rate: both streams follow the graph instead of pinning it.
+        let capture_format = audio_format(input_channels as u32)?;
+        let playback_format = audio_format(channels as u32)?;
         let mut capture_params =
             [Pod::from_bytes(&capture_format).context("invalid capture format")?];
         let mut playback_params =
@@ -377,7 +401,16 @@ fn run_filter_pair(
 
         let weak = mainloop.downgrade();
         let timer_stop = stop.clone();
+        let reported_rate = std::cell::Cell::new(0);
         let timer = mainloop.loop_().add_timer(move |_| {
+            // Tell the service off the RT thread, so it builds a new chain.
+            let rate = stream_rate.load(Ordering::Relaxed);
+            if rate != reported_rate.get()
+                && let Some(events) = &rate_changed
+                && events.try_send(()).is_ok()
+            {
+                reported_rate.set(rate);
+            }
             if timer_stop.load(Ordering::Acquire)
                 && let Some(mainloop) = weak.upgrade()
             {
@@ -400,10 +433,9 @@ fn run_filter_pair(
     result
 }
 
-fn audio_format(sample_rate: u32, channels: u32) -> Result<Vec<u8>> {
+fn audio_format(channels: u32) -> Result<Vec<u8>> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::F32LE);
-    info.set_rate(sample_rate);
     info.set_channels(channels);
     let mut position = [0; spa::param::audio::MAX_CHANNELS];
     for (slot, name) in position.iter_mut().zip(positions(channels as usize)) {

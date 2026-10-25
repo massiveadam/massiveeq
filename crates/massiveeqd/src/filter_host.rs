@@ -16,6 +16,8 @@ use tokio::{
 pub struct FilterHost {
     filters: HashMap<String, ActiveFilter>,
     errors: HashMap<String, String>,
+    /// Wakes the service when a sink's device switches rate.
+    rate_changed: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 struct ActiveFilter {
@@ -35,7 +37,13 @@ impl FilterHost {
         Ok(Self {
             filters: HashMap::new(),
             errors: HashMap::new(),
+            rate_changed: None,
         })
+    }
+
+    /// Ask for a reconcile whenever an output starts running at a new rate.
+    pub fn notify_rate_changes(&mut self, events: tokio::sync::mpsc::Sender<()>) {
+        self.rate_changed = Some(events);
     }
 
     pub async fn stop_all(&mut self) {
@@ -98,11 +106,21 @@ impl FilterHost {
             self.errors.remove(&key);
         }
 
-        let settings = device::graph_settings().await;
+        let graph = device::graph_settings().await;
         for device in devices {
             let key = device.key.as_storage_key();
             if !desired.contains(&key) {
                 continue;
+            }
+            // PipeWire may run this output at another rate than the default,
+            // to play the music natively; its chain must be built for that.
+            let mut settings = graph;
+            if let Some(rate) = self
+                .filters
+                .get(&key)
+                .and_then(|active| active.filter.stream_rate())
+            {
+                settings = device::settings_at_rate(graph, rate);
             }
             let (compiled, revision) =
                 match compile_output_with_edits(storage, library, device, settings, edits) {
@@ -136,15 +154,21 @@ impl FilterHost {
 
             let input_channels = compiled.input_channels;
             let surround = input_channels > device.channels;
+            // The sink follows the device's rate by itself, so a rate change
+            // only needs a new chain, unless the latency it reports changes.
             if let Some(active) = self.filters.get_mut(&key)
-                && active.sample_rate == settings.sample_rate
-                && active.quantum == settings.quantum
-                && active.latency_frames == latency_frames
+                && same_latency(
+                    (active.latency_frames, active.sample_rate),
+                    (latency_frames, settings.sample_rate),
+                )
                 && active.input_channels == input_channels
             {
                 match active.filter.update(processor) {
                     Ok(()) => {
                         active.revision = revision;
+                        active.sample_rate = settings.sample_rate;
+                        active.quantum = settings.quantum;
+                        active.latency_frames = latency_frames;
                         self.errors.remove(&key);
                     }
                     Err(error) => {
@@ -165,6 +189,7 @@ impl FilterHost {
                 settings.sample_rate,
                 settings.quantum,
                 latency_frames,
+                self.rate_changed.clone(),
             ) {
                 Ok(filter) => filter,
                 Err(error) => {
@@ -677,6 +702,16 @@ fn profile_revision(
     ))
 }
 
+/// Whether two DSP latencies, as frames at a rate, are the same length of
+/// time. A resampled impulse response rounds to a slightly different length.
+fn same_latency((frames, rate): (u32, u32), (other_frames, other_rate): (u32, u32)) -> bool {
+    if rate == other_rate {
+        return frames == other_frames;
+    }
+    let seconds = |frames: u32, rate: u32| frames as f64 / rate.max(1) as f64;
+    (seconds(frames, rate) - seconds(other_frames, other_rate)).abs() <= 0.000_5
+}
+
 async fn normalize_virtual_nodes() -> Result<()> {
     // Do this outside the RT thread. WirePlumber may restore an old virtual
     // node volume even though MassiveEQ's DSP gain is already explicit.
@@ -1073,6 +1108,16 @@ mod tests {
                 .iter()
                 .all(|channel| { channel.biquads.is_empty() && channel.convolutions.is_empty() })
         );
+    }
+
+    #[test]
+    fn latency_is_compared_as_time_across_rates() {
+        assert!(super::same_latency((512, 48_000), (512, 48_000)));
+        assert!(!super::same_latency((512, 48_000), (513, 48_000)));
+        // A resampled IR: 512 frames at 48 kHz is 470.4 at 44.1 kHz.
+        assert!(super::same_latency((512, 48_000), (470, 44_100)));
+        assert!(super::same_latency((0, 48_000), (0, 96_000)));
+        assert!(!super::same_latency((512, 48_000), (2048, 96_000)));
     }
 
     #[test]

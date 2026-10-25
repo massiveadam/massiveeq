@@ -157,6 +157,7 @@ pub struct ProfileProcessor {
     summed: Vec<Vec<f32>>,
     route_output: Vec<f32>,
     limiter: Option<OutputLimiter>,
+    sample_rate: u32,
 }
 
 impl ProfileProcessor {
@@ -200,7 +201,13 @@ impl ProfileProcessor {
             limiter: profile
                 .output_limit
                 .then(|| OutputLimiter::new(profile.sample_rate)),
+            sample_rate: profile.sample_rate,
         })
+    }
+
+    /// The rate this chain was designed for; it is wrong at any other rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     pub fn input_channels(&self) -> usize {

@@ -31,6 +31,17 @@ pub async fn graph_settings() -> GraphSettings {
     }
 }
 
+/// Settings for a device that runs at `rate` instead of the default rate.
+/// PipeWire scales its quantum limits with the rate, so a 96 kHz cycle can
+/// be twice as long as the largest 48 kHz one.
+pub fn settings_at_rate(graph: GraphSettings, rate: u32) -> GraphSettings {
+    let scaled = (graph.quantum as u64 * rate as u64).div_ceil(graph.sample_rate.max(1) as u64);
+    GraphSettings {
+        sample_rate: rate,
+        quantum: graph.quantum.max(scaled.min(u32::MAX as u64) as u32),
+    }
+}
+
 /// The rate PipeWire's graph runs at, the rates it may switch to, and the
 /// rates of the audio playing into it, to tell native playback from resampled.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -107,8 +118,28 @@ pub fn graph_info(objects: &[Value]) -> GraphInfo {
             Some(StreamRate { name, rate })
         })
         .collect();
+    // clock.rate is only the default: PipeWire may run an output at another
+    // allowed rate to play the music natively, as its sink's format shows.
+    let running = objects
+        .iter()
+        .filter(|object| {
+            object.get("type").and_then(Value::as_str) == Some("PipeWire:Interface:Node")
+                && object.pointer("/info/state").and_then(Value::as_str) == Some("running")
+                && object
+                    .pointer("/info/props/media.class")
+                    .and_then(Value::as_str)
+                    == Some("Audio/Sink")
+                && !object
+                    .pointer("/info/props/node.name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.starts_with("massiveeq."))
+        })
+        .find_map(|object| object.pointer("/info/params/Format/0/rate")?.as_u64())
+        .map(|rate| rate as u32);
     GraphInfo {
-        rate: forced.or_else(|| setting("clock.rate").and_then(number)),
+        rate: forced
+            .or(running)
+            .or_else(|| setting("clock.rate").and_then(number)),
         allowed_rates,
         streams,
     }
@@ -363,6 +394,35 @@ mod tests {
                 }],
             }
         );
+
+        // The DAC switched to 44.1 kHz for mpv: that is the graph's rate now.
+        let mut switched = objects.clone();
+        switched.push(
+            serde_json::json!({"type": "PipeWire:Interface:Node", "info": {
+            "state": "running",
+            "props": {"media.class": "Audio/Sink", "node.name": "alsa_output.usb"},
+            "params": {"Format": [{"rate": 44100}]}}}),
+        );
+        switched.push(
+            serde_json::json!({"type": "PipeWire:Interface:Node", "info": {
+            "state": "running",
+            "props": {"media.class": "Audio/Sink", "node.name": "massiveeq.1"},
+            "params": {"Format": [{"rate": 48000}]}}}),
+        );
+        assert_eq!(graph_info(&switched).rate, Some(44_100));
+    }
+
+    #[test]
+    fn quantum_capacity_grows_with_the_rate() {
+        let graph = GraphSettings {
+            sample_rate: 48_000,
+            quantum: 2_048,
+        };
+        assert_eq!(settings_at_rate(graph, 96_000).quantum, 4_096);
+        assert_eq!(settings_at_rate(graph, 192_000).quantum, 8_192);
+        assert_eq!(settings_at_rate(graph, 44_100).quantum, 2_048);
+        assert_eq!(settings_at_rate(graph, 88_200).quantum, 3_764);
+        assert_eq!(settings_at_rate(graph, 48_000), graph);
     }
 
     #[test]

@@ -72,11 +72,19 @@
 - Show the curve-context note only when measurement and target contexts
   conflict.
 - Outputs whose channels are listed as `FL,FR`, such as the Easy Effects
-  Sink, are stereo again. MassiveEQ counted one channel and put a mono
+  Sink, are read as stereo. MassiveEQ counted one channel and put a mono
   filter in front of them, so a profile could not sit before EasyEffects.
 - `Alt+1`…`Alt+9` pick comparison candidates on any keyboard layout,
   including AZERTY, whose digit row types symbols, and while a slider or
   field has focus.
+- Music plays at its own sample rate again when PipeWire is allowed to
+  switch (`default.clock.allowed-rates`). MassiveEQ pinned the output to the
+  default rate, so 44.1 kHz music was resampled to 48 kHz, and 96 kHz music,
+  which PipeWire did switch to, came out silent. MassiveEQ now follows the
+  output's rate and rebuilds the chain for it. Parametric EQ switches with
+  no audible gap; with an impulse response, about the first 100 ms of the
+  track stays silent while it is resampled. The header and status show the
+  rate the output really runs at, and the test tone joins at that rate.
 
 ### Added
 
