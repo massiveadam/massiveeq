@@ -5122,7 +5122,7 @@ fn install_comparison_shortcuts(
         let drop = device_drop.clone();
         let bypass = device_bypass.clone();
         let ui = comparison_ui.clone();
-        move |_, key, _, modifiers| {
+        move |_, key, keycode, modifiers| {
             let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
             if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
                 && character == Some('b')
@@ -5134,11 +5134,7 @@ fn install_comparison_shortcuts(
             if !modifiers.contains(gtk::gdk::ModifierType::ALT_MASK) {
                 return gtk::glib::Propagation::Proceed;
             }
-            let Some(index) = character
-                .and_then(|value| value.to_digit(10))
-                .filter(|value| (1..=9).contains(value))
-                .map(|value| value as usize - 1)
-            else {
+            let Some(index) = comparison_slot(key, keycode) else {
                 return gtk::glib::Propagation::Proceed;
             };
             let Some(device) = model
@@ -5171,7 +5167,25 @@ fn install_comparison_shortcuts(
             gtk::glib::Propagation::Stop
         }
     });
+    // Run before focused widgets, which would otherwise see the keys first.
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     window.add_controller(controller);
+}
+
+/// Bank slot for Alt+1…9 from the digit row or keypad. Layouts such as AZERTY
+/// put symbols on the unshifted digit row, so the physical key also counts.
+fn comparison_slot(key: gtk::gdk::Key, keycode: u32) -> Option<usize> {
+    // XKB keycodes of the 1…9 keys on the digit row (evdev 2…10, plus 8).
+    const DIGIT_ROW: std::ops::RangeInclusive<u32> = 10..=18;
+    key.to_unicode()
+        .and_then(|value| value.to_digit(10))
+        .filter(|value| (1..=9).contains(value))
+        .map(|value| value as usize - 1)
+        .or_else(|| {
+            DIGIT_ROW
+                .contains(&keycode)
+                .then(|| (keycode - DIGIT_ROW.start()) as usize)
+        })
 }
 
 fn install_editor_shortcut(window: &adw::ApplicationWindow, text_toggle: &gtk::ToggleButton) {
@@ -6612,6 +6626,18 @@ mod tests {
         engine_tooltip, preferred_device_index, source_rate, tone_frequency, tone_position,
     };
     use super::{PanelSide, best_panel_side, panel_origin};
+
+    #[test]
+    fn comparison_slots_follow_the_digit_keys_on_any_layout() {
+        use super::gtk::gdk::Key;
+        assert_eq!(super::comparison_slot(Key::_1, 10), Some(0));
+        assert_eq!(super::comparison_slot(Key::KP_9, 89), Some(8));
+        // AZERTY: the unshifted 1 and 9 keys type & and ç.
+        assert_eq!(super::comparison_slot(Key::ampersand, 10), Some(0));
+        assert_eq!(super::comparison_slot(Key::ccedilla, 18), Some(8));
+        assert_eq!(super::comparison_slot(Key::_0, 19), None);
+        assert_eq!(super::comparison_slot(Key::a, 38), None);
+    }
 
     #[test]
     fn band_panel_moves_off_the_lines_near_its_node() {

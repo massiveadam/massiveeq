@@ -398,8 +398,9 @@ guaranteed without the listener's playback SPL and headphone transfer, which
 more detailed stationary-loudness models such as
 [ISO 532-2](https://www.iso.org/standard/63078.html) require.
 
-While the app is focused, `Alt+1` through `Alt+9` select candidates in bank
-order. `Ctrl+B` toggles the selected output's **Filters** switch. Turning
+While the app is focused, `Alt+1` through `Alt+9` (digit row or keypad, on any
+layout) select candidates in bank order. `Ctrl+B` toggles the selected
+output's **Filters** switch. Turning
 Filters off removes the filters while retaining the active profile's
 clipping-safe perceived level and existing PipeWire endpoint. The header **Engine**
 switch is deliberately different: Engine Off is true 0 dB dry audio with no
