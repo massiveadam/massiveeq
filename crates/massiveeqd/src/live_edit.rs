@@ -32,6 +32,8 @@ pub type ReferenceCache =
 
 #[derive(Clone)]
 pub struct Session {
+    /// Unique D-Bus connection that owns this preview and its saves.
+    pub owner: String,
     pub draft: ProfileDocument,
     pub trim: f64,
     pub reference: Option<(ProfileDocument, f64)>,
@@ -44,7 +46,13 @@ pub struct Session {
 pub type Sessions = HashMap<String, Session>;
 
 impl Session {
-    pub fn parse(storage: &Storage, library: &Library, id: &str, request: Request) -> Result<Self> {
+    pub fn parse(
+        storage: &Storage,
+        library: &Library,
+        id: &str,
+        owner: &str,
+        request: Request,
+    ) -> Result<Self> {
         let (saved, _) = storage.parsed_profile(library, id)?;
         let parse = |text: &str, trim: f64| -> Result<ProfileDocument> {
             ensure!(text.len() <= 1_000_000, "profile draft is too large");
@@ -81,6 +89,7 @@ impl Session {
             "invalid held gain"
         );
         Ok(Self {
+            owner: owner.to_owned(),
             draft,
             trim: request.trim,
             reference,
@@ -93,6 +102,10 @@ impl Session {
 
     pub fn expired(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.renewed) >= LIVE_TIMEOUT
+    }
+
+    pub fn permits(&self, owner: &str, now: Instant) -> bool {
+        self.owner == owner || self.expired(now)
     }
 }
 
@@ -117,6 +130,7 @@ mod tests {
             &storage,
             &library,
             &profile.id,
+            ":1.10",
             request("Filter 1: ON PK Fc 1000 Hz Gain -3 dB Q 1", 0.0),
         )
         .unwrap();
@@ -127,18 +141,40 @@ mod tests {
         );
         assert!(!edit.expired(edit.renewed + Duration::from_secs(4)));
         assert!(edit.expired(edit.renewed + LIVE_TIMEOUT));
-        assert!(Session::parse(&storage, &library, &profile.id, request("", f64::NAN)).is_err());
-        let held = |value| Request {
-            hold_gain_db: Some(value),
-            ..request("", 0.0)
-        };
-        assert!(Session::parse(&storage, &library, &profile.id, held(-3.5)).is_ok());
-        assert!(Session::parse(&storage, &library, &profile.id, held(f64::INFINITY)).is_err());
+        assert!(edit.permits(":1.10", edit.renewed));
+        assert!(!edit.permits(":1.11", edit.renewed + Duration::from_secs(4)));
+        assert!(edit.permits(":1.11", edit.renewed + LIVE_TIMEOUT));
         assert!(
             Session::parse(
                 &storage,
                 &library,
                 &profile.id,
+                ":1.10",
+                request("", f64::NAN)
+            )
+            .is_err()
+        );
+        let held = |value| Request {
+            hold_gain_db: Some(value),
+            ..request("", 0.0)
+        };
+        assert!(Session::parse(&storage, &library, &profile.id, ":1.10", held(-3.5)).is_ok());
+        assert!(
+            Session::parse(
+                &storage,
+                &library,
+                &profile.id,
+                ":1.10",
+                held(f64::INFINITY)
+            )
+            .is_err()
+        );
+        assert!(
+            Session::parse(
+                &storage,
+                &library,
+                &profile.id,
+                ":1.10",
                 request("Convolution: assets/other.wav", 0.0)
             )
             .is_err()

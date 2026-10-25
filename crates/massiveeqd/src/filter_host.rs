@@ -876,6 +876,7 @@ mod tests {
             &storage,
             &library,
             &profile.id,
+            ":1.10",
             Request {
                 text: "Filter: ON LS Fc 100 Hz Gain 8 dB Q 0.707".into(),
                 trim: 0.0,

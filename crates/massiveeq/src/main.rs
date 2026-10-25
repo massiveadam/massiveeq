@@ -1,5 +1,6 @@
 mod client;
 mod editing;
+mod editor_tasks;
 mod glyph;
 mod graph;
 mod knob;
@@ -26,6 +27,7 @@ use std::{
 use client::Client;
 
 struct Model {
+    tasks: editor_tasks::EditorTasks,
     client: Client,
     profiles: RefCell<Vec<ProfileInfo>>,
     devices: RefCell<Vec<DeviceInfo>>,
@@ -80,6 +82,19 @@ struct Model {
     /// Set while the bank is rebuilt in place, so re-selecting the open profile
     /// does not reload it into the editor.
     reordering_profiles: Cell<bool>,
+}
+
+impl Model {
+    fn stop_editor(&self) {
+        self.tasks.close();
+        if let Some(timer) = self.pending_save.borrow_mut().take() {
+            timer.remove();
+        }
+        if let Some(timer) = self.pending_live.borrow_mut().take() {
+            timer.remove();
+        }
+        self.live_worker.shutdown();
+    }
 }
 
 /// Widgets that show which profile is actually playing.
@@ -139,6 +154,10 @@ fn main() {
 }
 
 fn build_ui(app: &adw::Application) {
+    if let Some(window) = app.active_window() {
+        window.present();
+        return;
+    }
     install_css();
     adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
     let client = match Client::connect() {
@@ -181,6 +200,7 @@ fn build_ui(app: &adw::Application) {
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(48_000) as f64;
     let model = Rc::new(Model {
+        tasks: editor_tasks::EditorTasks::default(),
         profiles: RefCell::new(profiles),
         devices: RefCell::new(devices),
         comparisons: RefCell::new(comparisons),
@@ -619,7 +639,7 @@ fn build_ui(app: &adw::Application) {
     ));
     let trim = output.knob.clone();
     let (tone_page, tone_ui) = build_tone_page();
-    let (graph_listen, graph_tone) = build_graph_tone(&tone_ui);
+    let (graph_listen, graph_tone) = build_graph_tone(&tone_ui, &model.tasks);
     let listen_play = graph_tone.play.clone();
     *model.graph_tone.borrow_mut() = Some(graph_tone);
 
@@ -924,7 +944,7 @@ fn build_ui(app: &adw::Application) {
     macro_knobs.append(&listening_controls.bass.root);
     macro_knobs.append(&listening_controls.tilt.root);
     macro_knobs.append(&output.root);
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(20), {
+    let completion_timer = gtk::glib::timeout_add_local(std::time::Duration::from_millis(20), {
         let model = model.clone();
         let graph = graph.clone();
         let analysis_label = analysis_label.clone();
@@ -967,7 +987,8 @@ fn build_ui(app: &adw::Application) {
             gtk::glib::ControlFlow::Continue
         }
     });
-    gtk::glib::timeout_add_seconds_local(2, {
+    model.tasks.track(completion_timer);
+    let preview_timer = gtk::glib::timeout_add_seconds_local(2, {
         let model = model.clone();
         move || {
             if model.current_id.borrow().is_some() {
@@ -979,10 +1000,14 @@ fn build_ui(app: &adw::Application) {
             gtk::glib::ControlFlow::Continue
         }
     });
+    model.tasks.track(preview_timer);
     window.connect_close_request({
         let model = model.clone();
         let status = status.clone();
         move |_| {
+            if model.tasks.is_closed() {
+                return gtk::glib::Propagation::Proceed;
+            }
             if let Some(timer) = model.pending_save.borrow_mut().take() {
                 timer.remove();
             }
@@ -1016,8 +1041,13 @@ fn build_ui(app: &adw::Application) {
             if let Some(id) = model.current_id.borrow().as_ref() {
                 let _ = model.client.end_preview(id);
             }
+            model.stop_editor();
             gtk::glib::Propagation::Proceed
         }
+    });
+    window.connect_destroy({
+        let model = model.clone();
+        move |_| model.stop_editor()
     });
 
     *model.live.borrow_mut() = Some(LiveIndicators {
@@ -1104,7 +1134,7 @@ fn build_ui(app: &adw::Application) {
             }
         }
     });
-    gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), {
+    let poll_timer = gtk::glib::timeout_add_local(std::time::Duration::from_secs(2), {
         let model = model.clone();
         let strings = device_strings.clone();
         let drop = device_drop.clone();
@@ -1201,6 +1231,7 @@ fn build_ui(app: &adw::Application) {
             gtk::glib::ControlFlow::Continue
         }
     });
+    model.tasks.track(poll_timer);
     // Open on the output desktop audio is using, with its profile in the editor.
     let preferred = preferred_device_index(&model.devices.borrow());
     if let Some(index) = preferred {
@@ -1928,6 +1959,9 @@ fn wire_actions(
                     let status = status.clone();
                     let switch = switch.clone();
                     move || {
+                        if model.tasks.is_closed() {
+                            return;
+                        }
                         match model.client.set_device_bypass(&device_key, bypassed) {
                             Ok(()) => {
                                 if let Ok(devices) = model.client.devices() {
@@ -3103,6 +3137,9 @@ fn tone_settings(ui: &ToneUi) -> serde_json::Value {
 
 /// Send the tone's settings (which also keeps it alive), or stop it.
 fn push_tone(model: &Model, ui: &ToneUi, device_drop: &gtk::DropDown, status: &gtk::Label) {
+    if model.tasks.is_closed() {
+        return;
+    }
     let frequency = tone_frequency(ui.frequency.value());
     ui.frequency_label
         .set_text(&format_band_frequency(frequency));
@@ -3239,7 +3276,7 @@ fn wire_tone(
     }
     // Renew the tone while it plays; the service stops it five seconds after
     // the last renewal, so a crashed editor cannot leave a tone running.
-    gtk::glib::timeout_add_seconds_local(2, {
+    let tone_timer = gtk::glib::timeout_add_seconds_local(2, {
         let ui = ui.clone();
         let push = push.clone();
         move || {
@@ -3249,6 +3286,7 @@ fn wire_tone(
             gtk::glib::ControlFlow::Continue
         }
     });
+    model.tasks.track(tone_timer);
     // The graph's listener remains available while editing bands. Text/IR
     // navigation is wired at the stacks, and closing still stops playback.
     window.connect_close_request({
@@ -3373,7 +3411,10 @@ fn sweep_position(start: f64, elapsed_seconds: f64, full_seconds: f64) -> f64 {
     (start + elapsed_seconds.max(0.0) / full_seconds.max(1.0)).clamp(0.0, 1.0)
 }
 
-fn build_graph_tone(tone: &Rc<ToneUi>) -> (adw::WrapBox, GraphToneUi) {
+fn build_graph_tone(
+    tone: &Rc<ToneUi>,
+    tasks: &editor_tasks::EditorTasks,
+) -> (adw::WrapBox, GraphToneUi) {
     let row = adw::WrapBox::builder()
         .child_spacing(8)
         .line_spacing(8)
@@ -3497,7 +3538,7 @@ fn build_graph_tone(tone: &Rc<ToneUi>) -> (adw::WrapBox, GraphToneUi) {
             }
         }
     });
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(25), {
+    let sweep_timer = gtk::glib::timeout_add_local(std::time::Duration::from_millis(25), {
         let tone = tone.clone();
         let sweep = sweep.clone();
         let clock = clock.clone();
@@ -3519,6 +3560,7 @@ fn build_graph_tone(tone: &Rc<ToneUi>) -> (adw::WrapBox, GraphToneUi) {
             gtk::glib::ControlFlow::Continue
         }
     });
+    tasks.track(sweep_timer);
     (
         row,
         GraphToneUi {
@@ -3550,6 +3592,9 @@ struct ListeningWidgets {
 }
 
 fn submit_live(model: &Rc<Model>, save: bool) {
+    if model.tasks.is_closed() {
+        return;
+    }
     let Some(id) = model.current_id.borrow().clone() else {
         return;
     };
@@ -3655,6 +3700,9 @@ fn apply_tone_hold(model: &Model, analysis: &mut ProfileAnalysis) {
 }
 
 fn schedule_live(model: &Rc<Model>) {
+    if model.tasks.is_closed() {
+        return;
+    }
     model
         .live_revision
         .set(model.live_revision.get().wrapping_add(1));
@@ -3673,6 +3721,9 @@ fn schedule_live(model: &Rc<Model>) {
 }
 
 fn schedule_save(model: &Rc<Model>) {
+    if model.tasks.is_closed() {
+        return;
+    }
     if let Some(timer) = model.pending_save.borrow_mut().take() {
         timer.remove();
     }

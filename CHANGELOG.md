@@ -109,6 +109,9 @@
 
 ### Fixed
 
+- Closed editors stop their preview timers and workers. Reopening the app
+  reuses its window, and competing editor connections cannot overwrite an
+  active preview, save over its profile, or end its session.
 - Offer MassiveEQ updates in cachy-update, arch-update, and AUR helpers
   without devel checks: the AUR package now carries each new upstream
   version. It had been published from a shallow clone as `r1`, below every

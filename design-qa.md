@@ -99,3 +99,11 @@ SHOT_SIZE=1280x1100 SHOT_SCENARIO="$PWD/.agents/skills/verify-massiveeq/measurem
 ```
 
 Evidence in `/home/adam/Playground/devbox/out/`: `merge-imported.png`, `merge-separate-preview.png`, `merge-separate-graph.png`, `merge-merged-preview.png`, `merge-merged-graph.png`, `merge-remove-draft.png`, `merge-invalid-file.png`, and `merge-narrow.png`. The [measurement import notes](docs/measurement-imports.md) describe the arithmetic and storage contract.
+
+## Editor lifetime regression, 2026-10-25
+
+A live diagnosis found three editor connections in one process renewing different drafts for one profile every two seconds while only one window was visible. Captured LDAC payload bitrate stayed at 660 kbps over 5,625 packets, while EQ runtime revisions changed 12 times over 44 seconds.
+
+Before the fix, the isolated D-Bus check accepted another connection's conflicting draft, and three launches created three windows. After the fix, `.agents/skills/verify-massiveeq/editor-lifetime-scenario.sh` passed competing preview/save/end rejection, owner release/handoff and crash expiry, repeated activation, stable live processing, immediate close-time saving, stopping a playing sweep on close, reopening and editing, failed-save refusal to close, and retry after restoring write access. The existing abandoned-preview scenario also returned to saved audio after lease expiry. The screenshot `devbox/out/editor-lifetime.png` was inspected. No GTK critical, Adwaita layout warning or panic appeared in the passing run.
+
+Workspace release tests: 157 passed, one ignored DSP load benchmark. Clippy with warnings denied, formatting and release build passed. Runtime evidence and a reversible local package are outside the checkout at `/home/adam/Playground/output/editor-lifetime-hotfix`; the diagnosis is at `/home/adam/Playground/output/benji-playback-check`.
