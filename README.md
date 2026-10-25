@@ -422,6 +422,16 @@ MassiveEQ accepts `Preamp`, the common `Filter` variants (`PK`, `LS`, `HS`,
 will not be activated silently. Included files are flattened on import and IR
 assets are copied into the profile library.
 
+Filters are designed exactly as Equalizer APO designs them, so a preset made
+for APO sounds the same: `BW Oct` is APO's digital bandwidth, `LS`/`HS` with a
+Q or slope (`LS 6dB`, `HS 12dB`) take Fc as the corner frequency, a shelf
+without either has APO's slope of 0.9, `LSC 12dB`-style slopes are read, a
+notch without a Q has Q 30, and REW's `Modal` filters are peaking filters.
+Measured through the audio service, a nine-band preset matches APO within
+0.0002 dB at 44.1, 48 and 96 kHz. MassiveEQ's level differs on purpose: on top
+of the file's `Preamp` it adds the loudness match and clipping safety shown
+above the graph.
+
 The audio host maintains a persistent native PipeWire smart-filter pair for
 each assigned output. MassiveEQ's Rust DSP engine uses stable biquad cascades,
 minimum-phase GraphicEQ FIR design, and a two-stage partitioned convolver.

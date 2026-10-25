@@ -268,7 +268,8 @@ fn parse_filter(args: &str, channels: ChannelSelection) -> Result<Filter, String
     }
     let kind_token = tokens[1].to_ascii_uppercase();
     let kind = match kind_token.as_str() {
-        "PK" | "PEQ" => FilterKind::Peaking,
+        // Room EQ Wizard's modal filters are peaking filters with a Q.
+        "PK" | "PEQ" | "MODAL" => FilterKind::Peaking,
         "LS" | "LSC" => FilterKind::LowShelf,
         "HS" | "HSC" => FilterKind::HighShelf,
         "LP" | "LPQ" => FilterKind::LowPass,
@@ -278,14 +279,37 @@ fn parse_filter(args: &str, channels: ChannelSelection) -> Result<Filter, String
         "AP" => FilterKind::AllPass,
         _ => return Err(format!("Unsupported filter type: {}", tokens[1])),
     };
-    let frequency = required_number_after(&tokens, "Fc")?;
+    let frequency = frequency_after(args)?;
     let gain_db = optional_number_after(&tokens, "Gain")?.unwrap_or(0.0);
-    let q = if let Some(q) = optional_number_after(&tokens, "Q")? {
-        q
-    } else if let Some(bw) = bandwidth_after(&tokens)? {
-        bandwidth_to_q(bw)
+    let shelf = matches!(kind, FilterKind::LowShelf | FilterKind::HighShelf);
+    let given_q = optional_number_after(&tokens, "Q")?;
+    // Read the way Equalizer APO reads it, so a preset sounds the same.
+    let (frequency, q, bandwidth) = if shelf {
+        // A slope in dB per octave right after the type (`LSC 12dB`, `LS 6dB`)
+        // is 1 at 12 dB. Without a Q or slope APO uses 0.9. `LS`/`HS` with a Q
+        // or slope give the corner frequency rather than the centre.
+        let slope = shelf_slope(&tokens)?;
+        let corner = !kind_token.ends_with('C') && (given_q.is_some() || slope.is_some());
+        let q = match (slope, given_q) {
+            (Some(slope), _) => shelf_slope_to_q(slope / 12.0, gain_db)?,
+            (None, Some(q)) => q,
+            (None, None) => shelf_slope_to_q(0.9, gain_db)?,
+        };
+        let frequency = if corner {
+            shelf_centre(kind, frequency, gain_db, q)
+        } else {
+            frequency
+        };
+        (frequency, q, None)
+    } else if let Some(q) = given_q {
+        (frequency, q, None)
+    } else if let Some(bandwidth) = bandwidth_after(&tokens)? {
+        (frequency, bandwidth_to_q(bandwidth), Some(bandwidth))
+    } else if kind == FilterKind::Notch {
+        // APO's notch default, from Room EQ Wizard.
+        (frequency, 30.0, None)
     } else {
-        std::f64::consts::FRAC_1_SQRT_2
+        (frequency, std::f64::consts::FRAC_1_SQRT_2, None)
     };
     if !(1.0..=384000.0).contains(&frequency) {
         return Err("Filter frequency is outside 1–384000 Hz".into());
@@ -302,8 +326,78 @@ fn parse_filter(args: &str, channels: ChannelSelection) -> Result<Filter, String
         frequency,
         gain_db,
         q,
+        bandwidth,
         channels,
     })
+}
+
+/// Fc as Equalizer APO reads it: Room EQ Wizard may write a thousands
+/// separator as a dot (`Fc 1.500 Hz` is 1500 Hz). A comma is a decimal point.
+fn frequency_after(args: &str) -> Result<f64, String> {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    let raw = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("Fc"))
+        .and_then(|index| tokens.get(index + 1))
+        .ok_or_else(|| "Filter is missing Fc".to_owned())?;
+    let thousands =
+        raw.len() >= 5 && !raw.contains(['e', 'E', ',']) && raw.as_bytes()[raw.len() - 4] == b'.';
+    let value = raw
+        .replace(',', ".")
+        .parse::<f64>()
+        .map_err(|_| "Invalid numeric value after Fc".to_owned())?;
+    if !value.is_finite() {
+        return Err("Value after Fc must be finite".into());
+    }
+    Ok(if thousands { value * 1000.0 } else { value })
+}
+
+/// A shelf's slope in dB per octave, written right after its type.
+fn shelf_slope(tokens: &[&str]) -> Result<Option<f64>, String> {
+    let Some(next) = tokens.get(2) else {
+        return Ok(None);
+    };
+    let (number, unit) = match next.to_ascii_lowercase().strip_suffix("db") {
+        Some(number) => (number.to_owned(), true),
+        None => (
+            (*next).to_owned(),
+            tokens
+                .get(3)
+                .is_some_and(|unit| unit.eq_ignore_ascii_case("dB")),
+        ),
+    };
+    if !unit {
+        return Ok(None);
+    }
+    let slope = number
+        .parse::<f64>()
+        .map_err(|_| format!("Invalid shelf slope: {next}"))?;
+    if !slope.is_finite() || slope <= 0.0 {
+        return Err("Shelf slope must be positive".into());
+    }
+    Ok(Some(slope))
+}
+
+/// The Q of a shelf with slope `s` (1 is the steepest without overshoot).
+fn shelf_slope_to_q(s: f64, gain_db: f64) -> Result<f64, String> {
+    let amp = 10.0_f64.powf(gain_db / 40.0);
+    let inverse_square = (amp + 1.0 / amp) * (1.0 / s - 1.0) + 2.0;
+    if inverse_square <= 0.0 {
+        return Err("Shelf slope is too steep for its gain".into());
+    }
+    Ok(1.0 / inverse_square.sqrt())
+}
+
+/// The centre of a shelf whose corner frequency is given, as APO computes it.
+fn shelf_centre(kind: FilterKind, corner: f64, gain_db: f64, q: f64) -> f64 {
+    let amp = 10.0_f64.powf(gain_db / 40.0);
+    let s = 1.0 / ((1.0 / (q * q) - 2.0) / (amp + 1.0 / amp) + 1.0);
+    let factor = 10.0_f64.powf(gain_db.abs() / 80.0 / s);
+    if kind == FilterKind::LowShelf {
+        corner * factor
+    } else {
+        corner / factor
+    }
 }
 
 fn parse_graphic_eq(args: &str, channels: ChannelSelection) -> Result<GraphicEq, String> {
@@ -365,10 +459,6 @@ fn optional_number_after(tokens: &[&str], key: &str) -> Result<Option<f64>, Stri
     Ok(Some(value))
 }
 
-fn required_number_after(tokens: &[&str], key: &str) -> Result<f64, String> {
-    optional_number_after(tokens, key)?.ok_or_else(|| format!("Filter is missing {key}"))
-}
-
 fn bandwidth_after(tokens: &[&str]) -> Result<Option<f64>, String> {
     let Some(index) = tokens
         .iter()
@@ -393,6 +483,19 @@ fn bandwidth_after(tokens: &[&str]) -> Result<Option<f64>, String> {
         return Err("BW must be positive and finite".into());
     }
     Ok(Some(value))
+}
+
+/// A number as written to profile text: at most six decimals, without
+/// trailing zeros. Saving never moves a value by more than 0.0000005, so a
+/// saved profile sounds the same when loaded again.
+fn decimal(value: f64) -> String {
+    let text = format!("{value:.6}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text == "-0" {
+        "0".to_owned()
+    } else {
+        text.to_owned()
+    }
 }
 
 fn first_number(text: &str) -> Option<f64> {
@@ -498,18 +601,21 @@ pub fn serialize_profile(profile: &ProfileDocument) -> String {
     };
     for gain in &profile.preamps {
         switch(&mut out, &mut current, gain.channels);
-        out.push_str(&format!("Preamp: {:.2} dB\n", gain.gain_db));
+        out.push_str(&format!("Preamp: {} dB\n", decimal(gain.gain_db)));
     }
     for (index, filter) in profile.filters.iter().enumerate() {
         switch(&mut out, &mut current, filter.channels);
+        let width = match filter.bandwidth {
+            Some(bandwidth) => format!("BW Oct {}", decimal(bandwidth)),
+            None => format!("Q {}", decimal(filter.q)),
+        };
         out.push_str(&format!(
-            "Filter {}: {} {} Fc {:.2} Hz Gain {:.2} dB Q {:.4}\n",
+            "Filter {}: {} {} Fc {} Hz Gain {} dB {width}\n",
             index + 1,
             if filter.enabled { "ON" } else { "OFF" },
             filter.kind.apo_name(),
-            filter.frequency,
-            filter.gain_db,
-            filter.q
+            decimal(filter.frequency),
+            decimal(filter.gain_db),
         ));
     }
     let tilt = tilt_filters(profile.tilt_db_per_octave);
@@ -523,11 +629,11 @@ pub fn serialize_profile(profile: &ProfileDocument) -> String {
     for filter in &tilt {
         switch(&mut out, &mut current, filter.channels);
         out.push_str(&format!(
-            "Filter: ON {} Fc {:.2} Hz Gain {:.2} dB Q {:.4}\n",
+            "Filter: ON {} Fc {} Hz Gain {} dB Q {}\n",
             filter.kind.apo_name(),
-            filter.frequency,
-            filter.gain_db,
-            filter.q
+            decimal(filter.frequency),
+            decimal(filter.gain_db),
+            decimal(filter.q)
         ));
     }
     for eq in &profile.graphic_eqs {
@@ -535,7 +641,7 @@ pub fn serialize_profile(profile: &ProfileDocument) -> String {
         let points = eq
             .points
             .iter()
-            .map(|p| format!("{:.2} {:.2}", p.frequency, p.gain_db))
+            .map(|p| format!("{} {}", decimal(p.frequency), decimal(p.gain_db)))
             .collect::<Vec<_>>()
             .join("; ");
         out.push_str(&format!("GraphicEQ: {points}\n"));
@@ -608,7 +714,7 @@ Filter 3: OFF HSC Fc 8000 Hz Gain -1.5 dB Q 0.8
     fn hand_edited_tilt_shelves_stay_ordinary_filters() {
         let mut profile = ProfileDocument::empty("fixture");
         profile.tilt_db_per_octave = 0.5;
-        let text = serialize_profile(&profile).replace("Gain 1.00 dB", "Gain 1.50 dB");
+        let text = serialize_profile(&profile).replace("Gain 1 dB", "Gain 1.5 dB");
         let round = parse_text("fixture", &text);
         assert_eq!(round.tilt_db_per_octave, 0.0);
         assert_eq!(round.filters.len(), 5);

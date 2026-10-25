@@ -28,6 +28,20 @@
 
 ### Changed
 
+- Filters read the way Equalizer APO reads them, so a preset sounds the same.
+  `BW Oct` is a digital bandwidth, designed at each sample rate (it was turned
+  into one Q, which made bands above about 5 kHz up to 1.6 dB narrower).
+  `LS`/`HS` with a Q or a slope (`LS 6dB`, `HS 12dB`) take Fc as the corner
+  rather than the centre, a shelf with neither has APO's slope of 0.9, a
+  slope after the type (`LSC 12dB`) sets it, and shelves ignore `BW`. A notch
+  without a Q has APO's Q of 30 (it was 0.71, a 32 dB difference at Fc).
+  Room EQ Wizard's `Modal` filters load as peaking filters, and `Fc 1.500 Hz`
+  is 1500 Hz, as REW writes it. Measured through the service, a nine-band
+  preset now matches APO within 0.0002 dB at 44.1, 48 and 96 kHz.
+- The graph, headroom and level match hold a GraphicEQ's end gains outside
+  its points, as the audio and Equalizer APO do; they used 0 dB there.
+- Profile text keeps every value to six decimals instead of rounding gains
+  and frequencies to 0.01 and Q to 0.0001, so saving never changes the sound.
 - Tone generator: pink noise no longer clips. It used to hit the −12 dBFS
   limit on about one sample in six at full level; noise now stops at
   −22 dBFS, where its peaks reach the same limit cleanly, and the level

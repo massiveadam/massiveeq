@@ -95,7 +95,34 @@ pub struct Filter {
     pub frequency: f64,
     pub gain_db: f64,
     pub q: f64,
+    /// Bandwidth in octaves when the filter was given one (`BW Oct`). It is a
+    /// digital bandwidth, as in Equalizer APO, so it does not turn into one
+    /// fixed Q: the filter is designed from it at each sample rate, and `q`
+    /// holds the analog equivalent. Not used by shelves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth: Option<f64>,
     pub channels: ChannelSelection,
+}
+
+impl Filter {
+    /// The RBJ alpha term for this filter at `omega` (radians per sample).
+    pub fn alpha(&self, omega: f64) -> f64 {
+        let sin = omega.sin();
+        match self.bandwidth {
+            Some(bandwidth)
+                if !matches!(self.kind, FilterKind::LowShelf | FilterKind::HighShelf) =>
+            {
+                sin * (std::f64::consts::LN_2 / 2.0 * bandwidth * omega / sin).sinh()
+            }
+            _ => sin / (2.0 * self.q),
+        }
+    }
+
+    /// Set the Q, which replaces a bandwidth given in octaves.
+    pub fn set_q(&mut self, q: f64) {
+        self.q = q;
+        self.bandwidth = None;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -168,6 +195,7 @@ pub fn tilt_filters(slope: f64) -> Vec<Filter> {
                 2.0 * slope
             },
             q: TILT_Q,
+            bandwidth: None,
             channels: ChannelSelection::All,
         })
         .collect()
