@@ -520,17 +520,22 @@ impl Service {
         if let Some(playing) = tone.take() {
             playing.stop();
         }
-        // Only the device lookup needs the service state.
-        let device = self
-            .state
-            .lock()
-            .await
-            .devices
-            .iter()
-            .find(|device| device.connected && device.key.as_storage_key() == device_key)
-            .cloned()
-            .ok_or_else(|| fdo::Error::Failed("that output is not connected".into()))?;
-        let rate = crate::device::graph_settings().await.sample_rate;
+        // Only the device lookup needs the service state. The tone joins at
+        // the rate the output already runs at, so it never forces a switch.
+        let (device, running_rate) = {
+            let state = self.state.lock().await;
+            let device = state
+                .devices
+                .iter()
+                .find(|device| device.connected && device.key.as_storage_key() == device_key)
+                .cloned()
+                .ok_or_else(|| fdo::Error::Failed("that output is not connected".into()))?;
+            (device, state.graph.rate)
+        };
+        let rate = match running_rate {
+            Some(rate) => rate,
+            None => crate::device::graph_settings().await.sample_rate,
+        };
         // Connecting to PipeWire can take a moment; keep it off the runtime.
         let started =
             tokio::task::spawn_blocking(move || crate::tone::Tone::start(&device, rate, settings))

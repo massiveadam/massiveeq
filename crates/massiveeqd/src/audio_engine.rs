@@ -1,7 +1,10 @@
 use crate::latest_processor::LatestProcessor;
 use massiveeq_dsp::ProfileProcessor;
 use rtrb::{Producer, PushError};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 
 /// Owns all mutable DSP state on the PipeWire real-time thread. Every buffer
 /// and processor is created by the control thread before it reaches here.
@@ -11,6 +14,9 @@ pub struct AudioEngine {
     updates: Arc<LatestProcessor>,
     retired: Producer<Box<ProfileProcessor>>,
     retire_backlog: Option<Box<ProfileProcessor>>,
+    /// The rate PipeWire negotiated for the sink, 0 until it has. It follows
+    /// the device when the graph switches rate for the music playing.
+    stream_rate: Arc<AtomicU32>,
     /// Channels arriving from the sink; more than `outputs` for surround.
     inputs: usize,
     outputs: usize,
@@ -23,14 +29,19 @@ pub struct AudioEngine {
     interleaved_output: Vec<f32>,
 }
 
+/// How much longer than the first chain's capacity a cycle may grow. PipeWire
+/// scales cycles with the rate, so 384 kHz cycles are eight times 48 kHz ones.
+pub const RATE_HEADROOM: usize = 8;
+
 impl AudioEngine {
     pub fn new(
         active: Box<ProfileProcessor>,
         updates: Arc<LatestProcessor>,
         retired: Producer<Box<ProfileProcessor>>,
+        stream_rate: Arc<AtomicU32>,
         sample_rate: u32,
     ) -> Self {
-        let capacity = active.capacity();
+        let capacity = active.capacity() * RATE_HEADROOM;
         let inputs = active.input_channels();
         let outputs = active.output_channels();
         Self {
@@ -39,6 +50,7 @@ impl AudioEngine {
             updates,
             retired,
             retire_backlog: None,
+            stream_rate,
             inputs,
             outputs,
             capacity,
@@ -75,7 +87,18 @@ impl AudioEngine {
                 self.input[channel][frame_index] = *sample;
             }
         }
-        if self
+        // A chain built for another rate would put every filter in the wrong
+        // place, and one for shorter cycles cannot take this one, so it stays
+        // silent until the control thread sends one that fits, which fades in.
+        let rate = self.stream_rate.load(Ordering::Relaxed);
+        let fits = |processor: &ProfileProcessor| {
+            (rate == 0 || processor.sample_rate() == rate) && frames <= processor.capacity()
+        };
+        if !fits(&self.active) {
+            for output in &mut self.active_output {
+                output[..frames].fill(0.0);
+            }
+        } else if self
             .active
             .process(&self.input, &mut self.active_output, frames)
             .is_err()
@@ -92,7 +115,11 @@ impl AudioEngine {
 
         let mut finish_crossfade = false;
         if let Some(pending) = &mut self.pending {
-            if pending
+            if !fits(pending) {
+                for output in &mut self.pending_output {
+                    output[..frames].fill(0.0);
+                }
+            } else if pending
                 .process(&self.input, &mut self.pending_output, frames)
                 .is_err()
             {
@@ -160,6 +187,7 @@ mod tests {
             Box::new(ProfileProcessor::new(&initial).unwrap()),
             updates.clone(),
             retired,
+            Arc::new(AtomicU32::new(0)),
             48000,
         );
         for gain in 1..=32 {
@@ -176,6 +204,80 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_for_another_rate_is_silent_until_one_for_the_new_rate_fades_in() {
+        let at_48k = compile_bypass(48_000, 256, 2);
+        let at_96k = compile_bypass(96_000, 256, 2);
+        let updates = Arc::new(LatestProcessor::default());
+        let (retired, _consumer) = RingBuffer::new(4);
+        let rate = Arc::new(AtomicU32::new(48_000));
+        let mut engine = AudioEngine::new(
+            Box::new(ProfileProcessor::new(&at_48k).unwrap()),
+            updates.clone(),
+            retired,
+            rate.clone(),
+            48_000,
+        );
+        let input = vec![0.5_f32; 512];
+        assert!(engine.process(&input).iter().all(|sample| *sample == 0.5));
+
+        // The device switched to 96 kHz for the next track.
+        rate.store(96_000, Ordering::Relaxed);
+        assert!(engine.process(&input).iter().all(|sample| *sample == 0.0));
+        // A late chain for the old rate stays silent too.
+        updates.publish(Box::new(ProfileProcessor::new(&at_48k).unwrap()));
+        assert!(engine.process(&input).iter().all(|sample| *sample == 0.0));
+        for _ in 0..8 {
+            engine.process(&input);
+        }
+
+        updates.publish(Box::new(ProfileProcessor::new(&at_96k).unwrap()));
+        allocation_test_support::begin();
+        let first = engine.process(&input);
+        let allocations = allocation_test_support::end();
+        assert_eq!(allocations, 0);
+        assert!(first[0] < 0.01 && first[511] > first[0], "fades in");
+        for _ in 0..8 {
+            engine.process(&input);
+        }
+        assert!(
+            engine
+                .process(&input)
+                .iter()
+                .all(|sample| (sample - 0.5).abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn longer_cycles_at_a_higher_rate_wait_for_a_chain_that_fits() {
+        let at_48k = compile_bypass(48_000, 256, 2);
+        let at_96k = compile_bypass(96_000, 512, 2);
+        let updates = Arc::new(LatestProcessor::default());
+        let (retired, _consumer) = RingBuffer::new(4);
+        let rate = Arc::new(AtomicU32::new(96_000));
+        let mut engine = AudioEngine::new(
+            Box::new(ProfileProcessor::new(&at_48k).unwrap()),
+            updates.clone(),
+            retired,
+            rate,
+            48_000,
+        );
+        // 512 frames: twice what the first chain holds, never passed through raw.
+        let input = vec![0.5_f32; 1024];
+        assert_eq!(engine.process(&input).len(), 1024);
+        assert!(engine.process(&input).iter().all(|sample| *sample == 0.0));
+        updates.publish(Box::new(ProfileProcessor::new(&at_96k).unwrap()));
+        for _ in 0..4 {
+            engine.process(&input);
+        }
+        assert!(
+            engine
+                .process(&input)
+                .iter()
+                .all(|sample| (sample - 0.5).abs() < 1e-6)
+        );
+    }
+
+    #[test]
     fn processing_and_crossfade_do_not_allocate_or_free() {
         let compiled = compile_bypass(48_000, 128, 2);
         let active = Box::new(ProfileProcessor::new(&compiled).unwrap());
@@ -183,7 +285,13 @@ mod tests {
         let update_producer = Arc::new(LatestProcessor::default());
         let update_consumer = update_producer.clone();
         let (retire_producer, mut retire_consumer) = RingBuffer::new(4);
-        let mut engine = AudioEngine::new(active, update_consumer, retire_producer, 48_000);
+        let mut engine = AudioEngine::new(
+            active,
+            update_consumer,
+            retire_producer,
+            Arc::new(AtomicU32::new(0)),
+            48_000,
+        );
         update_producer.publish(next);
         let input = vec![0.25_f32; 256];
 
@@ -205,7 +313,13 @@ mod tests {
         let update_producer = Arc::new(LatestProcessor::default());
         let update_consumer = update_producer.clone();
         let (retire_producer, _retire_consumer) = RingBuffer::new(4);
-        let mut engine = AudioEngine::new(active, update_consumer, retire_producer, 48_000);
+        let mut engine = AudioEngine::new(
+            active,
+            update_consumer,
+            retire_producer,
+            Arc::new(AtomicU32::new(0)),
+            48_000,
+        );
         update_producer.publish(next);
         // 128 frames of 7.1 in, 128 frames of stereo out.
         let mut input = vec![0.0_f32; 128 * 8];
