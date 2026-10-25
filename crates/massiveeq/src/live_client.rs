@@ -39,12 +39,19 @@ pub struct Completion {
     pub analysis: Option<ProfileAnalysis>,
 }
 
+/// The tone's own queue and thread, so retuning it never waits behind a
+/// profile preview or save. Only the latest request matters.
+#[derive(Default)]
+struct ToneQueue {
+    play: Option<(String, serde_json::Value)>,
+    stop: bool,
+    stopped: bool,
+}
+
 #[derive(Default)]
 struct Queue {
     jobs: VecDeque<Draft>,
     end: Vec<String>,
-    tone: Option<(String, serde_json::Value)>,
-    stop_tone: bool,
     stopped: bool,
     barriers: Vec<mpsc::Sender<()>>,
 }
@@ -78,6 +85,7 @@ pub struct Poll {
 
 pub struct LiveClient {
     queue: Arc<(Mutex<Queue>, Condvar)>,
+    tone: Arc<(Mutex<ToneQueue>, Condvar)>,
     results: mpsc::Receiver<Completion>,
     poll: Arc<Mutex<Option<Result<Poll, String>>>>,
     stopped: Arc<AtomicBool>,
@@ -106,6 +114,42 @@ impl LiveClient {
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
         });
+        let tone = Arc::new((Mutex::new(ToneQueue::default()), Condvar::new()));
+        let tone_work = tone.clone();
+        let tone_client = client.clone();
+        let tone_errors = tx.clone();
+        std::thread::spawn(move || {
+            loop {
+                let (lock, ready) = &*tone_work;
+                let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while state.play.is_none() && !state.stop && !state.stopped {
+                    state = ready.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+                let play = state.play.take();
+                let stop = std::mem::take(&mut state.stop);
+                let stopped = state.stopped;
+                drop(state);
+                if stop || stopped {
+                    let _ = tone_client.stop_tone();
+                } else if let Some((device, settings)) = play
+                    && let Err(error) = tone_client.play_tone(&device, &settings)
+                    && tone_errors
+                        .send(Completion {
+                            revision: 0,
+                            id: String::new(),
+                            saved: None,
+                            error: Some(format!("{error:#}")),
+                            analysis: None,
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+                if stopped {
+                    break;
+                }
+            }
+        });
         let work = queue.clone();
         std::thread::spawn(move || {
             loop {
@@ -113,8 +157,6 @@ impl LiveClient {
                 let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
                 while state.jobs.is_empty()
                     && state.end.is_empty()
-                    && state.tone.is_none()
-                    && !state.stop_tone
                     && state.barriers.is_empty()
                     && !state.stopped
                 {
@@ -122,25 +164,10 @@ impl LiveClient {
                 }
                 let ends = std::mem::take(&mut state.end);
                 let stopped = state.stopped;
-                let tone = state.tone.take();
-                let stop_tone = std::mem::take(&mut state.stop_tone);
                 let job = state.jobs.pop_front();
                 drop(state);
                 for id in ends {
                     let _ = client.end_preview(&id);
-                }
-                if stop_tone || stopped {
-                    let _ = client.stop_tone();
-                } else if let Some((device, settings)) = tone
-                    && let Err(error) = client.play_tone(&device, &settings)
-                {
-                    let _ = tx.send(Completion {
-                        revision: 0,
-                        id: String::new(),
-                        saved: None,
-                        error: Some(format!("{error:#}")),
-                        analysis: None,
-                    });
                 }
                 if stopped {
                     break;
@@ -198,6 +225,7 @@ impl LiveClient {
         });
         Self {
             queue,
+            tone,
             results,
             poll,
             stopped,
@@ -227,24 +255,24 @@ impl LiveClient {
     }
 
     pub fn tone(&self, key: String, settings: serde_json::Value) {
-        let (lock, ready) = &*self.queue;
+        let (lock, ready) = &*self.tone;
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
         if queue.stopped {
             return;
         }
-        queue.tone = Some((key, settings));
-        queue.stop_tone = false;
+        queue.play = Some((key, settings));
+        queue.stop = false;
         ready.notify_one();
     }
 
     pub fn stop_tone(&self) {
-        let (lock, ready) = &*self.queue;
+        let (lock, ready) = &*self.tone;
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
         if queue.stopped {
             return;
         }
-        queue.tone = None;
-        queue.stop_tone = true;
+        queue.play = None;
+        queue.stop = true;
         ready.notify_one();
     }
 
@@ -275,7 +303,13 @@ impl LiveClient {
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
         queue.stopped = true;
         queue.jobs.clear();
-        queue.tone = None;
+        ready.notify_one();
+        drop(queue);
+        // The tone thread stops the tone on its way out.
+        let (lock, ready) = &*self.tone;
+        let mut tone = lock.lock().unwrap_or_else(|e| e.into_inner());
+        tone.stopped = true;
+        tone.play = None;
         ready.notify_one();
     }
 }

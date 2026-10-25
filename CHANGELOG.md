@@ -20,6 +20,21 @@
 
 ### Changed
 
+- Tone generator: pink noise no longer clips. It used to hit the −12 dBFS
+  limit on about one sample in six at full level; noise now stops at
+  −22 dBFS, where its peaks reach the same limit cleanly, and the level
+  slider follows when Pink noise is picked.
+- Tone generator: the Octave and ⅓ octave noise bands are now that wide.
+  They were about 0.65 and 0.21 octaves.
+- Tone generator: the service runs the sweep itself, so it glides at an even
+  rate instead of stepping every 25 ms and stalling while the editor is
+  busy. Moving the frequency by hand also glides instead of jumping.
+- Tone generator: while the level is held for the tone, a −1 dBFS safety
+  limiter guards the output, so music or a notification playing alongside
+  cannot clip. The tone itself always stays below it and is never touched.
+- Tone generator: the tone has its own connection in the editor and its own
+  lock in the service, so moving it never waits behind a profile preview
+  and starting it never holds up other requests.
 - The selected band's panel moves to whichever side of its node hides the
   least of the curves near that band, using the empty top or bottom of the
   graph when the space beside the node is busy, so it no longer covers the

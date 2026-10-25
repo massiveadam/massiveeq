@@ -92,6 +92,48 @@ impl ChannelProcessor {
     }
 }
 
+/// A zero-latency peak limiter linked across the output channels: any frame
+/// over the ceiling is turned down to it at once, then the gain recovers
+/// smoothly. Below the ceiling it is exactly unity.
+#[derive(Debug, Clone)]
+struct OutputLimiter {
+    ceiling: f32,
+    gain: f32,
+    release: f32,
+}
+
+impl OutputLimiter {
+    /// -1 dBFS, the same margin every profile keeps.
+    const CEILING_DB: f32 = -1.0;
+    const RELEASE_SECONDS: f32 = 0.1;
+
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            ceiling: 10.0_f32.powf(Self::CEILING_DB / 20.0),
+            gain: 1.0,
+            release: 1.0 - (-1.0 / (Self::RELEASE_SECONDS * sample_rate.max(1) as f32)).exp(),
+        }
+    }
+
+    fn process<O: AsMut<[f32]>>(&mut self, outputs: &mut [O], frames: usize) {
+        for frame in 0..frames {
+            let peak = outputs
+                .iter_mut()
+                .map(|output| output.as_mut()[frame].abs())
+                .fold(0.0_f32, f32::max);
+            self.gain += (1.0 - self.gain) * self.release;
+            if peak * self.gain > self.ceiling {
+                self.gain = self.ceiling / peak;
+            }
+            if self.gain < 1.0 {
+                for output in outputs.iter_mut() {
+                    output.as_mut()[frame] *= self.gain;
+                }
+            }
+        }
+    }
+}
+
 /// One input channel convolved into one output channel.
 #[derive(Debug, Clone)]
 struct RouteProcessor {
@@ -114,6 +156,7 @@ pub struct ProfileProcessor {
     /// Matrix-convolution sums per output.
     summed: Vec<Vec<f32>>,
     route_output: Vec<f32>,
+    limiter: Option<OutputLimiter>,
 }
 
 impl ProfileProcessor {
@@ -154,6 +197,9 @@ impl ProfileProcessor {
                 outputs
             ],
             route_output: vec![0.0; capacity],
+            limiter: profile
+                .output_limit
+                .then(|| OutputLimiter::new(profile.sample_rate)),
         })
     }
 
@@ -168,6 +214,19 @@ impl ProfileProcessor {
     /// Process `frames` frames from planar inputs (one buffer per sink
     /// channel) into planar outputs (one per output channel). Allocation-free.
     pub fn process<I: AsRef<[f32]>, O: AsMut<[f32]>>(
+        &mut self,
+        inputs: &[I],
+        outputs: &mut [O],
+        frames: usize,
+    ) -> Result<(), ProcessError> {
+        self.process_unlimited(inputs, outputs, frames)?;
+        if let Some(limiter) = &mut self.limiter {
+            limiter.process(outputs, frames);
+        }
+        Ok(())
+    }
+
+    fn process_unlimited<I: AsRef<[f32]>, O: AsMut<[f32]>>(
         &mut self,
         inputs: &[I],
         outputs: &mut [O],
@@ -264,6 +323,9 @@ impl ProfileProcessor {
         for route in &mut self.routes {
             route.convolver.reset();
         }
+        if let Some(limiter) = &mut self.limiter {
+            limiter.gain = 1.0;
+        }
     }
 }
 
@@ -295,6 +357,48 @@ mod tests {
         for (input, output) in right.iter().zip(&right_out) {
             assert!((*output - *input * safety).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn held_tone_gain_limits_music_but_never_the_tone() {
+        let profile = parse_text("test", "Filter 1: ON PK Fc 1000 Hz Gain 9 dB Q 1");
+        let mut compiled =
+            compile_profile(&profile, &CompileOptions::stereo(48_000, 128, "/tmp")).unwrap();
+        // Hold a gain 8 dB above what is safe for full-scale music.
+        let safe = compiled.analysis.effective_gain_db;
+        crate::hold_output_gain(&mut compiled, safe + 8.0, 11.0).unwrap();
+        assert!(compiled.output_limit);
+        let run = |amplitude: f32| {
+            let mut processor = ProfileProcessor::new(&compiled).unwrap();
+            let mut peak = 0.0_f32;
+            for block in 0..400 {
+                let input = (0..128)
+                    .map(|index| {
+                        let time = (block * 128 + index) as f32 / 48_000.0;
+                        amplitude * (std::f32::consts::TAU * 1_000.0 * time).sin()
+                    })
+                    .collect::<Vec<_>>();
+                let mut left = vec![0.0; 128];
+                let mut right = vec![0.0; 128];
+                processor
+                    .process_planar(&[&input, &input], &mut [&mut left, &mut right])
+                    .unwrap();
+                if block > 40 {
+                    peak = left.iter().fold(peak, |peak, value| peak.max(value.abs()));
+                }
+            }
+            20.0 * peak.log10()
+        };
+        // Full-scale music at the boosted frequency would land at +7 dBFS.
+        assert!(run(1.0) <= -0.99, "music reached {:.2} dBFS", run(1.0));
+        // The loudest tone, -12 dBFS, passes untouched: 9 dB of boost, the
+        // safe gain, and the 8 dB hold.
+        let tone = run(10.0_f32.powf(-12.0 / 20.0));
+        let expected = -12.0 + 9.0 + safe as f32 + 8.0;
+        assert!(
+            (tone - expected).abs() < 0.05,
+            "tone {tone:.2} dBFS, expected {expected:.2}"
+        );
     }
 
     #[test]
