@@ -71,6 +71,9 @@
   so a stray keypress cannot rename the profile.
 - Show the curve-context note only when measurement and target contexts
   conflict.
+- Outputs whose channels are listed as `FL,FR`, such as the Easy Effects
+  Sink, are stereo again. MassiveEQ counted one channel and put a mono
+  filter in front of them, so a profile could not sit before EasyEffects.
 
 ### Added
 

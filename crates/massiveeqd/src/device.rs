@@ -289,12 +289,14 @@ fn integer(props: &Map<String, Value>, key: &str) -> Option<u64> {
         .get(key)
         .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
 }
+/// Channels in an `audio.position` list. PipeWire writes `[ FL FR ]`, while
+/// EasyEffects and other clients write `FL,FR`.
 fn channel_count(position: Option<&str>) -> u64 {
     position
         .map(|value| {
             value
-                .trim_matches(|c| c == '[' || c == ']')
-                .split_whitespace()
+                .split(|c: char| c == ',' || c == '[' || c == ']' || c.is_whitespace())
+                .filter(|name| !name.is_empty())
                 .count() as u64
         })
         .filter(|v| *v > 0)
@@ -361,6 +363,16 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn counts_positions_in_either_list_style() {
+        assert_eq!(channel_count(Some("[ FL FR ]")), 2);
+        assert_eq!(channel_count(Some("FL,FR")), 2);
+        assert_eq!(channel_count(Some("FL, FR, FC, LFE")), 4);
+        assert_eq!(channel_count(Some("MONO")), 1);
+        assert_eq!(channel_count(Some("[]")), 2);
+        assert_eq!(channel_count(None), 2);
     }
 
     #[test]
