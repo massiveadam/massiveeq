@@ -3011,7 +3011,16 @@ struct ToneUi {
     level_label: gtk::Label,
     fix_caption: gtk::Label,
     fixes: Vec<(gtk::Button, f64)>,
+    /// The running sweep's start in Hz and rate in octaves per second. The
+    /// service plays it; the slider here only follows along.
+    sweep: Cell<Option<(f64, f64, u32)>>,
+    sweep_id: Cell<u32>,
 }
+
+/// Loudest tone levels in dBFS, as the service caps them: noise peaks run
+/// about 10 dB above a sine of the same level, so noise stops lower.
+const TONE_MAX_LEVEL_DB: f64 = -12.0;
+const NOISE_MAX_LEVEL_DB: f64 = -22.0;
 
 /// Slider position (0–1) to frequency, logarithmic over 20 Hz–20 kHz.
 fn tone_frequency(position: f64) -> f64 {
@@ -3080,8 +3089,12 @@ fn build_tone_page() -> (gtk::Box, Rc<ToneUi>) {
     let frequency = slider((0.0, 1.0, 0.001), tone_position(1_000.0));
     frequency.set_increments(1.0 / 120.0, 1.0 / 30.0);
     frequency.update_property(&[gtk::accessible::Property::Label("Graph tone frequency")]);
-    let level = slider((-60.0, -12.0, 1.0), -36.0);
+    let level = slider((-60.0, TONE_MAX_LEVEL_DB, 1.0), -36.0);
     level.update_property(&[gtk::accessible::Property::Label("Tone level")]);
+    level.set_tooltip_text(Some(
+        "Level before the EQ. Pink noise matches a sine's loudness at the same setting \
+         and stops at −22 dBFS, where its peaks reach the sine's −12 dBFS limit.",
+    ));
     card.append(&frequency);
     card.append(&level);
 
@@ -3121,6 +3134,8 @@ fn build_tone_page() -> (gtk::Box, Rc<ToneUi>) {
         level_label,
         fix_caption,
         fixes,
+        sweep: Cell::new(None),
+        sweep_id: Cell::new(0),
     });
     (page, ui)
 }
@@ -3132,6 +3147,11 @@ fn tone_settings(ui: &ToneUi) -> serde_json::Value {
         "ears": match ui.ears.selected() { 0 => "left", 2 => "right", _ => "both" },
         "frequency": tone_frequency(ui.frequency.value()),
         "level_db": ui.level.value(),
+        "sweep": ui.sweep.get().map(|(start, rate, id)| serde_json::json!({
+            "start": start,
+            "octaves_per_second": rate,
+            "id": id,
+        })),
     })
 }
 
@@ -3262,7 +3282,24 @@ fn wire_tone(
             schedule_live(&model);
         }
     });
-    for segmented in [&ui.signal, &ui.band, &ui.ears] {
+    ui.signal.connect_changed({
+        let ui = ui.clone();
+        let push = push.clone();
+        move || {
+            // Lowering the limit pulls a louder setting down with it.
+            let upper = if ui.signal.selected() == 1 {
+                NOISE_MAX_LEVEL_DB
+            } else {
+                TONE_MAX_LEVEL_DB
+            };
+            ui.level.adjustment().set_upper(upper);
+            if ui.level.value() > upper {
+                ui.level.set_value(upper);
+            }
+            push();
+        }
+    });
+    for segmented in [&ui.band, &ui.ears] {
         let push = push.clone();
         segmented.connect_changed(move || push());
     }
@@ -3407,6 +3444,29 @@ struct GraphToneUi {
     sweep: gtk::ToggleButton,
 }
 
+/// Seconds a sweep takes across the whole range, from the speed menu.
+fn speed_seconds(speed: &gtk::DropDown) -> f64 {
+    match speed.selected() {
+        0 => 15.0,
+        2 => 60.0,
+        _ => 30.0,
+    }
+}
+
+/// Hand a sweep from slider position `start` to the service, which plays it.
+/// Each sweep gets a new id, so starting the same one again restarts it.
+fn start_sweep(tone: &ToneUi, start: f64, full_seconds: f64) {
+    let id = tone.sweep_id.get().wrapping_add(1);
+    tone.sweep_id.set(id);
+    tone.sweep
+        .set(Some((tone_frequency(start), sweep_rate(full_seconds), id)));
+}
+
+/// Octaves per second for a sweep across 20 Hz–20 kHz in `full_seconds`.
+fn sweep_rate(full_seconds: f64) -> f64 {
+    1000.0_f64.log2() / full_seconds.max(1.0)
+}
+
 fn sweep_position(start: f64, elapsed_seconds: f64, full_seconds: f64) -> f64 {
     (start + elapsed_seconds.max(0.0) / full_seconds.max(1.0)).clamp(0.0, 1.0)
 }
@@ -3515,26 +3575,32 @@ fn build_graph_tone(
     sweep.connect_toggled({
         let tone = tone.clone();
         let clock = clock.clone();
+        let speed = speed.clone();
         move |button| {
             if button.is_active() {
                 tone.signal.buttons[0].set_active(true);
                 if tone.frequency.value() >= 0.999 {
                     tone.frequency.set_value(0.0);
                 }
-                *clock.borrow_mut() = Some((std::time::Instant::now(), tone.frequency.value()));
+                let start = tone.frequency.value();
+                *clock.borrow_mut() = Some((std::time::Instant::now(), start));
+                start_sweep(&tone, start, speed_seconds(&speed));
                 tone.play.set_active(true);
             } else {
                 *clock.borrow_mut() = None;
+                tone.sweep.set(None);
             }
         }
     });
     speed.connect_selected_notify({
         let clock = clock.clone();
         let tone = tone.clone();
-        move |_| {
+        move |drop| {
             let running = clock.borrow().is_some();
             if running {
-                *clock.borrow_mut() = Some((std::time::Instant::now(), tone.frequency.value()));
+                let start = tone.frequency.value();
+                *clock.borrow_mut() = Some((std::time::Instant::now(), start));
+                start_sweep(&tone, start, speed_seconds(drop));
             }
         }
     });
@@ -3545,11 +3611,7 @@ fn build_graph_tone(
         move || {
             let running = *clock.borrow();
             if let Some((start, position)) = running {
-                let seconds = match speed.selected() {
-                    0 => 15.0,
-                    2 => 60.0,
-                    _ => 30.0,
-                };
+                let seconds = speed_seconds(&speed);
                 let next = sweep_position(position, start.elapsed().as_secs_f64(), seconds);
                 tone.frequency.set_value(next);
                 if next >= 1.0 {

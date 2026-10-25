@@ -18,9 +18,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The quietest and loudest levels a tone may play at, in dBFS.
+/// The quietest and loudest levels a tone may play at, in dBFS. No sample
+/// ever goes above `MAX_LEVEL_DB`, which the level hold's headroom relies on.
 pub const MIN_LEVEL_DB: f32 = -60.0;
 pub const MAX_LEVEL_DB: f32 = -12.0;
+/// Noise peaks run this far above a sine of the same level (its RMS is 3 dB
+/// lower, and 13 dB above RMS clips about one sample in 200,000), so noise
+/// stops this much lower to play cleanly under `MAX_LEVEL_DB`.
+pub const NOISE_CREST_DB: f32 = 10.0;
+/// Glide time for frequency changes, so dragging or stepping the frequency
+/// bends the tone instead of jumping.
+const GLIDE_SECONDS: f32 = 0.03;
+/// Two cascaded band-pass sections per band, each with this Q, give a
+/// -3 dB width of exactly one octave or one third of an octave.
+const OCTAVE_Q: f32 = 0.9054;
+const THIRD_Q: f32 = 2.7654;
 /// A tone stops unless the editor renews it within this time.
 pub const KEEPALIVE: Duration = Duration::from_secs(5);
 
@@ -47,6 +59,18 @@ pub enum Ears {
     Right,
 }
 
+/// A sine moving upward through the spectrum at a constant rate in octaves,
+/// run by the generator so it glides smoothly whatever the editor is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct Sweep {
+    pub start: f32,
+    pub octaves_per_second: f32,
+    /// Changes whenever the editor starts a sweep, so starting the same sweep
+    /// again restarts it even if the service never saw it stop.
+    #[serde(default)]
+    pub id: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct ToneSettings {
     pub signal: Signal,
@@ -54,11 +78,18 @@ pub struct ToneSettings {
     pub ears: Ears,
     pub frequency: f32,
     pub level_db: f32,
+    /// While set, the frequency comes from the sweep instead.
+    #[serde(default)]
+    pub sweep: Option<Sweep>,
 }
 
 impl ToneSettings {
     /// Keep a request inside safe, audible limits.
     pub fn clamped(self) -> Self {
+        let max_level = match self.signal {
+            Signal::Sine => MAX_LEVEL_DB,
+            Signal::Pink => MAX_LEVEL_DB - NOISE_CREST_DB,
+        };
         Self {
             frequency: if self.frequency.is_finite() {
                 self.frequency.clamp(20.0, 20_000.0)
@@ -66,10 +97,22 @@ impl ToneSettings {
                 1_000.0
             },
             level_db: if self.level_db.is_finite() {
-                self.level_db.clamp(MIN_LEVEL_DB, MAX_LEVEL_DB)
+                self.level_db.clamp(MIN_LEVEL_DB, max_level)
             } else {
                 MIN_LEVEL_DB
             },
+            sweep: self
+                .sweep
+                .filter(|sweep| {
+                    sweep.start.is_finite()
+                        && sweep.octaves_per_second.is_finite()
+                        && sweep.octaves_per_second > 0.0
+                })
+                .map(|sweep| Sweep {
+                    start: sweep.start.clamp(20.0, 20_000.0),
+                    octaves_per_second: sweep.octaves_per_second.min(10.0),
+                    ..sweep
+                }),
             ..self
         }
     }
@@ -82,6 +125,13 @@ struct Shared {
     ears: AtomicU32,
     frequency: AtomicU32,
     level_db: AtomicU32,
+    /// Sweep start in Hz and rate in octaves per second; a zero start means
+    /// no sweep. A new sweep bumps `sweep_generation` so the generator
+    /// restarts it, while renewals of the same sweep leave it running.
+    sweep_start: AtomicU32,
+    sweep_rate: AtomicU32,
+    sweep_id: AtomicU32,
+    sweep_generation: AtomicU32,
     /// Fade to silence; set before the stream is torn down.
     muted: AtomicBool,
 }
@@ -94,6 +144,10 @@ impl Shared {
             ears: AtomicU32::new(0),
             frequency: AtomicU32::new(0),
             level_db: AtomicU32::new(0),
+            sweep_start: AtomicU32::new(0),
+            sweep_rate: AtomicU32::new(0),
+            sweep_id: AtomicU32::new(0),
+            sweep_generation: AtomicU32::new(0),
             muted: AtomicBool::new(false),
         };
         shared.store(settings);
@@ -108,6 +162,34 @@ impl Shared {
             .store(settings.frequency.to_bits(), Ordering::Relaxed);
         self.level_db
             .store(settings.level_db.to_bits(), Ordering::Relaxed);
+        let (start, rate, id) = settings.sweep.map_or((0.0, 0.0, 0), |sweep| {
+            (sweep.start, sweep.octaves_per_second, sweep.id)
+        });
+        let previous = (
+            f32::from_bits(self.sweep_start.load(Ordering::Relaxed)),
+            f32::from_bits(self.sweep_rate.load(Ordering::Relaxed)),
+            self.sweep_id.load(Ordering::Relaxed),
+        );
+        if previous != (start, rate, id) {
+            self.sweep_start.store(start.to_bits(), Ordering::Relaxed);
+            self.sweep_rate.store(rate.to_bits(), Ordering::Relaxed);
+            self.sweep_id.store(id, Ordering::Relaxed);
+            self.sweep_generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn sweep(&self) -> (u32, Option<Sweep>) {
+        let generation = self.sweep_generation.load(Ordering::Acquire);
+        let start = f32::from_bits(self.sweep_start.load(Ordering::Relaxed));
+        let rate = f32::from_bits(self.sweep_rate.load(Ordering::Relaxed));
+        (
+            generation,
+            (start > 0.0).then_some(Sweep {
+                start,
+                octaves_per_second: rate,
+                id: self.sweep_id.load(Ordering::Relaxed),
+            }),
+        )
     }
 
     fn load(&self) -> ToneSettings {
@@ -128,6 +210,7 @@ impl Shared {
             },
             frequency: f32::from_bits(self.frequency.load(Ordering::Relaxed)),
             level_db: f32::from_bits(self.level_db.load(Ordering::Relaxed)),
+            sweep: self.sweep().1,
         }
     }
 }
@@ -190,6 +273,10 @@ pub(crate) struct Generator {
     gain: f32,
     left: f32,
     right: f32,
+    /// The frequency playing now, gliding toward the requested one.
+    frequency: f32,
+    /// The sweep being played: its generation and current frequency.
+    sweep: Option<(u32, f32)>,
 }
 
 impl Generator {
@@ -205,6 +292,8 @@ impl Generator {
             gain: 0.0,
             left: 0.0,
             right: 0.0,
+            frequency: 0.0,
+            sweep: None,
         }
     }
 
@@ -246,8 +335,15 @@ impl Generator {
         pink * 0.11
     }
 
-    /// Fill interleaved stereo frames.
-    pub(crate) fn fill(&mut self, settings: ToneSettings, muted: bool, output: &mut [f32]) {
+    /// Fill interleaved stereo frames. `sweep` is the shared sweep and its
+    /// generation; a new generation starts the sweep over from its start.
+    pub(crate) fn fill(
+        &mut self,
+        settings: ToneSettings,
+        sweep: (u32, Option<Sweep>),
+        muted: bool,
+        output: &mut [f32],
+    ) {
         let settings = settings.clamped();
         let amplitude = if muted {
             0.0
@@ -260,17 +356,41 @@ impl Generator {
             Ears::Both => (1.0, 1.0),
             Ears::Right => (0.0, 1.0),
         };
+        let frames = output.len() / 2;
+        // A sweep runs here, sample-accurate; otherwise glide to the request.
+        let (generation, sweep) = sweep;
+        let sweep = sweep.filter(|_| settings.signal == Signal::Sine);
+        let sweep_step = match sweep {
+            Some(request) => {
+                let start = match self.sweep {
+                    Some((current, frequency)) if current == generation => frequency,
+                    _ => request.start.clamp(20.0, 20_000.0),
+                };
+                self.sweep = Some((generation, start));
+                Some(2.0_f32.powf(request.octaves_per_second / self.rate))
+            }
+            None => {
+                self.sweep = None;
+                None
+            }
+        };
+        if self.frequency <= 0.0 {
+            self.frequency = self
+                .sweep
+                .map_or(settings.frequency, |(_, frequency)| frequency);
+        }
+        let target = settings.frequency;
+        let glide = 1.0 - (-1.0 / (GLIDE_SECONDS * self.rate)).exp();
         if settings.signal == Signal::Pink && settings.band != Band::Full {
-            let wanted = (settings.band, settings.frequency);
+            let wanted = (settings.band, target);
             if self.designed != Some(wanted) {
-                // Two cascaded sections give steeper skirts around the band.
                 let q = if settings.band == Band::Octave {
-                    std::f32::consts::SQRT_2
+                    OCTAVE_Q
                 } else {
-                    4.318
+                    THIRD_Q
                 };
                 for filter in &mut self.filters {
-                    filter.design(settings.frequency, q, self.rate);
+                    filter.design(target, q, self.rate);
                 }
                 self.band_power = PINK_POWER * self.band_share();
                 self.designed = Some(wanted);
@@ -284,14 +404,20 @@ impl Generator {
         };
         // Match a sine's RMS at the same level.
         let noise_scale = std::f32::consts::FRAC_1_SQRT_2 / noise_power.max(1e-12).sqrt();
-        let step = settings.frequency / self.rate;
-        for frame in output.as_chunks_mut::<2>().0 {
+        for frame in output.as_chunks_mut::<2>().0.iter_mut().take(frames) {
             self.gain += (amplitude - self.gain) * smoothing;
             self.left += (left - self.left) * smoothing;
             self.right += (right - self.right) * smoothing;
+            if let (Some(step), Some((_, frequency))) = (sweep_step, self.sweep.as_mut()) {
+                *frequency = (*frequency * step).min(20_000.0);
+                self.frequency = *frequency;
+            } else {
+                // Glide in log frequency, as the ear hears pitch.
+                self.frequency *= (target / self.frequency).powf(glide);
+            }
             let sample = match settings.signal {
                 Signal::Sine => {
-                    self.phase = (self.phase + step).fract();
+                    self.phase = (self.phase + self.frequency / self.rate).fract();
                     (self.phase * std::f32::consts::TAU).sin() * self.gain
                 }
                 Signal::Pink => {
@@ -308,6 +434,12 @@ impl Generator {
             frame[0] = sample * self.left;
             frame[1] = sample * self.right;
         }
+    }
+
+    /// The frequency playing now, in Hz.
+    #[cfg(test)]
+    fn current_frequency(&self) -> f32 {
+        self.frequency
     }
 }
 
@@ -439,7 +571,12 @@ fn run(
                     else {
                         return;
                     };
-                    generator.fill(shared.load(), shared.muted.load(Ordering::Relaxed), samples);
+                    generator.fill(
+                        shared.load(),
+                        shared.sweep(),
+                        shared.muted.load(Ordering::Relaxed),
+                        samples,
+                    );
                     byte_len
                 };
                 let chunk = data.chunk_mut();
@@ -514,6 +651,7 @@ mod tests {
             ears,
             frequency: 1_000.0,
             level_db: -20.0,
+            sweep: None,
         }
     }
 
@@ -526,7 +664,7 @@ mod tests {
 
     #[test]
     fn levels_match_across_signals_and_respect_ears() {
-        let target = 10.0_f32.powf(-20.0 / 20.0) * std::f32::consts::FRAC_1_SQRT_2;
+        let target = 10.0_f32.powf(-30.0 / 20.0) * std::f32::consts::FRAC_1_SQRT_2;
         for rate in [44_100_u32, 48_000, 96_000] {
             for frequency in [100.0, 1_000.0, 8_000.0] {
                 for (signal, band) in [
@@ -539,9 +677,10 @@ mod tests {
                     let mut buffer = vec![0.0; rate as usize * 2 * 2];
                     let tone = ToneSettings {
                         frequency,
+                        level_db: -30.0,
                         ..settings(signal, band, Ears::Left)
                     };
-                    generator.fill(tone, false, &mut buffer);
+                    generator.fill(tone, (0, None), false, &mut buffer);
                     // The level holds from the end of the fade-in.
                     let tail = &buffer[rate as usize / 5 * 2..];
                     let left = rms(tail.iter().step_by(2).copied());
@@ -566,14 +705,139 @@ mod tests {
         assert_eq!(loud.clamped().level_db, MAX_LEVEL_DB);
         let mut generator = Generator::new(48_000);
         let mut buffer = vec![0.0; 9_600];
-        generator.fill(loud, false, &mut buffer);
+        generator.fill(loud, (0, None), false, &mut buffer);
         let ceiling = 10.0_f32.powf(MAX_LEVEL_DB / 20.0);
         assert!(buffer.iter().all(|value| value.abs() <= ceiling + 1e-6));
-        generator.fill(loud, true, &mut buffer);
+        generator.fill(loud, (0, None), true, &mut buffer);
         assert!(
             buffer[buffer.len() - 2..]
                 .iter()
                 .all(|value| value.abs() < 1e-3)
         );
+    }
+
+    #[test]
+    fn noise_never_clips_and_is_capped_below_the_sine_limit() {
+        let loud = ToneSettings {
+            level_db: MAX_LEVEL_DB,
+            ..settings(Signal::Pink, Band::Full, Ears::Left)
+        };
+        assert_eq!(loud.clamped().level_db, MAX_LEVEL_DB - NOISE_CREST_DB);
+        let ceiling = 10.0_f32.powf(MAX_LEVEL_DB / 20.0);
+        for band in [Band::Full, Band::Octave, Band::Third] {
+            let mut generator = Generator::new(48_000);
+            let mut buffer = vec![0.0; 48_000 * 2 * 10];
+            generator.fill(ToneSettings { band, ..loud }, (0, None), false, &mut buffer);
+            let left = buffer.iter().step_by(2);
+            let clipped = left.filter(|value| value.abs() >= ceiling - 1e-6).count();
+            // Before, about one sample in six hit the limit at full level.
+            assert!(
+                clipped < 20,
+                "{band:?}: {clipped} of 480000 samples clipped"
+            );
+        }
+    }
+
+    #[test]
+    fn noise_bands_are_as_wide_as_their_names() {
+        for (band, q, octaves) in [
+            (Band::Octave, OCTAVE_Q, 1.0),
+            (Band::Third, THIRD_Q, 1.0 / 3.0),
+        ] {
+            let mut filter = BandPass::default();
+            filter.design(1_000.0, q, 48_000.0);
+            // Both sections: |H|^4, and its -3 dB edges.
+            let gain_db = |frequency: f32| 20.0 * filter.power_gain(frequency, 48_000.0).log10();
+            let edge = |direction: f32| {
+                let mut octave = 0.0_f32;
+                while gain_db(1_000.0 * 2.0_f32.powf(octave)) > -3.0 {
+                    octave += direction * 0.0005;
+                }
+                octave
+            };
+            let width = edge(1.0) - edge(-1.0);
+            assert!(
+                (width - octaves).abs() < 0.02,
+                "{band:?} is {width:.3} octaves wide"
+            );
+        }
+    }
+
+    #[test]
+    fn frequency_glides_instead_of_jumping() {
+        let mut generator = Generator::new(48_000);
+        let mut buffer = vec![0.0; 960];
+        // Settings round-trip through Shared, as on the real-time thread.
+        let shared = Shared::new(settings(Signal::Sine, Band::Full, Ears::Both));
+        assert_eq!(shared.sweep(), (0, None));
+        let tone = settings(Signal::Sine, Band::Full, Ears::Both);
+        generator.fill(tone, (0, None), false, &mut buffer);
+        let up = ToneSettings {
+            frequency: 2_000.0,
+            ..tone
+        };
+        generator.fill(up, (0, None), false, &mut buffer[..2]);
+        assert!(generator.current_frequency() < 1_010.0);
+        let mut long = vec![0.0; 48_000 / 5 * 2];
+        generator.fill(up, (0, None), false, &mut long);
+        assert!((generator.current_frequency() - 2_000.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn sweeps_run_in_the_generator_and_survive_renewals() {
+        let rate = 48_000;
+        let mut generator = Generator::new(rate);
+        let sweep = Sweep {
+            start: 100.0,
+            octaves_per_second: 1.0,
+            id: 1,
+        };
+        let tone = ToneSettings {
+            sweep: Some(sweep),
+            ..settings(Signal::Sine, Band::Full, Ears::Both)
+        };
+        let mut half = vec![0.0; rate as usize];
+        // Two half-second buffers of one sweep: one octave up, whatever
+        // frequency the renewals carry.
+        generator.fill(tone, (1, Some(sweep)), false, &mut half);
+        let renewal = ToneSettings {
+            frequency: 5_000.0,
+            ..tone
+        };
+        generator.fill(renewal, (1, Some(sweep)), false, &mut half);
+        assert!((generator.current_frequency() - 200.0).abs() < 0.5);
+        // A new sweep starts over.
+        generator.fill(tone, (2, Some(sweep)), false, &mut half[..2]);
+        assert!((generator.current_frequency() - 100.0).abs() < 0.1);
+        // And it stops at the top of the range.
+        let fast = Sweep {
+            start: 10_000.0,
+            octaves_per_second: 10.0,
+            id: 2,
+        };
+        generator.fill(tone, (3, Some(fast)), false, &mut half);
+        assert_eq!(generator.current_frequency(), 20_000.0);
+    }
+
+    #[test]
+    fn restarting_the_same_sweep_starts_it_over() {
+        let sweep = Sweep {
+            start: 20.0,
+            octaves_per_second: 0.33,
+            id: 1,
+        };
+        let tone = ToneSettings {
+            sweep: Some(sweep),
+            ..settings(Signal::Sine, Band::Full, Ears::Both)
+        };
+        let shared = Shared::new(tone);
+        let (first, _) = shared.sweep();
+        shared.store(tone);
+        assert_eq!(shared.sweep().0, first, "a renewal keeps the sweep running");
+        shared.store(ToneSettings {
+            sweep: Some(Sweep { id: 2, ..sweep }),
+            ..tone
+        });
+        assert_ne!(shared.sweep().0, first);
     }
 }
