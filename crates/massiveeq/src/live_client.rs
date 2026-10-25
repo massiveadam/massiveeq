@@ -51,6 +51,9 @@ struct Queue {
 
 impl Queue {
     fn push(&mut self, draft: Draft) {
+        if self.stopped {
+            return;
+        }
         if draft.save {
             self.jobs.retain(|job| job.id != draft.id);
             self.jobs.push_back(draft);
@@ -210,6 +213,9 @@ impl LiveClient {
     pub fn end(&self, id: &str) {
         let (lock, ready) = &*self.queue;
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.stopped {
+            return;
+        }
         // Finish any queued save before ending. A draft-only request can go.
         queue.jobs.retain(|job| job.id != id || job.save);
         for job in queue.jobs.iter_mut().filter(|job| job.id == id) {
@@ -223,6 +229,9 @@ impl LiveClient {
     pub fn tone(&self, key: String, settings: serde_json::Value) {
         let (lock, ready) = &*self.queue;
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.stopped {
+            return;
+        }
         queue.tone = Some((key, settings));
         queue.stop_tone = false;
         ready.notify_one();
@@ -231,6 +240,9 @@ impl LiveClient {
     pub fn stop_tone(&self) {
         let (lock, ready) = &*self.queue;
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.stopped {
+            return;
+        }
         queue.tone = None;
         queue.stop_tone = true;
         ready.notify_one();
@@ -254,14 +266,23 @@ impl LiveClient {
     pub fn completions(&self) -> Vec<Completion> {
         self.results.try_iter().collect()
     }
+
+    /// A closed window may still be retained by GTK signal handlers. Stop its
+    /// workers explicitly instead of depending on the model's final drop.
+    pub fn shutdown(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        let (lock, ready) = &*self.queue;
+        let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+        queue.stopped = true;
+        queue.jobs.clear();
+        queue.tone = None;
+        ready.notify_one();
+    }
 }
 
 impl Drop for LiveClient {
     fn drop(&mut self) {
-        self.stopped.store(true, Ordering::Relaxed);
-        let (lock, ready) = &*self.queue;
-        lock.lock().unwrap_or_else(|e| e.into_inner()).stopped = true;
-        ready.notify_one();
+        self.shutdown();
     }
 }
 
@@ -297,5 +318,16 @@ mod tests {
                 .iter()
                 .any(|job| !job.save && job.text == "new gesture")
         );
+    }
+
+    #[test]
+    fn closed_worker_cannot_queue_another_preview_or_save() {
+        let mut queue = Queue {
+            stopped: true,
+            ..Queue::default()
+        };
+        queue.push(draft("stale preview", false));
+        queue.push(draft("stale save", true));
+        assert!(queue.jobs.is_empty());
     }
 }

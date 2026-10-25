@@ -60,9 +60,11 @@ impl Service {
         name: &str,
         text: &str,
         manual_trim_db: f64,
+        #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> fdo::Result<String> {
         let mut state = self.state.lock().await;
+        require_preview_owner(&state, id, &header)?;
         let storage = state.storage.clone();
         let profile = storage
             .put_profile(&mut state.library, id, name, text, manual_trim_db)
@@ -75,17 +77,24 @@ impl Service {
 
     /// Audition a validated draft without writing profile files. The editor
     /// renews this lease; a crash returns outputs to their saved profiles.
-    async fn preview_profile(&self, id: &str, request: &str) -> fdo::Result<()> {
+    async fn preview_profile(
+        &self,
+        id: &str,
+        request: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
         let request: crate::live_edit::Request = serde_json::from_str(request).map_err(failed)?;
         let mut state = self.state.lock().await;
+        let owner = require_preview_owner(&state, id, &header)?;
         let mut edit =
-            crate::live_edit::Session::parse(&state.storage, &state.library, id, request)
+            crate::live_edit::Session::parse(&state.storage, &state.library, id, &owner, request)
                 .map_err(failed)?;
         if let Some(previous) = state.live_edits.get_mut(id) {
             if previous.reference == edit.reference {
                 edit.reference_cache = previous.reference_cache.clone();
             }
-            if previous.draft == edit.draft
+            if previous.owner == edit.owner
+                && previous.draft == edit.draft
                 && previous.trim == edit.trim
                 && previous.reference == edit.reference
                 && previous.hear_reference == edit.hear_reference
@@ -130,8 +139,13 @@ impl Service {
         Ok(())
     }
 
-    async fn end_preview(&self, id: &str) -> fdo::Result<()> {
+    async fn end_preview(
+        &self,
+        id: &str,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+    ) -> fdo::Result<()> {
         let mut state = self.state.lock().await;
+        require_preview_owner(&state, id, &header)?;
         if state.live_edits.remove(id).is_some() {
             let crate::AppState {
                 storage,
@@ -566,6 +580,28 @@ impl Service {
 
 fn failed(error: impl std::fmt::Display) -> fdo::Error {
     fdo::Error::Failed(error.to_string())
+}
+
+/// The bus supplies the sender, so another editor cannot impersonate it in JSON.
+fn require_preview_owner(
+    state: &AppState,
+    id: &str,
+    header: &zbus::message::Header<'_>,
+) -> fdo::Result<String> {
+    let owner = header
+        .sender()
+        .ok_or_else(|| fdo::Error::AccessDenied("Editor connection has no sender".into()))?
+        .to_string();
+    if state
+        .live_edits
+        .get(id)
+        .is_some_and(|edit| !edit.permits(&owner, std::time::Instant::now()))
+    {
+        return Err(fdo::Error::AccessDenied(
+            "Another editor is already editing this profile. Close it before editing here.".into(),
+        ));
+    }
+    Ok(owner)
 }
 
 fn require_known_device(state: &crate::AppState, device_key: &str) -> fdo::Result<()> {
