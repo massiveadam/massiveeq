@@ -130,6 +130,19 @@ struct ConvolutionUi {
     sync_tabs: Rc<dyn Fn()>,
 }
 
+/// The footer's volume menu for the selected output.
+struct VolumeUi {
+    menu: gtk::MenuButton,
+    label: gtk::Label,
+    in_dsp: gtk::Switch,
+    block_jumps: gtk::Switch,
+    level: gtk::Label,
+    blocked: gtk::Label,
+    /// The last service status, to show another output without waiting.
+    status: RefCell<serde_json::Value>,
+    syncing: Cell<bool>,
+}
+
 struct ComparisonUi {
     menu: gtk::MenuButton,
     stack: gtk::Stack,
@@ -826,6 +839,7 @@ fn build_ui(app: &adw::Application) {
     listen_group.set_valign(gtk::Align::Center);
     listen_group.append(&listen_play);
     listen_group.append(&listen_menu);
+    let volume_ui = build_volume_controls(&model, &device_drop);
 
     // Footer, as on a plugin: bypass and listening, the bands, the macro
     // knobs, and the secondary editors.
@@ -835,6 +849,7 @@ fn build_ui(app: &adw::Application) {
     footer_start.set_valign(gtk::Align::Start);
     footer_start.append(&device_bypass);
     footer_start.append(&listen_group);
+    footer_start.append(&volume_ui.menu);
     footer.append(&footer_start);
     let bands_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     bands_row.set_hexpand(true);
@@ -1145,6 +1160,7 @@ fn build_ui(app: &adw::Application) {
         let engine_readout = header_status.clone();
         let comparison_ui = comparison_ui.clone();
         let profile_list = profile_list.clone();
+        let volume_ui = volume_ui.clone();
         move || {
             let Some(poll) = model.live_worker.take_poll() else {
                 return gtk::glib::ControlFlow::Continue;
@@ -1210,6 +1226,8 @@ fn build_ui(app: &adw::Application) {
                 }
             }
             let service_status = poll.status;
+            *volume_ui.status.borrow_mut() = service_status.clone();
+            refresh_volume_ui(&model, &drop, &volume_ui);
             if let Some(engine_off) = service_status
                 .get("global_bypass")
                 .and_then(serde_json::Value::as_bool)
@@ -5188,6 +5206,201 @@ fn comparison_slot(key: gtk::gdk::Key, keycode: u32) -> Option<usize> {
         })
 }
 
+fn build_volume_controls(model: &Rc<Model>, device_drop: &gtk::DropDown) -> Rc<VolumeUi> {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    content.set_margin_top(14);
+    content.set_margin_bottom(14);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
+    content.set_size_request(340, -1);
+    let title = gtk::Label::new(Some("VOLUME"));
+    title.set_xalign(0.0);
+    title.add_css_class("panel-title");
+    content.append(&title);
+    let option = |name: &str, help: &str| {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        text.set_hexpand(true);
+        let label = gtk::Label::new(Some(name));
+        label.set_xalign(0.0);
+        let detail = gtk::Label::new(Some(help));
+        detail.set_xalign(0.0);
+        detail.set_wrap(true);
+        detail.set_max_width_chars(38);
+        detail.add_css_class("level-code");
+        text.append(&label);
+        text.append(&detail);
+        let switch = gtk::Switch::new();
+        switch.set_valign(gtk::Align::Center);
+        switch.update_property(&[gtk::accessible::Property::Label(name)]);
+        row.append(&text);
+        row.append(&switch);
+        (row, switch)
+    };
+    let (dsp_row, in_dsp) = option(
+        "Volume in MassiveEQ",
+        "The volume keys set MassiveEQ's volume, in even steps: each 1% is 0.5 dB, \
+         so a 5% key press is 2.5 dB. The device keeps its own volume as the ceiling; \
+         set it once in your sound settings.",
+    );
+    content.append(&dsp_row);
+    let level = gtk::Label::new(None);
+    level.set_xalign(0.0);
+    level.add_css_class("level-code");
+    content.append(&level);
+    let (jump_row, block_jumps) = option(
+        "Block volume jumps",
+        "Undo any raise of more than 10% at once, as when an app or Bluetooth \
+         headphones push the volume to 100%. Volume keys still work.",
+    );
+    content.append(&jump_row);
+    let blocked = gtk::Label::new(None);
+    blocked.set_xalign(0.0);
+    blocked.add_css_class("level-code");
+    content.append(&blocked);
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&content));
+    let label = gtk::Label::new(Some("VOLUME"));
+    let menu = gtk::MenuButton::new();
+    menu.set_child(Some(&label));
+    menu.add_css_class("footer-toggle");
+    menu.set_valign(gtk::Align::Center);
+    menu.set_popover(Some(&popover));
+    menu.set_tooltip_text(Some("Volume in MassiveEQ and blocking volume jumps"));
+    menu.update_property(&[gtk::accessible::Property::Label("Volume options")]);
+    let ui = Rc::new(VolumeUi {
+        menu,
+        label,
+        in_dsp,
+        block_jumps,
+        level,
+        blocked,
+        status: RefCell::new(serde_json::Value::Null),
+        syncing: Cell::new(false),
+    });
+    for switch in [&ui.in_dsp, &ui.block_jumps] {
+        switch.connect_active_notify({
+            let model = model.clone();
+            let drop = device_drop.clone();
+            let ui = ui.clone();
+            move |_| {
+                if ui.syncing.get() {
+                    return;
+                }
+                let Some(device) = model
+                    .devices
+                    .borrow()
+                    .get(drop.selected() as usize)
+                    .cloned()
+                else {
+                    return;
+                };
+                let key = device.key.as_storage_key();
+                let result = model.client.set_volume_options(
+                    &key,
+                    ui.in_dsp.is_active(),
+                    ui.block_jumps.is_active(),
+                );
+                if let Err(error) = result {
+                    ui.blocked.set_text(&error.to_string());
+                }
+                if let Ok(status) = model.client.status() {
+                    *ui.status.borrow_mut() = status;
+                }
+                refresh_volume_ui(&model, &drop, &ui);
+            }
+        });
+    }
+    device_drop.connect_selected_notify({
+        let model = model.clone();
+        let ui = ui.clone();
+        move |drop| refresh_volume_ui(&model, drop, &ui)
+    });
+    ui
+}
+
+fn refresh_volume_ui(model: &Rc<Model>, drop: &gtk::DropDown, ui: &VolumeUi) {
+    let device = model
+        .devices
+        .borrow()
+        .get(drop.selected() as usize)
+        .cloned();
+    let status = ui.status.borrow();
+    let volume = device.as_ref().and_then(|device| {
+        status.pointer(&format!(
+            "/volume/{}",
+            json_pointer_key(&device.key.as_storage_key())
+        ))
+    });
+    ui.menu.set_sensitive(volume.is_some());
+    let flag = |name: &str| {
+        volume
+            .and_then(|volume| volume.get(name))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let (in_dsp, block_jumps) = (flag("in_dsp"), flag("block_jumps"));
+    ui.syncing.set(true);
+    ui.in_dsp.set_active(in_dsp);
+    ui.block_jumps.set_active(block_jumps);
+    ui.syncing.set(false);
+    let assigned = device
+        .as_ref()
+        .is_some_and(|device| device.assigned_profile.is_some());
+    let db = volume
+        .and_then(|volume| volume.get("db"))
+        .map(|db| db.as_f64());
+    let (label, level) = match (in_dsp, db) {
+        (false, _) => ("VOLUME".to_owned(), String::new()),
+        (true, _) if !assigned => (
+            "VOLUME".to_owned(),
+            "Takes effect while a profile is applied to this output.".to_owned(),
+        ),
+        (true, Some(Some(db))) => (format!("VOL {db:+.1} dB"), format!("Now {db:+.1} dB")),
+        (true, _) => ("VOL MUTED".to_owned(), "Now muted (0%)".to_owned()),
+    };
+    ui.label.set_text(&label);
+    if in_dsp {
+        ui.menu.add_css_class("volume-on");
+    } else {
+        ui.menu.remove_css_class("volume-on");
+    }
+    ui.level.set_text(&level);
+    ui.level.set_visible(!level.is_empty());
+    let blocked = volume
+        .and_then(|volume| volume.get("last_blocked"))
+        .filter(|jump| !jump.is_null())
+        .map(blocked_jump_text)
+        .unwrap_or_default();
+    ui.blocked.set_text(&blocked);
+    ui.blocked.set_visible(!blocked.is_empty());
+}
+
+/// A JSON pointer token for an object key (`~` and `/` are escaped).
+fn json_pointer_key(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+fn blocked_jump_text(jump: &serde_json::Value) -> String {
+    let percent = |name: &str| {
+        jump.get(name)
+            .and_then(serde_json::Value::as_f64)
+            .map_or(0.0, |level| (level * 100.0).round())
+    };
+    let at = jump
+        .get("at")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|at| gtk::glib::DateTime::from_unix_local(at).ok())
+        .and_then(|time| time.format("%H:%M").ok())
+        .map(|time| format!(" at {time}"))
+        .unwrap_or_default();
+    format!(
+        "Blocked a jump from {:.0}% to {:.0}%{at}.",
+        percent("from"),
+        percent("to")
+    )
+}
+
 fn install_editor_shortcut(window: &adw::ApplicationWindow, text_toggle: &gtk::ToggleButton) {
     let controller = gtk::EventControllerKey::new();
     controller.connect_key_pressed({
@@ -6017,6 +6230,7 @@ fn install_css() {
         }
 
         button.footer-toggle,
+        menubutton.footer-toggle > button,
         .listen-group button {
             background-color: #1b1b1d;
             border: none;
@@ -6029,8 +6243,17 @@ fn install_css() {
             padding: 0 12px;
         }
 
-        button.footer-toggle {
+        button.footer-toggle,
+        menubutton.footer-toggle > button {
             border-radius: 10px;
+        }
+
+        menubutton.footer-toggle > button:checked {
+            background-color: #2a2a2d;
+        }
+
+        menubutton.volume-on > button {
+            color: #ff7a1a;
         }
 
         .listen-group button {

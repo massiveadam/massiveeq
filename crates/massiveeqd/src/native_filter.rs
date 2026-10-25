@@ -1,4 +1,4 @@
-use crate::{audio_engine::AudioEngine, latest_processor::LatestProcessor};
+use crate::{audio_engine::AudioEngine, dsp_volume::DspVolume, latest_processor::LatestProcessor};
 use anyhow::{Context, Result};
 use massiveeq_core::DeviceInfo;
 use massiveeq_dsp::ProfileProcessor;
@@ -36,6 +36,8 @@ pub struct NativeFilter {
     pub node_name: String,
     /// The rate PipeWire negotiated for the sink, 0 until it has.
     stream_rate: Arc<AtomicU32>,
+    /// Set when MassiveEQ applies the sink's volume itself.
+    pub volume: Option<Arc<DspVolume>>,
 }
 
 impl NativeFilter {
@@ -46,6 +48,7 @@ impl NativeFilter {
         quantum: u32,
         latency_frames: u32,
         rate_changed: Option<tokio::sync::mpsc::Sender<()>>,
+        volume: Option<Arc<DspVolume>>,
     ) -> Result<Self> {
         let updates = Arc::new(LatestProcessor::default());
         let update_consumer = updates.clone();
@@ -62,6 +65,7 @@ impl NativeFilter {
         let thread_node_name = node_name.clone();
         let stream_rate = Arc::new(AtomicU32::new(0));
         let thread_rate = stream_rate.clone();
+        let thread_volume = volume.clone();
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name(format!("massiveeq-{safe_name:x}"))
@@ -81,6 +85,7 @@ impl NativeFilter {
                     latency_frames,
                     thread_rate,
                     rate_changed,
+                    thread_volume,
                     started_tx,
                 )
             })
@@ -94,6 +99,7 @@ impl NativeFilter {
                 stats,
                 node_name,
                 stream_rate,
+                volume,
             }),
             Ok(Err(message)) => {
                 stop.store(true, Ordering::Release);
@@ -161,6 +167,7 @@ fn run_filter_pair(
     latency_frames: u32,
     stream_rate: Arc<AtomicU32>,
     rate_changed: Option<tokio::sync::mpsc::Sender<()>>,
+    volume: Option<Arc<DspVolume>>,
     started: mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> Result<()> {
     let result = (|| -> Result<()> {
@@ -173,6 +180,9 @@ fn run_filter_pair(
         // A surround sink is a real, selectable output: apps only send 7.1 to
         // an output that advertises it, and the physical device is stereo.
         let surround = input_channels > channels;
+        // A 7.1 sink, or one whose volume MassiveEQ applies, stands in for
+        // its device as the system output, so the volume keys reach it.
+        let visible = surround || volume.is_some();
         let link_group = format!(
             "massiveeq-link-{:x}",
             stable_hash(&device.key.as_storage_key())
@@ -214,12 +224,13 @@ fn run_filter_pair(
             "audio.position" => input_position,
             "filter.smart" => "true",
             "filter.smart.name" => link_group.clone(),
-            "filter.smart.targetable" => if surround { "true" } else { "false" },
+            "filter.smart.targetable" => if visible { "true" } else { "false" },
             "filter.smart.target" => target,
-            "node.hidden" => if surround { "false" } else { "true" },
+            "node.hidden" => if visible { "false" } else { "true" },
             "node.stream.restore-props" => "false",
-            // The 7.1 sink is the system output, so its volume is the user's.
-            "channelmix.lock-volumes" => if surround { "false" } else { "true" },
+            // A visible sink's volume is the user's. With the volume in the
+            // DSP, MassiveEQ reshapes PipeWire's to its own decibel scale.
+            "channelmix.lock-volumes" => if visible { "false" } else { "true" },
             "resample.disable" => "true",
         };
         let playback_props = properties! {
@@ -245,11 +256,41 @@ fn run_filter_pair(
 
         let capture = pw::stream::StreamBox::new(&core, "MassiveEQ input", capture_props)?;
         let playback = pw::stream::StreamBox::new(&core, "MassiveEQ output", playback_props)?;
-        let engine = AudioEngine::new(initial, updates, retired, stream_rate.clone(), sample_rate);
+        let mut engine =
+            AudioEngine::new(initial, updates, retired, stream_rate.clone(), sample_rate);
+        if let Some(volume) = &volume {
+            engine = engine.with_volume(volume.clone());
+        }
+        let control_volume = volume.clone();
         let capture_stats = stats.clone();
         let capture_rate = stream_rate.clone();
         let _capture_listener = capture
             .add_local_listener_with_user_data(engine)
+            // Volume keys and mixers set the sink's volume; with the volume in
+            // the DSP, PipeWire leaves the samples alone and reports it here.
+            .control_info(move |_, _, id, control| {
+                let Some(volume) = &control_volume else {
+                    return;
+                };
+                // SAFETY: PipeWire passes a valid control for this callback,
+                // whose values array holds n_values floats.
+                let values = unsafe {
+                    let Some(control) = control.as_ref() else {
+                        return;
+                    };
+                    if control.values.is_null() {
+                        return;
+                    }
+                    std::slice::from_raw_parts(control.values, control.n_values as usize)
+                };
+                match id {
+                    spa::sys::SPA_PROP_channelVolumes => volume.set_channel_volumes(values),
+                    spa::sys::SPA_PROP_mute => {
+                        volume.set_muted(values.first().is_some_and(|value| *value > 0.5))
+                    }
+                    _ => {}
+                }
+            })
             .process(move |stream, engine| {
                 // Samples arrive at the rate the device's clock runs at, which
                 // PipeWire switches to suit the music when it is allowed to;

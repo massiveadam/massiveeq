@@ -475,6 +475,32 @@ and 2-channel files. A profile that references a missing IR, exceeds the
 device Nyquist rate, or fails headroom analysis remains an editable draft while
 the last valid audio chain continues playing.
 
+## Volume
+
+The **VOLUME** menu in the footer sets how the selected output's volume works.
+Both options are off by default and are kept per output.
+
+**Volume in MassiveEQ** makes MassiveEQ's sink the system output, so the volume
+keys and desktop sliders set MassiveEQ's volume instead of the device's. The
+scale is even in decibels: each 1% is 0.5 dB, a 5% key press is always 2.5 dB,
+1% is −49.5 dB and 0% mutes. Desktop volume normally follows a cubic curve, which
+takes big steps at low volume and small ones near the top. The device keeps its
+own volume as a fixed ceiling; turning the option on starts at 100%, so nothing
+changes in loudness, and the device's volume can then be set once in the
+system's sound settings. The footer button shows the level, for example
+`VOL −20.0 dB`. The level is kept across restarts. Whenever MassiveEQ's sink goes
+away (the option turned off, the profile unassigned, the service stopped or
+upgraded), the device is turned down by MassiveEQ's level first, so audio that
+keeps playing is no louder; after a restart the device goes back to its ceiling.
+If the service crashes, audio plays at the device's own volume.
+
+**Block volume jumps** undoes any raise of more than 10% of the volume scale in
+one change, such as an app or Bluetooth headphones pushing the volume to 100%.
+Volume-key presses still go through. It watches the volume that is in charge:
+the device's, and MassiveEQ's sink when Volume in MassiveEQ is on. The menu shows
+the last jump it blocked. Dragging a slider moves in small steps and passes;
+clicking a slider far above the current volume counts as a jump.
+
 ## Diagnostics
 
 The status strip in the header shows the PipeWire graph rate and whether

@@ -9,6 +9,7 @@ pub mod parser;
 pub mod pipewire;
 pub mod storage;
 pub mod upgrade;
+pub mod volume;
 
 pub use analysis::{ChannelAnalysis, ProfileAnalysis, analyze_profile, analyze_profile_preview};
 pub use curve::{
@@ -25,4 +26,8 @@ pub use model::*;
 pub use parser::{ParseError, parse_file, parse_text, serialize_profile};
 pub use storage::{
     COMPARISON_BYPASS_ID, ComparisonSet, Library, MAX_COMPARISON_PROFILES, Storage, StorageError,
+};
+pub use volume::{
+    VOLUME_JUMP_LIMIT, VOLUME_RANGE_DB, VolumeSettings, is_volume_jump, level_db, level_gain,
+    volume_level,
 };

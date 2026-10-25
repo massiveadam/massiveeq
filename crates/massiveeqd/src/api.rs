@@ -505,6 +505,34 @@ impl Service {
         Self::changed(&emitter, "bypass").await.map_err(failed)
     }
 
+    /// Choose how an output's volume is handled: in MassiveEQ's DSP on an
+    /// even decibel scale, and whether sudden raises are undone.
+    async fn set_volume_options(
+        &self,
+        device_key: &str,
+        in_dsp: bool,
+        block_jumps: bool,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> fdo::Result<()> {
+        let mut state = self.state.lock().await;
+        require_known_device(&state, device_key)?;
+        let settings = state
+            .library
+            .volume
+            .entry(device_key.to_owned())
+            .or_default();
+        // Turning the DSP volume on starts at 100%: the device keeps its own
+        // volume, so nothing gets louder.
+        if in_dsp && !settings.in_dsp {
+            settings.level = 1.0;
+        }
+        settings.in_dsp = in_dsp;
+        settings.block_jumps = block_jumps;
+        state.storage.save_library(&state.library).map_err(failed)?;
+        refresh_locked(&mut state, false).await.map_err(failed)?;
+        Self::changed(&emitter, "volume").await.map_err(failed)
+    }
+
     /// Play (or retune) the tone finder's test tone on an output. Must be
     /// called again within five seconds to keep it playing.
     async fn play_tone(&self, device_key: &str, settings: &str) -> fdo::Result<()> {
@@ -587,7 +615,30 @@ impl Service {
 
     async fn status(&self) -> fdo::Result<String> {
         let state = self.state.lock().await;
-        Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass, "comparisons": state.library.comparison_sets, "engine": state.host.status_json(), "graph": state.graph }).to_string())
+        let volume = state
+            .devices
+            .iter()
+            .filter(|device| device.connected)
+            .map(|device| {
+                let key = device.key.as_storage_key();
+                let settings = state.library.volume.get(&key).copied().unwrap_or_default();
+                let sink = state.host.sink_node_name(&key);
+                let last_blocked = [Some(device.node_name.as_str()), sink]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|name| state.volume_guard.last_blocked(name))
+                    .max_by_key(|jump| jump.at);
+                let value = serde_json::json!({
+                    "in_dsp": settings.in_dsp,
+                    "block_jumps": settings.block_jumps,
+                    "level": settings.level,
+                    "db": massiveeq_core::level_db(settings.level),
+                    "last_blocked": last_blocked,
+                });
+                (key, value)
+            })
+            .collect::<serde_json::Map<_, _>>();
+        Ok(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "profiles": state.library.profiles.len(), "devices": state.devices.len(), "active_filters": state.host.active_count(), "global_bypass": state.library.global_bypass, "comparisons": state.library.comparison_sets, "engine": state.host.status_json(), "graph": state.graph, "volume": volume }).to_string())
     }
 
     #[zbus(signal)]
