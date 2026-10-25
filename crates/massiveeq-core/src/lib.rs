@@ -1,6 +1,8 @@
 //! Shared profile, analysis, storage, device, and PipeWire configuration logic.
 
 pub mod analysis;
+#[cfg(test)]
+mod apo_golden;
 pub mod curve;
 pub mod layout;
 pub mod measurement;

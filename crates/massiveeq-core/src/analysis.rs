@@ -185,8 +185,7 @@ pub fn filter_coefficients(filter: &Filter, sample_rate: f64) -> ([f64; 3], [f64
     }
     let omega = 2.0 * PI * filter.frequency.min(sample_rate * 0.499) / sample_rate;
     let cos = omega.cos();
-    let sin = omega.sin();
-    let alpha = sin / (2.0 * filter.q);
+    let alpha = filter.alpha(omega);
     let amp = 10.0_f64.powf(filter.gain_db / 40.0);
     let (b0, b1, b2, a0, a1, a2) = match filter.kind {
         FilterKind::Peaking => (
@@ -224,7 +223,6 @@ pub fn filter_coefficients(filter: &Filter, sample_rate: f64) -> ([f64; 3], [f64
             1.0 - alpha,
         ),
         FilterKind::LowShelf => {
-            let alpha = sin / (2.0 * filter.q);
             let beta = 2.0 * amp.sqrt() * alpha;
             (
                 amp * ((amp + 1.0) - (amp - 1.0) * cos + beta),
@@ -236,7 +234,6 @@ pub fn filter_coefficients(filter: &Filter, sample_rate: f64) -> ([f64; 3], [f64
             )
         }
         FilterKind::HighShelf => {
-            let alpha = sin / (2.0 * filter.q);
             let beta = 2.0 * amp.sqrt() * alpha;
             (
                 amp * ((amp + 1.0) + (amp - 1.0) * cos + beta),
@@ -251,9 +248,17 @@ pub fn filter_coefficients(filter: &Filter, sample_rate: f64) -> ([f64; 3], [f64
     ([b0 / a0, b1 / a0, b2 / a0], [1.0, a1 / a0, a2 / a0])
 }
 
+/// GraphicEQ gain, interpolated in dB over log frequency. Outside its points
+/// the end gains hold, as in Equalizer APO and in the audio.
 fn graphic_gain_db(eq: &GraphicEq, frequency: f64) -> f64 {
-    if frequency < eq.points[0].frequency || frequency > eq.points[eq.points.len() - 1].frequency {
+    let (Some(first), Some(last)) = (eq.points.first(), eq.points.last()) else {
         return 0.0;
+    };
+    if frequency <= first.frequency {
+        return first.gain_db;
+    }
+    if frequency >= last.frequency {
+        return last.gain_db;
     }
     for pair in eq.points.windows(2) {
         if frequency >= pair[0].frequency && frequency <= pair[1].frequency {
@@ -328,6 +333,59 @@ fn db_to_power(db: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn graphic_eq_holds_its_end_gains_like_the_audio_does() {
+        let profile = crate::parse_text("geq", "GraphicEQ: 30 3; 1000 0; 19000 -4");
+        let eq = &profile.graphic_eqs[0];
+        assert_eq!(graphic_gain_db(eq, 20.0), 3.0);
+        assert_eq!(graphic_gain_db(eq, 20_000.0), -4.0);
+        assert!((graphic_gain_db(eq, 173.205) - 1.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn every_filter_reads_and_sounds_as_equalizer_apo_makes_it() {
+        use crate::apo_golden::{APO_FREQUENCIES, APO_GOLDEN};
+        for (line, rate, expected) in APO_GOLDEN {
+            let profile = crate::parse_text("apo", line);
+            assert!(
+                profile.is_activatable(),
+                "{line}: {:?}",
+                profile.diagnostics
+            );
+            for (frequency, expected) in APO_FREQUENCIES.iter().zip(expected) {
+                if *expected < -100.0 || *frequency >= rate / 2.0 {
+                    continue;
+                }
+                let gain = filter_gain_db(&profile.filters[0], *frequency, *rate);
+                assert!(
+                    (gain - expected).abs() < 1e-6,
+                    "{line} at {rate} Hz, {frequency} Hz: {gain} dB, APO {expected} dB"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apo_presets_survive_a_save_and_reload_unchanged() {
+        use crate::apo_golden::{APO_FREQUENCIES, APO_GOLDEN};
+        for (line, rate, _) in APO_GOLDEN {
+            let profile = crate::parse_text("apo", line);
+            let saved = crate::serialize_profile(&profile);
+            let reloaded = crate::parse_text("apo", &saved);
+            for frequency in APO_FREQUENCIES
+                .iter()
+                .filter(|frequency| **frequency < rate / 2.0)
+            {
+                let before = filter_gain_db(&profile.filters[0], *frequency, *rate);
+                let after = filter_gain_db(&reloaded.filters[0], *frequency, *rate);
+                assert!(
+                    (before - after).abs() < 1e-4 || before < -60.0,
+                    "{line} → {saved}: {before} vs {after} dB at {frequency} Hz"
+                );
+            }
+        }
+    }
+
     use super::*;
     use crate::model::TILT_PIVOT_HZ;
 

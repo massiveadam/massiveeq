@@ -97,7 +97,7 @@ impl Client {
             .ok_or_else(|| anyhow!("filter {filter_index} was not found"))?;
         filter.frequency = frequency_hz;
         filter.gain_db = gain_db;
-        filter.q = q;
+        filter.set_q(q);
         let text = serialize_profile(&document);
         let _: ProfileInfo = self
             .call_json(

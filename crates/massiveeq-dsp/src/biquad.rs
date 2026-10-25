@@ -41,8 +41,7 @@ impl BiquadCoefficients {
 
         let omega = 2.0 * PI * filter.frequency / sample_rate;
         let cos = omega.cos();
-        let sin = omega.sin();
-        let alpha = sin / (2.0 * filter.q);
+        let alpha = filter.alpha(omega);
         let amp = 10.0_f64.powf(filter.gain_db / 40.0);
         let (b0, b1, b2, a0, a1, a2) = match filter.kind {
             FilterKind::Peaking => (
@@ -169,6 +168,28 @@ impl Biquad {
 
 #[cfg(test)]
 mod tests {
+    mod golden {
+        include!("../../massiveeq-core/src/apo_golden.rs");
+    }
+
+    #[test]
+    fn the_audio_filters_match_equalizer_apo() {
+        for (line, rate, expected) in golden::APO_GOLDEN {
+            let profile = parse_text("apo", line);
+            let coefficients = BiquadCoefficients::from_filter(&profile.filters[0], *rate).unwrap();
+            for (frequency, expected) in golden::APO_FREQUENCIES.iter().zip(expected) {
+                if *expected < -100.0 || *frequency >= rate / 2.0 {
+                    continue;
+                }
+                let gain = 20.0 * coefficients.transfer(*frequency, *rate).norm().log10();
+                assert!(
+                    (gain - expected).abs() < 1e-6,
+                    "{line} at {rate} Hz, {frequency} Hz: {gain} dB, APO {expected} dB"
+                );
+            }
+        }
+    }
+
     use super::*;
     use massiveeq_core::parse_text;
 

@@ -1336,6 +1336,7 @@ fn wire_actions(
                     frequency: 1000.0,
                     gain_db: 0.0,
                     q: 1.0,
+                    bandwidth: None,
                     channels: ChannelSelection::All,
                 });
                 model.selected_filter.set(Some(document.filters.len() - 1));
@@ -2161,6 +2162,7 @@ fn wire_actions(
                     frequency,
                     gain_db,
                     q: 1.0,
+                    bandwidth: None,
                     channels: ChannelSelection::All,
                 });
                 let index = document.filters.len() - 1;
@@ -2392,7 +2394,7 @@ fn wire_actions(
                 return gtk::glib::Propagation::Proceed;
             }
             update_filter(&model, &buffer, &graph, index, |filter| {
-                filter.q = (filter.q * 1.12_f64.powf(-dy)).clamp(0.05, 50.0);
+                filter.set_q((filter.q * 1.12_f64.powf(-dy)).clamp(0.05, 50.0));
             });
             gtk::glib::Propagation::Stop
         }
@@ -3243,6 +3245,7 @@ fn apply_tone_fix(
         frequency: (frequency * 100.0).round() / 100.0,
         gain_db: delta_db,
         q,
+        bandwidth: None,
         channels,
     });
     Some(document.filters.len() - 1)
@@ -4474,7 +4477,7 @@ fn build_band_editor(
                     update_filter(&model, &buffer, &graph, index, |filter| match parameter {
                         0 => filter.frequency = knob.value(),
                         1 => filter.gain_db = knob.value(),
-                        _ => filter.q = knob.value(),
+                        _ => filter.set_q(knob.value()),
                     });
                 }
             }
@@ -7120,6 +7123,7 @@ mod tests {
                 frequency: 1_000.0,
                 gain_db: 0.0,
                 q: 1.0,
+                bandwidth: None,
                 channels: ChannelSelection::Left,
             })
             .collect();

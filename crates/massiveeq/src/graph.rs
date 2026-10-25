@@ -777,7 +777,7 @@ pub fn nudge_filter(filter: &mut Filter, direction: NudgeDirection, shifted: boo
                 -1.0
             };
             if shifted {
-                filter.q = (filter.q * Q_STEP_FACTOR.powf(sign * repeat)).clamp(0.01, 1_000.0);
+                filter.set_q((filter.q * Q_STEP_FACTOR.powf(sign * repeat)).clamp(0.01, 1_000.0));
             } else {
                 filter.frequency = (filter.frequency
                     * 2.0_f64.powf(sign * FINE_FREQUENCY_OCTAVES * repeat))
@@ -904,6 +904,7 @@ mod tests {
             frequency: 1_000.0,
             gain_db: 0.0,
             q: 1.0,
+            bandwidth: None,
             channels: ChannelSelection::All,
         };
 

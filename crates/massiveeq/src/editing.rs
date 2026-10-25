@@ -204,6 +204,7 @@ fn shelf(kind: FilterKind, frequency: f64, gain_db: f64) -> Filter {
         frequency,
         gain_db,
         q: SHELF_Q,
+        bandwidth: None,
         channels: ChannelSelection::All,
     }
 }
@@ -380,6 +381,7 @@ mod tests {
             frequency: 200.0,
             gain_db: 2.0,
             q: 1.0,
+            bandwidth: None,
             channels: ChannelSelection::Left,
         });
         profile.filters.push(Filter {
@@ -388,6 +390,7 @@ mod tests {
             frequency: 105.0,
             gain_db: 9.0,
             q: SHELF_Q,
+            bandwidth: None,
             channels: ChannelSelection::All,
         });
         profile.convolutions.push(Convolution {
@@ -435,6 +438,7 @@ mod tests {
                 frequency: 105.0,
                 gain_db: 6.0,
                 q: SHELF_Q,
+                bandwidth: None,
                 channels: ChannelSelection::All,
             }
         );
@@ -461,6 +465,7 @@ mod tests {
                 frequency: 100.0 + index as f64,
                 gain_db: 1.0,
                 q: 1.0,
+                bandwidth: None,
                 channels: ChannelSelection::Left,
             });
         }
