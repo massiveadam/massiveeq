@@ -74,6 +74,9 @@
 - Outputs whose channels are listed as `FL,FR`, such as the Easy Effects
   Sink, are stereo again. MassiveEQ counted one channel and put a mono
   filter in front of them, so a profile could not sit before EasyEffects.
+- `Alt+1`…`Alt+9` pick comparison candidates on any keyboard layout,
+  including AZERTY, whose digit row types symbols, and while a slider or
+  field has focus.
 
 ### Added
 
