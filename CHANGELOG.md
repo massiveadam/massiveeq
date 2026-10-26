@@ -160,6 +160,10 @@
 
 ### Fixed
 
+- Protect normal EQ and BRIR playback with the linked −1 dBFS output limiter,
+  which previously ran only during tone testing. Automatic preamp includes
+  convolution gain but cannot predict every transient peak. Quieter audio
+  keeps its original response, and plain engine bypass stays unmodified.
 - Closed editors stop their preview timers and workers. Reopening the app
   reuses its window, and competing editor connections cannot overwrite an
   active preview, save over its profile, or end its session.
