@@ -367,6 +367,28 @@ mod tests {
     }
 
     #[test]
+    fn processed_mono_limits_overrange_audio_while_plain_bypass_stays_unmodified() {
+        let profile = parse_text("test", "");
+        let mut options = CompileOptions::stereo(48_000, 128, "/tmp");
+        options.output_channels = 1;
+        let compiled = compile_profile(&profile, &options).unwrap();
+        let bypass = crate::compile_bypass(48_000, 128, 1);
+        let input = vec![2.0; 128];
+        let mut output = vec![0.0; 128];
+        let ceiling = 10.0_f32.powf(-1.0 / 20.0);
+        ProfileProcessor::new(&compiled)
+            .unwrap()
+            .process_planar(&[&input], &mut [&mut output])
+            .unwrap();
+        assert!(output.iter().all(|sample| (*sample - ceiling).abs() < 1e-6));
+        ProfileProcessor::new(&bypass)
+            .unwrap()
+            .process_planar(&[&input], &mut [&mut output])
+            .unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
     fn held_tone_gain_limits_music_but_never_the_tone() {
         let profile = parse_text("test", "Filter 1: ON PK Fc 1000 Hz Gain 9 dB Q 1");
         let mut compiled =

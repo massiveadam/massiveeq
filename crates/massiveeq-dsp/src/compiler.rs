@@ -97,10 +97,10 @@ pub struct CompiledProfile {
     pub channels: Vec<CompiledChannel>,
     pub analysis: CompiledAnalysis,
     pub latency_frames: u32,
-    /// Catch anything over -1 dBFS at the output. Only a held tone-generator
-    /// gain needs it: that gain may run above what keeps full-scale music
-    /// clean, and the limiter keeps music or a notification from clipping
-    /// while never touching the quieter tone.
+    /// Catch sample peaks over -1 dBFS after all filtering and summing.
+    /// Frequency-response headroom cannot bound transient peaks, particularly
+    /// with convolution or surround downmixing. Enabled for processed profiles
+    /// and held tone gain; plain bypass keeps its unmodified output.
     pub output_limit: bool,
 }
 
@@ -370,7 +370,7 @@ pub fn compile_profile(
         channels,
         analysis,
         latency_frames,
-        output_limit: false,
+        output_limit: true,
     })
 }
 
@@ -722,6 +722,75 @@ mod tests {
             let (at, value) = tap(&impulse_response(&compiled, input)[output]).unwrap();
             assert_eq!(at, ir_channel, "input {input} output {output}");
             assert!((value - gain(ir_channel) * scale).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn true_stereo_transients_stay_below_the_output_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let ceiling = 10.0_f32.powf(-1.0 / 20.0);
+        for sample_rate in [44_100, 48_000, 96_000] {
+            // Each left-ear path is [1, 1, -1], each right-ear path half
+            // that. The frequency peak is 2*sqrt(5) at the left ear, but
+            // bounded stereo input [-1, 1, 1] produces a sample of 6.
+            // Frequency-response headroom alone therefore misses this peak.
+            write_float_wav(
+                &temp.path().join("room.wav"),
+                sample_rate,
+                4,
+                &[
+                    1.0, 0.5, 1.0, 0.5, 1.0, 0.5, 1.0, 0.5, -1.0, -0.5, -1.0, -0.5,
+                ],
+            );
+            let profile = parse_text("test", "Convolution: room.wav");
+            let compiled = compile_profile(
+                &profile,
+                &CompileOptions::stereo(sample_rate, 64, temp.path()),
+            )
+            .unwrap();
+            assert!(compiled.analysis.final_peak_db <= -0.999);
+            let run = |compiled: &CompiledProfile, amplitude: f32| {
+                let mut processor = crate::ProfileProcessor::new(compiled).unwrap();
+                let mut collected = [Vec::new(), Vec::new()];
+                for block in 0..8 {
+                    let mut input = vec![0.0; 64];
+                    // The transient crosses a processing-block boundary.
+                    for (frame, sample) in input.iter_mut().enumerate() {
+                        *sample = match block * 64 + frame {
+                            62 => -amplitude,
+                            63 | 64 => amplitude,
+                            _ => 0.0,
+                        };
+                    }
+                    let mut output = vec![vec![0.0; 64]; 2];
+                    processor
+                        .process(&[&input, &input], &mut output, 64)
+                        .unwrap();
+                    for (collected, output) in collected.iter_mut().zip(output) {
+                        collected.extend(output);
+                    }
+                }
+                collected
+            };
+            let mut unlimited = compiled.clone();
+            unlimited.output_limit = false;
+            let unprotected = run(&unlimited, 1.0);
+            assert!(unprotected[0].iter().any(|sample| sample.abs() > 1.19));
+            let protected = run(&compiled, 1.0);
+            let peak = protected[0]
+                .iter()
+                .map(|sample| sample.abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                peak <= ceiling + 1e-6,
+                "{sample_rate} Hz: transient reached {peak}, ceiling {ceiling}"
+            );
+            assert!((peak - ceiling).abs() < 1e-5);
+            for (left, right) in protected[0].iter().zip(&protected[1]) {
+                assert!((right - left * 0.5).abs() < 1e-5, "stereo balance changed");
+            }
+            // Ordinary levels retain the original convolution exactly.
+            assert_eq!(run(&compiled, 0.1), run(&unlimited, 0.1));
         }
     }
 
