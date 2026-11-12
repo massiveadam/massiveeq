@@ -1,0 +1,5 @@
+{
+  "source": "alsa_input.REPLACE_WITH_MICROPHONE_NODE",
+  "project": "/home/REPLACE_WITH_USER/.config/massiveeq/microphone.carxp",
+  "channels": ["MONO"]
+}

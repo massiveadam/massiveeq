@@ -1,0 +1,16 @@
+[Unit]
+Description=MassiveEQ independent microphone plugin processing
+Documentation=https://github.com/massiveadam/massiveeq/blob/development/docs/microphone-plugins.md
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pw-jack /usr/bin/massiveeq-input run
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

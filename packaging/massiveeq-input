@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""Independent PipeWire microphone processing through Carla's native plugin rack."""
+import argparse
+import ctypes as C
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+CLIENT = "massiveeq-input-rack"
+CAPTURE = "massiveeq-input-capture"
+SOURCE = "massiveeq-input"
+
+
+def config_path():
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "massiveeq/input.json"
+
+
+def load_config(path):
+    config = json.loads(Path(path).read_text())
+    if not isinstance(config, dict):
+        raise ValueError("input configuration must be a JSON object")
+    if set(config) - {"source", "project", "channels"}:
+        raise ValueError("unknown input configuration key")
+    source = config.get("source")
+    if not isinstance(source, str) or not source or source.startswith("massiveeq"):
+        raise ValueError("source must name a physical PipeWire microphone node")
+    if not isinstance(config.get("project"), str):
+        raise ValueError("project must be an absolute .carxp path string")
+    project = Path(config["project"]).expanduser()
+    if not project.is_absolute() or not project.is_file():
+        raise ValueError("project must be an existing absolute .carxp path")
+    channels = config.get("channels", ["MONO"])
+    if channels not in (["MONO"], ["FL", "FR"]):
+        raise ValueError('channels must be ["MONO"] or ["FL", "FR"]')
+    root = ET.parse(project).getroot()
+    if root.tag != "CARLA-PROJECT" or not root.findall("Plugin"):
+        raise ValueError("project must be a Carla rack project containing at least one plugin")
+    # Rack mode connects plugins in document order. Reject patchbay projects,
+    # whose graph could otherwise be silently reinterpreted as a serial chain.
+    if root.find("Patchbay") is not None:
+        raise ValueError("save a Continuous Rack project, not a Patchbay project")
+    for plugin in root.findall("Plugin"):
+        if plugin.findtext("Data/Active", "Yes").strip().lower() in ("no", "false", "0"):
+            raise ValueError("all rack plugins must be active")
+    return {"source": source, "project": str(project), "channels": channels}
+
+
+class Carla:
+    """Small binding to the stable standalone C API, never called from audio RT."""
+    def __init__(self):
+        candidates = [Path("/usr/lib/carla/libcarla_standalone2.so"),
+                      Path("/usr/lib64/carla/libcarla_standalone2.so")]
+        library = next((path for path in candidates if path.is_file()), None)
+        if library is None:
+            raise RuntimeError("Carla is missing; install carla and pipewire-jack")
+        self.lib = C.CDLL(str(library), mode=C.RTLD_GLOBAL)
+        self.bind("standalone_host_init", [], C.c_void_p)
+        self.bind("set_engine_option", [C.c_void_p, C.c_int, C.c_int, C.c_char_p], None)
+        self.bind("engine_init", [C.c_void_p, C.c_char_p, C.c_char_p], C.c_bool)
+        self.bind("engine_close", [C.c_void_p], C.c_bool)
+        self.bind("engine_idle", [C.c_void_p], None)
+        self.bind("is_engine_running", [C.c_void_p], C.c_bool)
+        self.bind("load_project", [C.c_void_p, C.c_char_p], C.c_bool)
+        self.bind("get_current_plugin_count", [C.c_void_p], C.c_uint)
+        self.bind("get_internal_parameter_value", [C.c_void_p, C.c_uint, C.c_int32], C.c_float)
+        self.bind("get_last_error", [C.c_void_p], C.c_char_p)
+        self.handle = self.lib.carla_standalone_host_init()
+        if not self.handle:
+            raise RuntimeError("could not create Carla host")
+        self.started = False
+
+    def bind(self, name, args, result):
+        func = getattr(self.lib, "carla_" + name)
+        func.argtypes, func.restype = args, result
+
+    def check(self, success):
+        if not success:
+            error = self.lib.carla_get_last_error(self.handle)
+            raise RuntimeError(error.decode(errors="replace") if error else "Carla operation failed")
+
+    def start(self, project):
+        # API enum values: PROCESS_MODE=1, CONTINUOUS_RACK=2;
+        # TRANSPORT_MODE=2, INTERNAL=1; PATH_BINARIES=20, PATH_RESOURCES=21.
+        for option, value, text in [(1, 2, b""), (2, 1, b""),
+                                    (20, 0, b"/usr/lib/carla"),
+                                    (21, 0, b"/usr/share/carla/resources")]:
+            self.lib.carla_set_engine_option(self.handle, option, value, text)
+        self.check(self.lib.carla_engine_init(self.handle, b"JACK", CLIENT.encode()))
+        self.started = True
+        self.check(self.lib.carla_load_project(self.handle, os.fsencode(project)))
+        expected = len(ET.parse(project).getroot().findall("Plugin"))
+        if self.lib.carla_get_current_plugin_count(self.handle) != expected:
+            raise RuntimeError("Carla did not load every plugin; refusing a partial microphone chain")
+        for index in range(expected):
+            if self.lib.carla_get_internal_parameter_value(self.handle, index, -2) < 0.5:
+                raise RuntimeError(f"rack plugin {index + 1} is inactive; refusing an unprocessed microphone")
+
+    def idle(self):
+        self.lib.carla_engine_idle(self.handle)
+        if not self.lib.carla_is_engine_running(self.handle):
+            raise RuntimeError("Carla audio engine stopped")
+
+    def close(self):
+        if self.started:
+            self.lib.carla_engine_close(self.handle)
+            self.started = False
+
+
+def graph():
+    return json.loads(subprocess.check_output(["pw-dump"], timeout=5))
+
+
+def node_ports(objects, name, direction):
+    nodes = [obj["id"] for obj in objects
+             if obj.get("type") == "PipeWire:Interface:Node"
+             and obj.get("info", {}).get("props", {}).get("node.name") == name]
+    if len(nodes) != 1:
+        return []
+    ports = []
+    for obj in objects:
+        props = obj.get("info", {}).get("props", {})
+        if (obj.get("type") == "PipeWire:Interface:Port"
+                and str(props.get("node.id")) == str(nodes[0])
+                and props.get("port.direction") == direction):
+            ports.append((obj["id"], props))
+    return ports
+
+
+def desired_links(objects, config):
+    """Resolve exact channel/port IDs; absent microphone means fail closed."""
+    sources = [obj for obj in objects if obj.get("type") == "PipeWire:Interface:Node"
+               and obj.get("info", {}).get("props", {}).get("node.name") == config["source"]]
+    if len(sources) != 1 or sources[0]["info"]["props"].get("media.class") != "Audio/Source":
+        raise RuntimeError("configured microphone is disconnected or is not an Audio/Source")
+    source_ports = node_ports(objects, config["source"], "out")
+    rack_in = node_ports(objects, CLIENT, "in")
+    rack_out = node_ports(objects, CLIENT, "out")
+    capture = node_ports(objects, CAPTURE, "in")
+    def named(ports, key, value):
+        matches = [port for port, props in ports if props.get(key) == value]
+        if len(matches) != 1:
+            raise RuntimeError(f"required port is missing or ambiguous: {key}={value}")
+        return matches[0]
+    links = []
+    for index, channel in enumerate(config["channels"]):
+        source = named(source_ports, "audio.channel", channel)
+        # Rack is always stereo. Duplicate a mono mic to both inputs; publish
+        # its first output as mono, so it is never summed at +6 dB.
+        inputs = [1, 2] if channel == "MONO" else [index + 1]
+        for rack_index in inputs:
+            links.append((source, named(rack_in, "port.name", f"audio-in{rack_index}")))
+        links.append((named(rack_out, "port.name", f"audio-out{index + 1}"),
+                      named(capture, "audio.channel", channel)))
+    return links
+
+
+def reconcile(objects, config):
+    links = desired_links(objects, config)
+    existing = {(obj["info"]["output-port-id"], obj["info"]["input-port-id"])
+                for obj in objects if obj.get("type") == "PipeWire:Interface:Link"}
+    for output, input_ in links:
+        if (output, input_) not in existing:
+            subprocess.run(["pw-link", str(output), str(input_)], check=True, timeout=5)
+
+
+def run(config):
+    # Only the helper's clients receive these properties. Prevent Carla's saved
+    # graph and WirePlumber from ever connecting the rack to speakers/defaults.
+    os.environ["CARLA_DONT_MANAGE_CONNECTIONS"] = "1"
+    os.environ["PIPEWIRE_PROPS"] = json.dumps({"node.autoconnect": False,
+                                              "node.dont-reconnect": True})
+    rack, loopback = None, None
+    stopping = False
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        rack = Carla()
+        rack.start(config["project"])
+        loopback = subprocess.Popen([
+            "pw-loopback", "--channels", str(len(config["channels"])),
+            "--channel-map", "[ " + ", ".join(config["channels"]) + " ]",
+            "--capture-props", json.dumps({"node.name": CAPTURE, "node.autoconnect": False,
+                                           "node.passive": True}),
+            "--playback-props", json.dumps({"node.name": SOURCE,
+                                            "node.description": "MassiveEQ Microphone",
+                                            "media.class": "Audio/Source",
+                                            "priority.session": 0,
+                                            "node.autoconnect": False})])
+        deadline = time.monotonic() + 10
+        ready = False
+        last_check = 0.0
+        while not stopping:
+            rack.idle()
+            if loopback.poll() is not None:
+                raise RuntimeError("virtual microphone process stopped")
+            now = time.monotonic()
+            if now - last_check >= 1:
+                last_check = now
+                try:
+                    reconcile(graph(), config)
+                except RuntimeError:
+                    if ready or now >= deadline:
+                        raise
+                else:
+                    if not ready:
+                        print("MassiveEQ Microphone ready", flush=True)
+                        ready = True
+            time.sleep(0.02)
+    finally:
+        # Destroy the published source before stopping processing. Applications
+        # cannot fall through to a dry microphone during teardown.
+        if loopback is not None:
+            loopback.terminate()
+            try:
+                loopback.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                loopback.kill()
+                loopback.wait()
+        if rack is not None:
+            rack.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["run", "check", "sources"])
+    parser.add_argument("--config", type=Path, default=config_path())
+    args = parser.parse_args()
+    if args.command == "sources":
+        sources = [obj["info"]["props"] for obj in graph()
+                   if obj.get("type") == "PipeWire:Interface:Node"
+                   and obj.get("info", {}).get("props", {}).get("media.class") == "Audio/Source"]
+        print(json.dumps([{"name": props.get("node.name"),
+                           "description": props.get("node.description")} for props in sources
+                          if not props.get("node.name", "").startswith("massiveeq")], indent=2))
+        return
+    config = load_config(args.config)
+    if args.command == "check":
+        print(json.dumps(config, indent=2))
+        return
+    # The runtime lock prevents duplicate names and independent competing chains.
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        raise RuntimeError("XDG_RUNTIME_DIR must be set for the user PipeWire session")
+    with open(Path(runtime) / "massiveeq-input.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("MassiveEQ microphone processing is already running") from None
+        run(config)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, RuntimeError, ET.ParseError, subprocess.SubprocessError) as error:
+        print(f"massiveeq-input: {error}", file=sys.stderr)
+        sys.exit(1)
