@@ -7,7 +7,7 @@ arch=('x86_64')
 url='https://github.com/massiveadam/massiveeq'
 license=('MIT')
 depends=('pipewire>=1:1.4' 'libpipewire' 'wireplumber>=0.5' 'gtk4>=4.18' 'libadwaita>=1.8' 'glib2' 'cairo' 'libsndfile' 'libsamplerate' 'curl' 'glibc' 'libgcc' 'hicolor-icon-theme')
-makedepends=('cargo' 'clang' 'git')
+makedepends=('cargo' 'clang' 'git' 'python')
 optdepends=('carla: native VST3/LV2 microphone plugin hosting'
             'pipewire-jack: independent microphone plugin routing'
             'python: microphone companion')
@@ -46,6 +46,7 @@ build() {
 check() {
   cd "$pkgname"
   cargo test --workspace --release --frozen
+  PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_microphone.py -v
 }
 
 package() {

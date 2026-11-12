@@ -20,7 +20,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed
           git clang rustup gtk4 libadwaita libsndfile libsamplerate
-          pipewire wireplumber dbus
+          pipewire wireplumber dbus python
 
       - name: Install Rust toolchain
         run: |
@@ -37,3 +37,6 @@ jobs:
 
       - name: Test optimized DSP
         run: cargo test --workspace --release --locked
+
+      - name: Test microphone configuration and routing
+        run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_microphone.py -v

@@ -9,6 +9,7 @@ pkgbase = massiveeq-git
 	makedepends = cargo
 	makedepends = clang
 	makedepends = git
+	makedepends = python
 	depends = pipewire>=1:1.4
 	depends = libpipewire
 	depends = wireplumber>=0.5
