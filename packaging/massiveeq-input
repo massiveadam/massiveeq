@@ -116,8 +116,8 @@ def load_config(path):
         if type(config["version"]) is not int or config["version"] != 1 or set(config) - {"version", "active_profile", "profiles"}:
             raise ValueError("unsupported input configuration version or fields")
         profiles = config.get("profiles")
-        if not isinstance(profiles, list) or not profiles:
-            raise ValueError("input configuration must contain profiles")
+        if not isinstance(profiles, list) or not 1 <= len(profiles) <= 128:
+            raise ValueError("input configuration must contain 1 to 128 profiles")
         profiles = [validate_managed_profile(profile) for profile in profiles]
         if len({profile["id"] for profile in profiles}) != len(profiles):
             raise ValueError("input profile IDs must be unique")
@@ -141,6 +141,14 @@ def load_config(path):
     if channels not in (["MONO"], ["FL", "FR"]):
         raise ValueError('channels must be ["MONO"] or ["FL", "FR"]')
     return {"source": source, "project": validate_project(config.get("project")), "channels": channels}
+
+
+def validate_sample_rate(profile, sample_rate):
+    if not math.isfinite(sample_rate) or sample_rate <= 0:
+        raise RuntimeError("microphone engine did not report a valid sample rate")
+    if profile["eq_enabled"] and any(band.get("enabled", True) and band["frequency"] >= sample_rate / 2
+                                     for band in profile["filters"]):
+        raise RuntimeError(f"an active microphone EQ band exceeds the {sample_rate / 2:g} Hz Nyquist limit; lower its frequency")
 
 
 def write_status(state, config=None, error=None):
@@ -199,6 +207,7 @@ class Carla:
         self.bind("engine_close", [C.c_void_p], C.c_bool)
         self.bind("engine_idle", [C.c_void_p], None)
         self.bind("is_engine_running", [C.c_void_p], C.c_bool)
+        self.bind("get_sample_rate", [C.c_void_p], C.c_double)
         self.bind("load_project", [C.c_void_p, C.c_char_p], C.c_bool)
         self.bind("get_current_plugin_count", [C.c_void_p], C.c_uint)
         self.bind("get_plugin_info", [C.c_void_p, C.c_uint], C.POINTER(PluginInfo))
@@ -297,6 +306,10 @@ class Carla:
             self.lib.carla_set_parameter_value(self.handle, plugin_id, parameters[symbol], value)
 
     def apply_managed(self, profile):
+        sample_rate = self.lib.carla_get_sample_rate(self.handle)
+        validate_sample_rate(profile, sample_rate)
+        self.managed_profile = profile
+        self.managed_rate = sample_rate
         gate = profile["gate"]
         compressor = profile["compressor"]
         # LSP thresholds and gains are linear amplitude; times are milliseconds.
@@ -321,6 +334,11 @@ class Carla:
         self.lib.carla_engine_idle(self.handle)
         if not self.lib.carla_is_engine_running(self.handle):
             raise RuntimeError("Carla audio engine stopped")
+        if hasattr(self, "managed_profile"):
+            rate = self.lib.carla_get_sample_rate(self.handle)
+            if rate != self.managed_rate:
+                validate_sample_rate(self.managed_profile, rate)
+                self.managed_rate = rate
 
     def close(self):
         if self.started:
@@ -518,8 +536,16 @@ def list_sources(objects):
         if obj.get("type") != "PipeWire:Interface:Node" or props.get("media.class") != "Audio/Source" or name.startswith("massiveeq"):
             continue
         channels = {port.get("audio.channel") for _, port in node_ports(objects, name, "out")}
-        channel_map = ["MONO"] if channels == {"MONO"} else ["FL", "FR"] if {"FL", "FR"} <= channels else []
-        result.append({"name": name, "description": props.get("node.description", name), "channels": channel_map})
+        if not channels:
+            # Suspended devices can advertise positions before exposing ports.
+            position = props.get("audio.position", [])
+            if isinstance(position, str):
+                position = position.translate(str.maketrans({"[": " ", "]": " ", ",": " ", '"': " "})).split()
+            if isinstance(position, list) and all(isinstance(channel, str) for channel in position):
+                channels = set(position)
+        channel_map = ["MONO"] if channels == {"MONO"} else ["FL", "FR"] if channels == {"FL", "FR"} else []
+        if channel_map:
+            result.append({"name": name, "description": props.get("node.description", name), "channels": channel_map})
     return result
 
 

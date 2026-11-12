@@ -184,11 +184,16 @@ class MicrophoneTests(unittest.TestCase):
         objects = mono_graph()
         objects.append(node(22, "unsupported"))
         result = mic.list_sources(objects)
-        self.assertEqual(result, [{"name": "mic", "description": "mic", "channels": ["MONO"]},
-                                  {"name": "unsupported", "description": "unsupported", "channels": []}])
+        self.assertEqual(result, [{"name": "mic", "description": "mic", "channels": ["MONO"]}])
         objects[1]["info"]["props"]["audio.channel"] = "FR"
         objects.append(port(99, 1, "out", "capture_FL", "FL"))
         self.assertEqual(mic.list_sources(objects)[0]["channels"], ["FL", "FR"])
+        suspended = node(30, "suspended")
+        suspended["info"]["props"]["audio.position"] = "[ FL, FR ]"
+        objects.append(suspended)
+        self.assertEqual(mic.list_sources(objects)[-1]["channels"], ["FL", "FR"])
+        suspended["info"]["props"]["audio.position"] = ["FL", "FR", "FC"]
+        self.assertEqual(len(mic.list_sources(objects)), 1)
 
     def test_runtime_status_is_atomic_and_tracks_owned_state(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_RUNTIME_DIR": temp}):
@@ -212,11 +217,23 @@ class MicrophoneTests(unittest.TestCase):
         profile["rnnoise"]["enabled"] = True
         self.assertNotEqual(mic.rack_shape(config), shape)
 
+    def test_active_microphone_filters_must_fit_engine_sample_rate(self):
+        profile = mic.validate_managed_profile(self.managed_profile())
+        profile["filters"][0]["frequency"] = 9000.0
+        with self.assertRaisesRegex(RuntimeError, "Nyquist"):
+            mic.validate_sample_rate(profile, 16000.0)
+        mic.validate_sample_rate(profile, 48000.0)
+        profile["eq_enabled"] = False
+        mic.validate_sample_rate(profile, 16000.0)
+        with self.assertRaisesRegex(RuntimeError, "sample rate"):
+            mic.validate_sample_rate(profile, 0.0)
+
     def test_managed_parameter_mapping_uses_linear_gain_and_explicit_eq_mode(self):
         profile = mic.validate_managed_profile(self.managed_profile())
         host = mic.Carla.__new__(mic.Carla)
         host.handle = 1
         host.lib = Mock()
+        host.lib.carla_get_sample_rate.return_value = 48000.0
         host.effects = {"gate": (0, {}), "compressor": (1, {}), "eq": (2, {})}
         host.set_controls = Mock()
         host.apply_managed(profile)
