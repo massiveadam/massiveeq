@@ -109,7 +109,7 @@ class Carla:
         for index, plugin in enumerate(plugins):
             info = self.lib.carla_get_plugin_info(self.handle, index)
             label = info.contents.label.decode(errors="replace") if info and info.contents.label else ""
-            expected_label = plugin.findtext("Info/Label", "")
+            expected_label = plugin.findtext("Info/Label") or plugin.findtext("Info/URI", "")
             if not expected_label or label != expected_label:
                 raise RuntimeError(f"plugin {index + 1} identity mismatch: expected {expected_label!r}, "
                                    f"loaded {label!r}; this Carla version may not support that VST3 bundle")

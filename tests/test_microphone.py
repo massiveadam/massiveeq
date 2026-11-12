@@ -105,6 +105,8 @@ class MicrophoneTests(unittest.TestCase):
             host.lib.carla_get_plugin_info.return_value = mic.C.pointer(info)
             host.lib.carla_get_internal_parameter_value.return_value = 1.0
             host.start(project)
+            project.write_text('<CARLA-PROJECT><Plugin><Info><Type>LV2</Type><URI>Expected</URI></Info></Plugin></CARLA-PROJECT>')
+            host.start(project)
             host.lib.carla_get_current_plugin_count.return_value = 0
             with self.assertRaisesRegex(RuntimeError, "partial"):
                 host.start(project)
