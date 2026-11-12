@@ -5936,13 +5936,6 @@ fn install_css() {
         .console-status,
         .level-code,
         .knob-value,
-        entry.knob-value {
-            min-height: 0;
-            padding: 0;
-            border-radius: 3px;
-            background-color: #242427;
-        }
-
         .knob-caption {
             font-family: monospace;
         }
