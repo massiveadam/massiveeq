@@ -427,13 +427,18 @@ impl LabeledKnob {
         let entry = gtk::Entry::new();
         entry.add_css_class("knob-value");
         entry.set_has_frame(false);
-        entry.set_width_chars(8);
-        entry.set_max_width_chars(8);
+        entry.set_width_chars(10);
+        entry.set_max_width_chars(10);
         gtk::prelude::EditableExt::set_alignment(&entry, 0.5);
         entry.update_property(&[gtk::accessible::Property::Label(&format!(
             "{caption} exact value"
         ))]);
         readout.add_named(&entry, Some("entry"));
+        let edited = std::rc::Rc::new(Cell::new(false));
+        entry.connect_changed({
+            let edited = edited.clone();
+            move |_| edited.set(true)
+        });
         value.set_tooltip_text(Some(
             "Double-click to enter a value; Enter applies, Escape cancels",
         ));
@@ -443,6 +448,7 @@ impl LabeledKnob {
             let knob = knob.downgrade();
             let readout = readout.downgrade();
             let entry = entry.downgrade();
+            let edited = edited.clone();
             move |gesture, presses, _, _| {
                 if presses == 2
                     && let (Some(knob), Some(readout), Some(entry)) =
@@ -450,8 +456,10 @@ impl LabeledKnob {
                     && knob.is_sensitive()
                 {
                     gesture.set_state(gtk::EventSequenceState::Claimed);
-                    // Use the full stored number, rather than the rounded display.
-                    entry.set_text(&knob.value().to_string());
+                    // Keep the initial text readable without changing the stored
+                    // precision unless the user actually edits the field.
+                    entry.set_text(&edit_value_text(knob.value()));
+                    edited.set(false);
                     entry.remove_css_class("error");
                     let adjustment = knob.adjustment();
                     entry.set_tooltip_text(Some(&format!(
@@ -469,12 +477,18 @@ impl LabeledKnob {
         entry.connect_activate({
             let knob = knob.downgrade();
             let readout = readout.downgrade();
+            let edited = edited.clone();
             move |entry| {
                 let (Some(knob), Some(readout)) = (knob.upgrade(), readout.upgrade()) else {
                     return;
                 };
                 if readout.visible_child_name().as_deref() != Some("entry") || !knob.is_sensitive()
                 {
+                    return;
+                }
+                if !edited.get() {
+                    readout.set_visible_child_name("value");
+                    knob.grab_focus();
                     return;
                 }
                 let adjustment = knob.adjustment();
@@ -553,6 +567,16 @@ impl LabeledKnob {
     }
 }
 
+fn edit_value_text(value: f64) -> String {
+    let text = format!("{value:.4}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text == "-0" {
+        "0".into()
+    } else {
+        text.into()
+    }
+}
+
 /// Parse user input at the UI boundary, before it reaches GtkAdjustment's
 /// clamping or the DSP model. Values outside the displayed range stay editable.
 fn parse_exact_value(text: &str, lower: f64, upper: f64) -> Option<f64> {
@@ -603,7 +627,11 @@ mod tests {
         });
         begin();
         assert_eq!(readout.visible_child_name().as_deref(), Some("entry"));
-        assert_eq!(entry.text(), "1234.56789");
+        assert_eq!(entry.text(), "1234.5679");
+        entry.emit_activate();
+        assert_eq!(control.knob.value(), 1234.56789);
+        assert_eq!(changes.get(), 0);
+        begin();
         entry.set_text("2345.67891");
         assert_eq!(changes.get(), 0);
         entry.emit_activate();
@@ -652,6 +680,15 @@ mod tests {
         entry.emit_activate();
         assert_eq!(changes.get(), 1);
         window.close();
+    }
+
+    #[test]
+    fn editor_opens_with_readable_numbers() {
+        assert_eq!(edit_value_text(-3.62969354804), "-3.6297");
+        assert_eq!(edit_value_text(623.123456789), "623.1235");
+        assert_eq!(edit_value_text(0.7291300000000001), "0.7291");
+        assert_eq!(edit_value_text(1.0), "1");
+        assert_eq!(edit_value_text(-0.0000001), "0");
     }
 
     #[test]
