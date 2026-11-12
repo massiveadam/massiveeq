@@ -19,6 +19,14 @@ Install the optional backend and the plugins you want to use:
 sudo pacman -S carla pipewire-jack python
 ```
 
+A tested speech rack uses RNNoise VST3 from `noise-suppression-for-voice`,
+followed by **LSP Gate Stereo** and **LSP Compressor Stereo** in LV2 format.
+Install those optional effects with:
+
+```sh
+sudo pacman -S noise-suppression-for-voice lsp-plugins-lv2
+```
+
 Open `pw-jack carla-rack`. Add native Linux VST3 or LV2 effects in processing
 order. For speech, a useful starting order is an RNNoise plugin, noise gate,
 then compressor. Install those plugins separately: MassiveEQ does not bundle

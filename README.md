@@ -28,6 +28,7 @@ The current beta has been validated on:
 - PipeWire 1.6.8, WirePlumber 0.5.15, GTK 4.22.4, and libadwaita 1.9.2
 - Apple AirPods over Bluetooth A2DP and a built-in analog stereo output
 - Noctalia/Quickshell StatusNotifier tray registration and live menu state
+- Omarchy 4.5 with a Quickshell bar: tray registration, menu export, and cleanup
 - PipeWire hotplug/reconnect, simultaneous outputs, service restart/fail-open,
   live filter edits, bypass, and device assignment restoration
 - Automated DSP reference tests at 44.1, 48, 96, and 192 kHz
