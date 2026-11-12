@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -120,6 +121,116 @@ class MicrophoneTests(unittest.TestCase):
                 host.start(project)
             host.close()
             host.lib.carla_engine_close.assert_called_once()
+
+
+    def managed_profile(self):
+        return {"id": "mic-profile", "name": "Microphone", "source": "mic", "channels": ["MONO"],
+                "eq_enabled": True, "filters": [{"enabled": True, "kind": "Peaking", "frequency": 1000.0,
+                "gain_db": -6.0, "q": 1.0, "channels": "All"}], "rnnoise": {"enabled": False},
+                "gate": {"enabled": False}, "compressor": {"enabled": False}, "advanced_project": None}
+
+    def test_managed_profiles_normalize_and_select_without_project_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "input.json"
+            inactive = self.managed_profile() | {"id": "inactive", "source": ""}
+            config = {"version": 1, "active_profile": "mic-profile", "profiles": [inactive, self.managed_profile()]}
+            path.write_text(json.dumps(config))
+            result = mic.load_config(path)
+            self.assertEqual(result["profile_id"], "mic-profile")
+            self.assertEqual(result["managed"]["gate"]["threshold_db"], -45.0)
+            self.assertNotIn("project", result)
+            config["active_profile"] = "inactive"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(mic.NoMicrophone, "choose a microphone"):
+                mic.load_config(path)
+            config["active_profile"] = "missing"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "active input profile"):
+                mic.load_config(path)
+
+    def test_managed_boundary_rejects_invalid_filter_and_voice_values(self):
+        for field, value in [("frequency", float("nan")), ("frequency", 0), ("q", 0),
+                             ("gain_db", 25), ("kind", "Unknown"), ("channels", "Left"), ("enabled", 1), ("bandwidth", 1.0)]:
+            profile = self.managed_profile()
+            profile["filters"][0][field] = value
+            with self.assertRaises(ValueError, msg=f"{field}={value}"):
+                mic.validate_managed_profile(profile)
+        for field, value in [("threshold_db", float("inf")), ("threshold_db", -61), ("ratio", 0), ("attack_ms", True), ("makeup_db", -1)]:
+            profile = self.managed_profile()
+            profile["compressor"][field] = value
+            with self.assertRaises(ValueError, msg=f"{field}={value}"):
+                mic.validate_managed_profile(profile)
+        for invalid in [[], None, "gate"]:
+            with self.assertRaises(ValueError):
+                mic.validate_managed_profile(self.managed_profile() | {"gate": invalid})
+        profile = self.managed_profile()
+        profile["filters"] *= 17
+        with self.assertRaisesRegex(ValueError, "16"):
+            mic.validate_managed_profile(profile)
+
+    def test_managed_custom_project_replaces_builtins_and_keeps_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "custom.carxp"
+            project.write_text('<CARLA-PROJECT><Plugin><Info><Label>Effect</Label></Info></Plugin></CARLA-PROJECT>')
+            path = Path(temp) / "input.json"
+            profile = self.managed_profile() | {"advanced_project": str(project)}
+            path.write_text(json.dumps({"version": 1, "active_profile": profile["id"], "profiles": [profile]}))
+            result = mic.load_config(path)
+            self.assertEqual(result["project"], str(project))
+            self.assertEqual(result["profile_id"], profile["id"])
+            self.assertNotIn("managed", result)
+
+    def test_source_listing_uses_real_port_channels(self):
+        objects = mono_graph()
+        objects.append(node(22, "unsupported"))
+        result = mic.list_sources(objects)
+        self.assertEqual(result, [{"name": "mic", "description": "mic", "channels": ["MONO"]},
+                                  {"name": "unsupported", "description": "unsupported", "channels": []}])
+        objects[1]["info"]["props"]["audio.channel"] = "FR"
+        objects.append(port(99, 1, "out", "capture_FL", "FL"))
+        self.assertEqual(mic.list_sources(objects)[0]["channels"], ["FL", "FR"])
+
+    def test_runtime_status_is_atomic_and_tracks_owned_state(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_RUNTIME_DIR": temp}):
+            config = {"profile_id": "one", "source": "mic", "managed": {}}
+            mic.write_status("running", config)
+            path = Path(temp) / "massiveeq-input-status.json"
+            value = json.loads(path.read_text())
+            self.assertEqual((value["state"], value["profile_id"], value["backend"]), ("running", "one", "managed"))
+            self.assertEqual(value["pid"], os.getpid())
+            mic.write_status("error", config, "disconnected")
+            self.assertEqual(json.loads(path.read_text())["error"], "disconnected")
+            self.assertEqual(list(Path(temp).glob("*.tmp")), [])
+
+    def test_live_rack_shape_changes_only_for_topology(self):
+        profile = mic.validate_managed_profile(self.managed_profile())
+        config = {"managed": profile}
+        shape = mic.rack_shape(config)
+        profile["filters"][0]["gain_db"] = 4.0
+        profile["gate"]["enabled"] = True
+        self.assertEqual(mic.rack_shape(config), shape)
+        profile["rnnoise"]["enabled"] = True
+        self.assertNotEqual(mic.rack_shape(config), shape)
+
+    def test_managed_parameter_mapping_uses_linear_gain_and_explicit_eq_mode(self):
+        profile = mic.validate_managed_profile(self.managed_profile())
+        host = mic.Carla.__new__(mic.Carla)
+        host.handle = 1
+        host.lib = Mock()
+        host.effects = {"gate": (0, {}), "compressor": (1, {}), "eq": (2, {})}
+        host.set_controls = Mock()
+        host.apply_managed(profile)
+        calls = {call.args[0]: call.args[1] for call in host.set_controls.call_args_list}
+        self.assertAlmostEqual(calls["gate"]["gt"], 10 ** (-45 / 20))
+        self.assertEqual(calls["compressor"]["cr"], 3)
+        self.assertAlmostEqual(calls["compressor"]["al"], 10 ** (-18 / 20))
+        self.assertEqual(calls["eq"]["ft_0"], 1)
+        self.assertEqual(calls["eq"]["fm_0"], 6)
+        self.assertAlmostEqual(calls["eq"]["g_0"], 10 ** (-6 / 20))
+        self.assertEqual(calls["eq"]["ft_15"], 0)
+        profile["eq_enabled"] = False
+        host.apply_managed(profile)
+        self.assertEqual(host.set_controls.call_args_list[-1].args[1]["ft_0"], 0)
 
 
 if __name__ == "__main__":

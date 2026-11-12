@@ -4,6 +4,8 @@ import argparse
 import ctypes as C
 import fcntl
 import json
+import math
+import shutil
 import os
 from pathlib import Path
 import signal
@@ -21,34 +23,145 @@ def config_path():
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "massiveeq/input.json"
 
 
-def load_config(path):
-    config = json.loads(Path(path).read_text())
-    if not isinstance(config, dict):
-        raise ValueError("input configuration must be a JSON object")
-    if set(config) - {"source", "project", "channels"}:
-        raise ValueError("unknown input configuration key")
-    source = config.get("source")
-    if not isinstance(source, str) or not source or source.startswith("massiveeq"):
-        raise ValueError("source must name a physical PipeWire microphone node")
-    if not isinstance(config.get("project"), str):
+def validate_project(value):
+    if not isinstance(value, str):
         raise ValueError("project must be an absolute .carxp path string")
-    project = Path(config["project"]).expanduser()
+    project = Path(value).expanduser()
     if not project.is_absolute() or not project.is_file():
         raise ValueError("project must be an existing absolute .carxp path")
-    channels = config.get("channels", ["MONO"])
-    if channels not in (["MONO"], ["FL", "FR"]):
-        raise ValueError('channels must be ["MONO"] or ["FL", "FR"]')
     root = ET.parse(project).getroot()
     if root.tag != "CARLA-PROJECT" or not root.findall("Plugin"):
         raise ValueError("project must be a Carla rack project containing at least one plugin")
-    # Rack mode connects plugins in document order. Reject patchbay projects,
-    # whose graph could otherwise be silently reinterpreted as a serial chain.
     if root.find("Patchbay") is not None:
         raise ValueError("save a Continuous Rack project, not a Patchbay project")
     for plugin in root.findall("Plugin"):
         if plugin.findtext("Data/Active", "Yes").strip().lower() in ("no", "false", "0"):
             raise ValueError("all rack plugins must be active")
-    return {"source": source, "project": str(project), "channels": channels}
+    return str(project)
+
+
+def number(value, low, high, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+        raise ValueError(f"{name} must be a finite number from {low} to {high}")
+    return value
+
+
+def boolean(value, name):
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false")
+    return value
+
+
+def voice_settings(value, defaults, ranges, name):
+    if not isinstance(value, dict) or set(value) - set(defaults):
+        raise ValueError(f"invalid {name} settings")
+    result = defaults | value
+    boolean(result["enabled"], f"{name} enabled")
+    for key, (low, high) in ranges.items():
+        number(result[key], low, high, f"{name} {key}")
+    return result
+
+
+def validate_managed_profile(profile):
+    allowed = {"id", "name", "source", "channels", "eq_enabled", "filters", "rnnoise", "gate", "compressor", "advanced_project"}
+    if not isinstance(profile, dict) or set(profile) - allowed:
+        raise ValueError("invalid input profile fields")
+    for key in ("id", "name"):
+        if not isinstance(profile.get(key), str) or not profile[key].strip() or len(profile[key]) > 128:
+            raise ValueError(f"profile {key} must be a nonempty string up to 128 characters")
+    source = profile.get("source", "")
+    if not isinstance(source, str) or "\x00" in source or source.startswith("massiveeq"):
+        raise ValueError("source must name a physical PipeWire microphone node")
+    channels = profile.get("channels", ["MONO"])
+    if channels not in (["MONO"], ["FL", "FR"]):
+        raise ValueError('channels must be ["MONO"] or ["FL", "FR"]')
+    filters = profile.get("filters", [])
+    if not isinstance(filters, list) or len(filters) > 16:
+        raise ValueError("microphone EQ supports up to 16 filters")
+    for band in filters:
+        if not isinstance(band, dict) or set(band) - {"enabled", "kind", "frequency", "gain_db", "q", "channels", "bandwidth"}:
+            raise ValueError("invalid microphone EQ filter")
+        if band.get("kind") not in FILTER_TYPES or band.get("channels", "All") != "All" or band.get("bandwidth") is not None:
+            raise ValueError("microphone filters require a supported kind, Q, and both channels")
+        boolean(band.get("enabled", True), "filter enabled")
+        number(band.get("frequency"), 20, 20000, "frequency")
+        number(band.get("gain_db"), -24, 24, "gain")
+        number(band.get("q"), 0.1, 20, "Q")
+    result = dict(profile, source=source, channels=channels, filters=filters)
+    result["eq_enabled"] = boolean(profile.get("eq_enabled", True), "EQ enabled")
+    result["rnnoise"] = voice_settings(profile.get("rnnoise", {}), {"enabled": False}, {}, "RNNoise")
+    result["gate"] = voice_settings(profile.get("gate", {}), {"enabled": False, "threshold_db": -45.0, "attack_ms": 5.0, "release_ms": 100.0},
+        {"threshold_db": (-80, 0), "attack_ms": (0.1, 100), "release_ms": (10, 1000)}, "gate")
+    result["compressor"] = voice_settings(profile.get("compressor", {}), {"enabled": False, "threshold_db": -18.0, "ratio": 3.0, "attack_ms": 10.0, "release_ms": 120.0, "makeup_db": 0.0},
+        {"threshold_db": (-60, 0), "ratio": (1, 20), "attack_ms": (0.1, 100), "release_ms": (10, 1000), "makeup_db": (0, 24)}, "compressor")
+    project = profile.get("advanced_project")
+    if project is not None and (not isinstance(project, str) or not Path(project).expanduser().is_absolute()):
+        raise ValueError("advanced_project must be an absolute path or null")
+    return result
+
+
+FILTER_TYPES = {"Peaking": 1, "HighPass": 2, "HighShelf": 3, "LowPass": 4, "LowShelf": 5}
+LSP_URI = "http://lsp-plug.in/plugins/lv2/"
+
+
+class NoMicrophone(ValueError):
+    pass
+
+
+def load_config(path):
+    config = json.loads(Path(path).read_text())
+    if not isinstance(config, dict):
+        raise ValueError("input configuration must be a JSON object")
+    if "version" in config:
+        if type(config["version"]) is not int or config["version"] != 1 or set(config) - {"version", "active_profile", "profiles"}:
+            raise ValueError("unsupported input configuration version or fields")
+        profiles = config.get("profiles")
+        if not isinstance(profiles, list) or not profiles:
+            raise ValueError("input configuration must contain profiles")
+        profiles = [validate_managed_profile(profile) for profile in profiles]
+        if len({profile["id"] for profile in profiles}) != len(profiles):
+            raise ValueError("input profile IDs must be unique")
+        profile = next((profile for profile in profiles if profile["id"] == config.get("active_profile")), None)
+        if profile is None:
+            raise ValueError("active input profile was not found")
+        if not profile["source"]:
+            raise NoMicrophone("choose a microphone before starting input processing")
+        result = {"source": profile["source"], "channels": profile["channels"], "profile_id": profile["id"]}
+        if profile.get("advanced_project"):
+            result["project"] = validate_project(profile["advanced_project"])
+        else:
+            result["managed"] = profile
+        return result
+    if set(config) - {"source", "project", "channels"}:
+        raise ValueError("unknown input configuration key")
+    source = config.get("source")
+    if not isinstance(source, str) or not source or "\x00" in source or source.startswith("massiveeq"):
+        raise ValueError("source must name a physical PipeWire microphone node")
+    channels = config.get("channels", ["MONO"])
+    if channels not in (["MONO"], ["FL", "FR"]):
+        raise ValueError('channels must be ["MONO"] or ["FL", "FR"]')
+    return {"source": source, "project": validate_project(config.get("project")), "channels": channels}
+
+
+def write_status(state, config=None, error=None):
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        return
+    config = config or {}
+    value = {"state": state, "profile_id": config.get("profile_id", ""), "source": config.get("source", ""),
+             "backend": "managed" if "managed" in config else "custom", "error": error,
+             "pid": os.getpid(), "updated_at": time.time()}
+    path = Path(runtime) / "massiveeq-input-status.json"
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(value))
+        temporary.replace(path)
+    except OSError:
+        # Status reporting must not prevent audio teardown on a disappearing session.
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class PluginInfo(C.Structure):
@@ -56,6 +169,19 @@ class PluginInfo(C.Structure):
     _fields_ = [("type", C.c_int), ("category", C.c_int), ("hints", C.c_uint),
                 ("options_available", C.c_uint), ("options_enabled", C.c_uint),
                 ("filename", C.c_char_p), ("name", C.c_char_p), ("label", C.c_char_p)]
+
+
+class ParameterInfo(C.Structure):
+    _fields_ = [("name", C.c_char_p), ("symbol", C.c_char_p), ("unit", C.c_char_p)]
+
+
+class ParameterRanges(C.Structure):
+    _fields_ = [("default", C.c_float), ("minimum", C.c_float), ("maximum", C.c_float),
+                ("step", C.c_float), ("step_small", C.c_float), ("step_large", C.c_float)]
+
+
+class ParameterData(C.Structure):
+    _fields_ = [("type", C.c_int), ("hints", C.c_uint), ("index", C.c_int32), ("rindex", C.c_int32)]
 
 
 class Carla:
@@ -78,6 +204,14 @@ class Carla:
         self.bind("get_plugin_info", [C.c_void_p, C.c_uint], C.POINTER(PluginInfo))
         self.bind("get_internal_parameter_value", [C.c_void_p, C.c_uint, C.c_int32], C.c_float)
         self.bind("get_last_error", [C.c_void_p], C.c_char_p)
+        self.bind("add_plugin", [C.c_void_p, C.c_int, C.c_int, C.c_char_p, C.c_char_p, C.c_char_p, C.c_int64, C.c_void_p, C.c_uint], C.c_bool)
+        self.bind("set_active", [C.c_void_p, C.c_uint, C.c_bool], None)
+        self.bind("set_drywet", [C.c_void_p, C.c_uint, C.c_float], None)
+        self.bind("get_parameter_count", [C.c_void_p, C.c_uint], C.c_uint)
+        self.bind("get_parameter_info", [C.c_void_p, C.c_uint, C.c_uint], C.POINTER(ParameterInfo))
+        self.bind("get_parameter_ranges", [C.c_void_p, C.c_uint, C.c_uint], C.POINTER(ParameterRanges))
+        self.bind("get_parameter_data", [C.c_void_p, C.c_uint, C.c_uint], C.POINTER(ParameterData))
+        self.bind("set_parameter_value", [C.c_void_p, C.c_uint, C.c_uint, C.c_float], None)
         self.handle = self.lib.carla_standalone_host_init()
         if not self.handle:
             raise RuntimeError("could not create Carla host")
@@ -92,7 +226,7 @@ class Carla:
             error = self.lib.carla_get_last_error(self.handle)
             raise RuntimeError(error.decode(errors="replace") if error else "Carla operation failed")
 
-    def start(self, project):
+    def start_engine(self):
         # API enum values: PROCESS_MODE=1, CONTINUOUS_RACK=2;
         # TRANSPORT_MODE=2, INTERNAL=1; PATH_BINARIES=20, PATH_RESOURCES=21.
         for option, value, text in [(1, 2, b""), (2, 1, b""),
@@ -101,6 +235,9 @@ class Carla:
             self.lib.carla_set_engine_option(self.handle, option, value, text)
         self.check(self.lib.carla_engine_init(self.handle, b"JACK", CLIENT.encode()))
         self.started = True
+
+    def start(self, project):
+        self.start_engine()
         self.check(self.lib.carla_load_project(self.handle, os.fsencode(project)))
         plugins = ET.parse(project).getroot().findall("Plugin")
         expected = len(plugins)
@@ -117,6 +254,68 @@ class Carla:
                 raise RuntimeError(f"plugin {index + 1} is an instrument, not a microphone effect")
             if self.lib.carla_get_internal_parameter_value(self.handle, index, -2) < 0.5:
                 raise RuntimeError(f"rack plugin {index + 1} is inactive; refusing an unprocessed microphone")
+
+    def add_effect(self, kind, label, binary=None, unique_id=0):
+        plugin_id = self.lib.carla_get_current_plugin_count(self.handle)
+        self.check(self.lib.carla_add_plugin(self.handle, 2 if C.sizeof(C.c_void_p) == 8 else 1, kind,
+                   os.fsencode(binary) if binary else None, None, label.encode(), unique_id, None, 0))
+        info = self.lib.carla_get_plugin_info(self.handle, plugin_id)
+        if not info or not info.contents.label or info.contents.label.decode(errors="replace") != label:
+            raise RuntimeError(f"managed effect identity mismatch: {label}")
+        self.lib.carla_set_active(self.handle, plugin_id, True)
+        parameters = {}
+        for index in range(self.lib.carla_get_parameter_count(self.handle, plugin_id)):
+            data = self.lib.carla_get_parameter_data(self.handle, plugin_id, index)
+            info = self.lib.carla_get_parameter_info(self.handle, plugin_id, index)
+            ranges = self.lib.carla_get_parameter_ranges(self.handle, plugin_id, index)
+            if not data or not info or not ranges:
+                raise RuntimeError("Carla returned incomplete effect parameter metadata")
+            if data.contents.type != 1:
+                continue
+            self.lib.carla_set_parameter_value(self.handle, plugin_id, index, ranges.contents.default)
+            if info.contents.symbol:
+                parameters[info.contents.symbol.decode()] = index
+        return plugin_id, parameters
+
+    def start_managed(self, profile):
+        self.start_engine()
+        self.effects = {}
+        if profile["rnnoise"]["enabled"]:
+            path = "/usr/lib/vst3/rnnoise.vst3"
+            if not Path(path).exists():
+                raise RuntimeError("RNNoise is missing; install noise-suppression-for-voice")
+            self.effects["rnnoise"] = self.add_effect(6, "RNNoise suppression for voice", path, 908024558)
+        for key, plugin in [("gate", "gate_stereo"), ("compressor", "compressor_stereo"), ("eq", "para_equalizer_x16_stereo")]:
+            self.effects[key] = self.add_effect(4, LSP_URI + plugin)
+        self.apply_managed(profile)
+
+    def set_controls(self, effect, controls):
+        plugin_id, parameters = self.effects[effect]
+        for symbol, value in controls.items():
+            if symbol not in parameters:
+                raise RuntimeError(f"installed {effect} plugin lacks required control {symbol}")
+            self.lib.carla_set_parameter_value(self.handle, plugin_id, parameters[symbol], value)
+
+    def apply_managed(self, profile):
+        gate = profile["gate"]
+        compressor = profile["compressor"]
+        # LSP thresholds and gains are linear amplitude; times are milliseconds.
+        self.set_controls("gate", {"gt": 10 ** (gate["threshold_db"] / 20),
+                          "ht": 10 ** ((gate["threshold_db"] - 6) / 20), "gh": 1, "gr": 0.000251,
+                          "at": gate["attack_ms"], "rt": gate["release_ms"]})
+        self.set_controls("compressor", {"al": 10 ** (compressor["threshold_db"] / 20),
+                          "at": compressor["attack_ms"], "rt": compressor["release_ms"],
+                          "cr": compressor["ratio"], "mk": 10 ** (compressor["makeup_db"] / 20)})
+        for key in ("gate", "compressor"):
+            self.lib.carla_set_drywet(self.handle, self.effects[key][0], 1.0 if profile[key]["enabled"] else 0.0)
+        controls = {"mode": 0}
+        for index in range(16):
+            band = profile["filters"][index] if index < len(profile["filters"]) else None
+            controls[f"ft_{index}"] = FILTER_TYPES[band["kind"]] if band and profile["eq_enabled"] and band.get("enabled", True) else 0
+            if band:
+                controls.update({f"fm_{index}": 6, f"s_{index}": 0, f"f_{index}": band["frequency"],
+                                 f"g_{index}": 10 ** (band["gain_db"] / 20), f"q_{index}": band["q"]})
+        self.set_controls("eq", controls)
 
     def idle(self):
         self.lib.carla_engine_idle(self.handle)
@@ -186,40 +385,105 @@ def reconcile(objects, config):
             subprocess.run(["pw-link", str(output), str(input_)], check=True, timeout=5)
 
 
-def run(config):
-    # Only the helper's clients receive these properties. Prevent Carla's saved
-    # graph and WirePlumber from ever connecting the rack to speakers/defaults.
+def terminate(process):
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def make_loopback(config):
+    return subprocess.Popen([
+        "pw-loopback", "--channels", str(len(config["channels"])),
+        "--channel-map", "[ " + ", ".join(config["channels"]) + " ]",
+        "--capture-props", json.dumps({"node.name": CAPTURE, "node.autoconnect": False, "node.passive": True}),
+        "--playback-props", json.dumps({"node.name": SOURCE, "node.description": "MassiveEQ Microphone",
+                                       "media.class": "Audio/Source", "priority.session": 0, "node.autoconnect": False})])
+
+
+def rack_shape(config):
+    return ("managed", config["managed"]["rnnoise"]["enabled"]) if "managed" in config else ("custom", config["project"])
+
+
+def start_rack(config):
+    rack = Carla()
+    try:
+        if "managed" in config:
+            rack.start_managed(config["managed"])
+        else:
+            rack.start(config["project"])
+        return rack
+    except BaseException:
+        rack.close()
+        raise
+
+
+def run(config, config_file=None):
     os.environ["CARLA_DONT_MANAGE_CONNECTIONS"] = "1"
-    os.environ["PIPEWIRE_PROPS"] = json.dumps({"node.autoconnect": False,
-                                              "node.dont-reconnect": True})
+    os.environ["PIPEWIRE_PROPS"] = json.dumps({"node.autoconnect": False, "node.dont-reconnect": True})
     rack, loopback = None, None
     stopping = False
+    failed = False
     def stop(_signum, _frame):
         nonlocal stopping
         stopping = True
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        rack = Carla()
-        rack.start(config["project"])
-        loopback = subprocess.Popen([
-            "pw-loopback", "--channels", str(len(config["channels"])),
-            "--channel-map", "[ " + ", ".join(config["channels"]) + " ]",
-            "--capture-props", json.dumps({"node.name": CAPTURE, "node.autoconnect": False,
-                                           "node.passive": True}),
-            "--playback-props", json.dumps({"node.name": SOURCE,
-                                            "node.description": "MassiveEQ Microphone",
-                                            "media.class": "Audio/Source",
-                                            "priority.session": 0,
-                                            "node.autoconnect": False})])
+        write_status("starting", config)
+        rack = start_rack(config)
+        loopback = make_loopback(config)
         deadline = time.monotonic() + 10
         ready = False
-        last_check = 0.0
+        last_check = last_reload = 0.0
+        observed_config = config
+        config_error = None
         while not stopping:
             rack.idle()
             if loopback.poll() is not None:
                 raise RuntimeError("virtual microphone process stopped")
             now = time.monotonic()
+            if config_file is not None and now - last_reload >= 0.25:
+                last_reload = now
+                try:
+                    next_config = load_config(config_file)
+                except NoMicrophone:
+                    # Selecting a new unconfigured profile must not leave the
+                    # previous microphone recording behind the new selection.
+                    raise
+                except (ValueError, OSError, ET.ParseError) as error:
+                    config_error = str(error)
+                    write_status("error", config, "Configuration was not applied: " + config_error)
+                else:
+                    if next_config != observed_config:
+                        shape_changed = rack_shape(next_config) != rack_shape(config)
+                        routing_changed = any(next_config[key] != config[key] for key in ("source", "channels"))
+                        if shape_changed or routing_changed:
+                            write_status("starting", next_config)
+                            rack.close()
+                            rack = None
+                            # Recreate only when the published channel map changes.
+                            if next_config["channels"] != config["channels"]:
+                                terminate(loopback)
+                                loopback = None
+                            rack = start_rack(next_config)
+                            if loopback is None:
+                                loopback = make_loopback(next_config)
+                            ready = False
+                            deadline = now + 10
+                            last_check = 0.0
+                        elif "managed" in next_config:
+                            rack.apply_managed(next_config["managed"])
+                        config = next_config
+                        observed_config = next_config
+                        if ready:
+                            write_status("running", config)
+                    if config_error is not None:
+                        config_error = None
+                        write_status("running" if ready else "starting", config)
             if now - last_check >= 1:
                 last_check = now
                 try:
@@ -231,37 +495,60 @@ def run(config):
                     if not ready:
                         print("MassiveEQ Microphone ready", flush=True)
                         ready = True
+                    if config_error is None:
+                        write_status("running", config)
             time.sleep(0.02)
+    except BaseException as error:
+        failed = True
+        write_status("error", config, str(error))
+        raise
     finally:
-        # Remove the published source before stopping processing. The desktop
-        # or recording application owns fallback to another recording source.
-        if loopback is not None:
-            loopback.terminate()
-            try:
-                loopback.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                loopback.kill()
-                loopback.wait()
+        terminate(loopback)
         if rack is not None:
             rack.close()
+        if not failed:
+            write_status("stopped", config)
+
+
+def list_sources(objects):
+    result = []
+    for obj in objects:
+        props = obj.get("info", {}).get("props", {})
+        name = props.get("node.name", "")
+        if obj.get("type") != "PipeWire:Interface:Node" or props.get("media.class") != "Audio/Source" or name.startswith("massiveeq"):
+            continue
+        channels = {port.get("audio.channel") for _, port in node_ports(objects, name, "out")}
+        channel_map = ["MONO"] if channels == {"MONO"} else ["FL", "FR"] if {"FL", "FR"} <= channels else []
+        result.append({"name": name, "description": props.get("node.description", name), "channels": channel_map})
+    return result
+
+
+def doctor():
+    missing = []
+    if not Path("/usr/lib/carla/libcarla_standalone2.so").is_file():
+        missing.append("carla")
+    if not Path("/usr/lib/lv2/lsp-plugins.lv2/para_equalizer_x16_stereo.ttl").is_file():
+        missing.append("lsp-plugins-lv2")
+    for command, package in [("pw-jack", "pipewire-jack"), ("pw-loopback", "pipewire"), ("pw-link", "pipewire")]:
+        if shutil.which(command) is None and package not in missing:
+            missing.append(package)
+    return {"available": not missing, "missing": missing,
+            "rnnoise_available": Path("/usr/lib/vst3/rnnoise.vst3").exists()}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["run", "check", "sources"])
+    parser.add_argument("command", choices=["run", "check", "sources", "doctor"])
     parser.add_argument("--config", type=Path, default=config_path())
     args = parser.parse_args()
     if args.command == "sources":
-        sources = [obj["info"]["props"] for obj in graph()
-                   if obj.get("type") == "PipeWire:Interface:Node"
-                   and obj.get("info", {}).get("props", {}).get("media.class") == "Audio/Source"]
-        print(json.dumps([{"name": props.get("node.name"),
-                           "description": props.get("node.description")} for props in sources
-                          if not props.get("node.name", "").startswith("massiveeq")], indent=2))
+        print(json.dumps(list_sources(graph()), indent=2))
         return
-    config = load_config(args.config)
+    if args.command == "doctor":
+        print(json.dumps(doctor(), indent=2))
+        return
     if args.command == "check":
-        print(json.dumps(config, indent=2))
+        print(json.dumps(load_config(args.config), indent=2))
         return
     # The runtime lock prevents duplicate names and independent competing chains.
     runtime = os.environ.get("XDG_RUNTIME_DIR")
@@ -272,7 +559,12 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("MassiveEQ microphone processing is already running") from None
-        run(config)
+        try:
+            config = load_config(args.config)
+        except (ValueError, OSError, ET.ParseError) as error:
+            write_status("error", error=str(error))
+            raise
+        run(config, args.config)
 
 
 if __name__ == "__main__":
