@@ -8,6 +8,9 @@ url='https://github.com/massiveadam/massiveeq'
 license=('MIT')
 depends=('pipewire>=1:1.4' 'libpipewire' 'wireplumber>=0.5' 'gtk4>=4.18' 'libadwaita>=1.8' 'glib2' 'cairo' 'libsndfile' 'libsamplerate' 'curl' 'glibc' 'libgcc' 'hicolor-icon-theme')
 makedepends=('cargo' 'clang' 'git')
+optdepends=('carla: native VST3/LV2 microphone plugin hosting'
+            'pipewire-jack: independent microphone plugin routing'
+            'python: microphone companion')
 provides=('massiveeq')
 conflicts=('massiveeq')
 options=('!debug')
@@ -51,6 +54,10 @@ package() {
   install -Dm755 target/release/massiveeqd "$pkgdir/usr/bin/massiveeqd"
   install -Dm755 target/release/massiveeq-tray "$pkgdir/usr/bin/massiveeq-tray"
   install -Dm755 target/release/massiveeqctl "$pkgdir/usr/bin/massiveeqctl"
+  install -Dm755 packaging/massiveeq-input "$pkgdir/usr/bin/massiveeq-input"
+  install -Dm644 packaging/massiveeq-input.service "$pkgdir/usr/lib/systemd/user/massiveeq-input.service"
+  install -Dm644 packaging/input/input.json "$pkgdir/usr/share/massiveeq/input/input.json"
+  install -Dm644 docs/microphone-plugins.md "$pkgdir/usr/share/doc/$pkgname/microphone-plugins.md"
   install -Dm644 packaging/massiveeq.service "$pkgdir/usr/lib/systemd/user/massiveeq.service"
   install -Dm644 packaging/massiveeq-tray.service "$pkgdir/usr/lib/systemd/user/massiveeq-tray.service"
   install -Dm644 packaging/org.massiveeq.Service1.service "$pkgdir/usr/share/dbus-1/services/org.massiveeq.Service1.service"

@@ -239,6 +239,15 @@ No custom module or menu script is needed. The
 the icon visible, and troubleshooting. A tray configuration example is
 installed at `/usr/share/massiveeq/waybar/tray.jsonc`.
 
+## Microphone DSP and native Linux plugins
+
+An optional, independent `massiveeq-input` companion runs native Linux VST3
+and LV2 effects through Carla and publishes **MassiveEQ Microphone** for calling
+and recording apps. Configure a saved rack with your compressor, noise gate,
+and RNNoise plugin, then control it with its own user service. Playback EQ and
+its Engine switch remain independent. Plugin setup and editing use Carla in
+this version; see the [microphone plugin guide](docs/microphone-plugins.md).
+
 ## Noctalia quick controls
 
 Noctalia 4.7.x and Noctalia 5 can use an optional native MassiveEQ widget
