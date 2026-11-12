@@ -53,10 +53,11 @@ struct Widgets {
     dependency: gtk::Box,
     dependency_label: gtk::Label,
     graph: gtk::DrawingArea,
+    graph_overlay: gtk::Overlay,
     bands: gtk::FlowBox,
     selected_box: gtk::Box,
-    kind: gtk::DropDown,
-    band_enabled: gtk::CheckButton,
+    kind: crate::Segmented,
+    band_enabled: gtk::ToggleButton,
     frequency: knob::LabeledKnob,
     gain: knob::LabeledKnob,
     q: knob::LabeledKnob,
@@ -256,9 +257,13 @@ impl State {
             ));
             self.ui.q.knob.set_value(filter.q);
             self.ui.band_enabled.set_active(filter.enabled);
-            self.ui
-                .kind
-                .set_selected(KINDS.iter().position(|k| *k == filter.kind).unwrap_or(0) as u32);
+            let kind = KINDS.iter().position(|k| *k == filter.kind).unwrap_or(0);
+            self.ui.kind.buttons[kind].set_active(true);
+            if filter.enabled {
+                self.ui.selected_box.remove_css_class("disabled-band");
+            } else {
+                self.ui.selected_box.add_css_class("disabled-band");
+            }
         }
         while let Some(child) = self.ui.bands.first_child() {
             self.ui.bands.remove(&child);
@@ -269,15 +274,21 @@ impl State {
                 index + 1,
                 filter.frequency
             ));
+            button.add_css_class("band-chip");
+            if !filter.enabled {
+                button.add_css_class("disabled-band");
+            }
+            button.set_focus_on_click(false);
             button.set_active(self.selected.get() == Some(index));
             button.update_property(&[gtk::accessible::Property::Label(&format!(
                 "Input band {}",
                 index + 1
             ))]);
             let state = Rc::downgrade(self);
-            button.connect_clicked(move |_| {
+            button.connect_clicked(move |button| {
                 if let Some(s) = state.upgrade() {
-                    s.select(Some(index));
+                    s.select(button.is_active().then_some(index));
+                    s.ui.graph.grab_focus();
                 }
             });
             self.ui.bands.insert(&button, -1);
@@ -294,6 +305,7 @@ impl State {
             .graph
             .set_opacity(if profile.eq_enabled { 1.0 } else { 0.45 });
         self.ui.graph.queue_draw();
+        self.ui.graph_overlay.queue_allocate();
         self.ui.undo.set_sensitive(self.history.borrow().can_undo());
         self.ui.redo.set_sensitive(self.history.borrow().can_redo());
         self.syncing.set(false);
@@ -711,7 +723,10 @@ pub fn build(window: &adw::ApplicationWindow) -> InputView {
     dependency.set_visible(!PathBuf::from("/usr/lib/carla/libcarla_standalone2.so").is_file());
     body.append(&dependency);
     let managed = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    managed.append(&graph);
+    let graph_overlay = gtk::Overlay::new();
+    graph_overlay.set_child(Some(&graph));
+    graph_overlay.set_vexpand(true);
+    managed.append(&graph_overlay);
     let eq = gtk::CheckButton::with_label("Microphone EQ");
     let undo = gtk::Button::from_icon_name("edit-undo-symbolic");
     undo.set_tooltip_text(Some("Undo input edit"));
@@ -726,14 +741,41 @@ pub fn build(window: &adw::ApplicationWindow) -> InputView {
     managed.append(&eq_row);
     let bands = gtk::FlowBox::new();
     bands.set_selection_mode(gtk::SelectionMode::None);
+    bands.set_min_children_per_line(1);
+    bands.set_max_children_per_line(16);
+    bands.set_halign(gtk::Align::Start);
+    bands.add_css_class("band-chips");
     bands.set_column_spacing(4);
     bands.set_row_spacing(4);
     managed.append(&bands);
-    let selected_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    selected_box.set_halign(gtk::Align::Center);
-    let kind =
-        gtk::DropDown::from_strings(&["Peak", "Low shelf", "High shelf", "High pass", "Low pass"]);
-    let band_enabled = gtk::CheckButton::with_label("Band on");
+    let selected_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    selected_box.add_css_class("band-panel");
+    selected_box.set_halign(gtk::Align::Start);
+    selected_box.set_valign(gtk::Align::Start);
+    let top = adw::WrapBox::builder()
+        .child_spacing(8)
+        .line_spacing(8)
+        .build();
+    let kind = crate::Segmented::new(
+        &["Peak", "Low shelf", "High shelf", "High pass", "Low pass"],
+        0,
+    );
+    kind.root.add_css_class("kind-picker");
+    for (button, filter_kind) in kind.buttons.iter().zip(KINDS) {
+        button.set_child(Some(&crate::glyph::widget(filter_kind, 26, 16)));
+        button.set_tooltip_text(Some(crate::kind_name(filter_kind)));
+        button.reset_relation(gtk::AccessibleRelation::LabelledBy);
+        button.update_property(&[gtk::accessible::Property::Label(crate::kind_name(
+            filter_kind,
+        ))]);
+        button.set_focus_on_click(false);
+    }
+    let band_enabled = gtk::ToggleButton::new();
+    band_enabled.set_icon_name("system-shutdown-symbolic");
+    band_enabled.add_css_class("band-power");
+    band_enabled.set_tooltip_text(Some("Band on or off"));
+    band_enabled.update_property(&[gtk::accessible::Property::Label("Input band enabled")]);
+    band_enabled.set_focus_on_click(false);
     let frequency = knob::LabeledKnob::new(
         knob::Knob::new(20.0, 20_000.0, 1000.0, knob::Taper::Log, false),
         "Freq",
@@ -755,15 +797,23 @@ pub fn build(window: &adw::ApplicationWindow) -> InputView {
                 "Input band {caption}"
             ))]);
     }
-    let remove = gtk::Button::from_icon_name("user-trash-symbolic");
+    let remove = gtk::Button::from_icon_name("window-close-symbolic");
+    remove.add_css_class("band-remove");
     remove.set_tooltip_text(Some("Remove input band"));
-    selected_box.append(&kind);
-    selected_box.append(&band_enabled);
+    remove.set_focus_on_click(false);
+    top.append(&kind.root);
+    top.append(&band_enabled);
+    top.append(&remove);
+    selected_box.append(&top);
+    let knobs = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    knobs.set_halign(gtk::Align::Center);
     for control in [&frequency, &gain, &q] {
-        selected_box.append(&control.root);
+        control.knob.set_size_request(48, 48);
+        knobs.append(&control.root);
     }
-    selected_box.append(&remove);
-    managed.append(&selected_box);
+    selected_box.append(&knobs);
+    selected_box.set_visible(false);
+    graph_overlay.add_overlay(&selected_box);
     let voice = gtk::Expander::new(Some("Voice processing"));
     let voice_box = gtk::Box::new(gtk::Orientation::Vertical, 10);
     voice_box.set_margin_top(10);
@@ -854,6 +904,7 @@ pub fn build(window: &adw::ApplicationWindow) -> InputView {
             dependency,
             dependency_label,
             graph,
+            graph_overlay,
             bands,
             selected_box,
             kind,
@@ -882,6 +933,44 @@ pub fn build(window: &adw::ApplicationWindow) -> InputView {
             add_band,
         },
     });
+    crate::band_panel::attach(
+        &state.ui.graph_overlay,
+        &state.ui.graph,
+        &state.ui.selected_box,
+        &[
+            &state.ui.frequency.knob,
+            &state.ui.gain.knob,
+            &state.ui.q.knob,
+        ],
+        {
+            let state = Rc::downgrade(&state);
+            move || {
+                let state = state.upgrade()?;
+                let index = state.selected.get()?;
+                let library = state.library.borrow();
+                let filter = library.active().filters.get(index)?;
+                Some(crate::band_panel::Anchor {
+                    index,
+                    frequency: filter.frequency,
+                    gain_db: filter.gain_db,
+                    graph_dragging: state.dragging.get(),
+                })
+            }
+        },
+        {
+            let state = Rc::downgrade(&state);
+            move |width, height| {
+                state.upgrade().map_or_else(Vec::new, |state| {
+                    graph::line_points(
+                        state.analysis.borrow().as_ref(),
+                        &graph::Overlay::default(),
+                        width,
+                        height,
+                    )
+                })
+            }
+        },
+    );
     state.history.borrow_mut().reset(state.snapshot());
     state.profiles();
     state.source_list();
@@ -1186,17 +1275,19 @@ fn wire(
             }
         });
     }
-    state.ui.kind.connect_selected_notify({
-        let s = Rc::downgrade(state);
-        move |drop| {
-            if let Some(s) = s.upgrade()
-                && let Some(index) = s.selected.get()
-                && let Some(kind) = KINDS.get(drop.selected() as usize)
-            {
-                s.edit(|p| p.filters[index].kind = *kind);
+    for (button, kind) in state.ui.kind.buttons.iter().zip(KINDS) {
+        button.connect_toggled({
+            let s = Rc::downgrade(state);
+            move |button| {
+                if button.is_active()
+                    && let Some(s) = s.upgrade()
+                    && let Some(index) = s.selected.get()
+                {
+                    s.edit(|p| p.filters[index].kind = kind);
+                }
             }
-        }
-    });
+        });
+    }
     state.ui.band_enabled.connect_toggled({
         let s = Rc::downgrade(state);
         move |button| {

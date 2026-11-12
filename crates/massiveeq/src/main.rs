@@ -1,3 +1,4 @@
+mod band_panel;
 mod client;
 mod editing;
 mod editor_tasks;
@@ -4372,99 +4373,40 @@ fn build_band_editor(
     enabled.set_focus_on_click(false);
     remove.set_focus_on_click(false);
 
-    // The panel follows its node, but holds still while the pointer is on it
-    // or one of its knobs is dragged: a panel moving under the pointer would
-    // carry a knob away mid-drag and send the mouse wheel to the graph.
-    let hovered = Rc::new(Cell::new(false));
-    let dragging = Rc::new(Cell::new(false));
-    let placed = Rc::new(Cell::new(None::<(usize, gtk::gdk::Rectangle)>));
-    let motion = gtk::EventControllerMotion::new();
-    motion.connect_enter({
-        let hovered = hovered.clone();
-        move |_, _, _| hovered.set(true)
-    });
-    motion.connect_leave({
-        let hovered = hovered.clone();
-        let overlay = overlay.clone();
-        move |_| {
-            hovered.set(false);
-            overlay.queue_allocate();
-        }
-    });
-    root.add_controller(motion);
-    for control in [&frequency, &gain, &q] {
-        let dragging = dragging.clone();
-        let overlay = overlay.clone();
-        control.knob.connect_dragging(move |active| {
-            dragging.set(active);
-            if !active {
-                overlay.queue_allocate();
+    crate::band_panel::attach(
+        overlay,
+        graph,
+        &root,
+        &[&frequency.knob, &gain.knob, &q.knob],
+        {
+            let model = Rc::downgrade(model);
+            move || {
+                let model = model.upgrade()?;
+                let index = model.selected_filter.get()?;
+                let document = model.document.borrow();
+                let filter = document.as_ref()?.filters.get(index)?;
+                Some(crate::band_panel::Anchor {
+                    index,
+                    frequency: filter.frequency,
+                    gain_db: filter.gain_db,
+                    graph_dragging: model.graph_dragging.get(),
+                })
             }
-        });
-    }
-    // Sit beside the node wherever the panel hides the least of the curves,
-    // above all near the band's own frequency, which is what is being tuned.
-    let side = Rc::new(Cell::new(PanelSide::Below));
-    overlay.connect_get_child_position({
-        let model = Rc::downgrade(model);
-        let graph = graph.clone();
-        let panel = root.clone();
-        move |_, child| {
-            if child != panel.upcast_ref::<gtk::Widget>() {
-                return None;
+        },
+        {
+            let model = Rc::downgrade(model);
+            move |width, height| {
+                model.upgrade().map_or_else(Vec::new, |model| {
+                    graph::line_points(
+                        model.analysis.borrow().as_ref(),
+                        &model.overlay.borrow(),
+                        width,
+                        height,
+                    )
+                })
             }
-            let model = model.upgrade()?;
-            let index = model.selected_filter.get()?;
-            if (hovered.get()
-                || dragging.get()
-                || panel
-                    .root()
-                    .and_then(|root| root.focus())
-                    .is_some_and(|focus| focus.is::<gtk::Text>() && focus.is_ancestor(&panel)))
-                && let Some((placed_index, rectangle)) = placed.get()
-                && placed_index == index
-            {
-                return Some(rectangle);
-            }
-            let (frequency, gain_db) = model
-                .document
-                .borrow()
-                .as_ref()?
-                .filters
-                .get(index)
-                .map(|filter| (filter.frequency, filter.gain_db))?;
-            let (width, height) = (graph.width() as f64, graph.height() as f64);
-            let node = graph::filter_point_position(frequency, gain_db, width, height);
-            // Narrow graphs get a narrower panel; its top row wraps to fit.
-            let (minimum, natural, _, _) = panel.measure(gtk::Orientation::Horizontal, -1);
-            let panel_width = (natural as f64).min(width - 16.0).max(minimum as f64);
-            let (_, panel_height, _, _) =
-                panel.measure(gtk::Orientation::Vertical, panel_width as i32);
-            let size = (panel_width, panel_height as f64);
-            let lines = graph::line_points(
-                model.analysis.borrow().as_ref(),
-                &model.overlay.borrow(),
-                width,
-                height,
-            );
-            let previous = (placed
-                .get()
-                .is_some_and(|(placed_index, _)| placed_index == index))
-            .then(|| side.get());
-            // Moving the node keeps the panel on its side rather than
-            // letting it hop around under the pointer.
-            let chosen = match previous {
-                Some(previous) if model.graph_dragging.get() => previous,
-                _ => best_panel_side(node, size, (width, height), &lines, previous),
-            };
-            side.set(chosen);
-            let (left, top) = panel_origin(chosen, node, size, (width, height));
-            let rectangle =
-                gtk::gdk::Rectangle::new(left as i32, top as i32, panel_width as i32, panel_height);
-            placed.set(Some((index, rectangle)));
-            Some(rectangle)
-        }
-    });
+        },
+    );
     let syncing = Rc::new(Cell::new(false));
     for (button, filter_kind) in kind.buttons.iter().zip(BAND_KINDS) {
         button.connect_toggled({

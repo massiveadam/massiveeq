@@ -20,7 +20,8 @@ Each view has its own profiles and power switch.
 3. Choose your physical microphone. Mono and stereo sources are supported.
    A disconnected source stays visible in its saved profile.
 4. Select **Add band**, or double-click the graph, to add EQ. Drag a band to
-   change frequency and gain, scroll to change Q, or use its knobs. Double-click
+   change frequency and gain, scroll to change Q, or use the floating controls
+   beside the selected node, as in the Output view. Double-click
    a numeric readout to type a value. Peak, low shelf, high shelf, high pass,
    and low pass filters are available, up to 16 bands per profile.
 5. Expand **Voice processing** to enable RNNoise, the noise gate, or compressor.
