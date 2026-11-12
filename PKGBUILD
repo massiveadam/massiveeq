@@ -57,6 +57,8 @@ package() {
   install -Dm644 packaging/org.massiveeq.MassiveEQ.desktop "$pkgdir/usr/share/applications/org.massiveeq.MassiveEQ.desktop"
   install -Dm644 packaging/org.massiveeq.MassiveEQ.metainfo.xml "$pkgdir/usr/share/metainfo/org.massiveeq.MassiveEQ.metainfo.xml"
   install -Dm644 packaging/org.massiveeq.MassiveEQ.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.massiveeq.MassiveEQ.svg"
+  install -Dm644 packaging/waybar/tray.jsonc "$pkgdir/usr/share/massiveeq/waybar/tray.jsonc"
+  install -Dm644 docs/waybar-omarchy.md "$pkgdir/usr/share/doc/$pkgname/waybar-omarchy.md"
   install -dm755 "$pkgdir/usr/share/massiveeq/noctalia-v4/massiveeq"
   cp -a packaging/noctalia-v4/massiveeq/. "$pkgdir/usr/share/massiveeq/noctalia-v4/massiveeq/"
   install -dm755 "$pkgdir/usr/share/massiveeq/noctalia-v5/massiveeq"

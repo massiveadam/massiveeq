@@ -247,6 +247,9 @@ impl MassiveEqTray {
 }
 
 impl ksni::Tray for MassiveEqTray {
+    // A bar click opens quick controls. The editor stays available in the menu.
+    const MENU_ON_ACTIVATE: bool = true;
+
     fn id(&self) -> String {
         "massiveeq-tray".into()
     }
@@ -345,10 +348,6 @@ impl ksni::Tray for MassiveEqTray {
             description,
             ..Default::default()
         }
-    }
-
-    fn activate(&mut self, _x: i32, _y: i32) {
-        self.send(Action::Open);
     }
 
     fn secondary_activate(&mut self, _x: i32, _y: i32) {

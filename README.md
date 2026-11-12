@@ -225,6 +225,17 @@ unassigns profiles, controls the per-output Filters switch and master engine,
 and opens the full editor. It is a separate process, so stopping it never
 changes audio routing.
 
+## Waybar and Omarchy quick controls
+
+Enable the packaged companion once with
+`systemctl --user enable --now massiveeq-tray.service`. It appears in Waybar's
+standard tray, including Omarchy's tray drawer. Click the icon to switch
+profiles, toggle Filters or the engine, and open the editor for settings.
+No custom module or menu script is needed. The
+[Waybar and Omarchy guide](docs/waybar-omarchy.md) covers tray setup, keeping
+the icon visible, and troubleshooting. A tray configuration example is
+installed at `/usr/share/massiveeq/waybar/tray.jsonc`.
+
 ## Noctalia quick controls
 
 Noctalia 4.7.x and Noctalia 5 can use an optional native MassiveEQ widget
