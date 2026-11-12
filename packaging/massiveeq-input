@@ -216,8 +216,8 @@ def run(config):
                         ready = True
             time.sleep(0.02)
     finally:
-        # Destroy the published source before stopping processing. Applications
-        # cannot fall through to a dry microphone during teardown.
+        # Remove the published source before stopping processing. The desktop
+        # or recording application owns fallback to another recording source.
         if loopback is not None:
             loopback.terminate()
             try:

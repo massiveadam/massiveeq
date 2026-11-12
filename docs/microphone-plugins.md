@@ -87,8 +87,8 @@ systemctl --user stop massiveeq-input.service
 systemctl --user restart massiveeq-input.service
 ```
 
-Stopping removes the virtual microphone. It does not switch an application's
-recording source to the physical microphone. A microphone unplug, stopped
+Stopping removes the virtual microphone. The helper does not select a replacement;
+your desktop or recording application may fall back to another source. A microphone unplug, stopped
 plugin engine, missing required port, or virtual-source process failure stops
 the chain and reports an error. Systemd retries every three seconds, so a
 reconnected microphone can return without changing playback. A manual
