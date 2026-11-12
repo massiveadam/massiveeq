@@ -1,179 +1,125 @@
-# Microphone plugins
+# Set up microphone processing
 
-MassiveEQ can run an independent microphone chain through Carla's native Linux
-VST3 and LV2 host. The chain publishes **MassiveEQ Microphone** as a PipeWire
-recording source. Select that source in your calling or recording application.
-Playback profiles, the playback Engine switch, and microphone processing have
-separate controls and service lifetimes.
+MassiveEQ has separate **Output** and **Input** views. The Output view keeps
+your playback profiles and controls. The Input view processes a microphone and
+publishes **MassiveEQ Microphone** for calling and recording applications.
+Each view has its own profiles and power switch.
 
-The first version uses Carla to edit the plugin rack and save plugin settings.
-It does not embed plugin editors into MassiveEQ's GTK window. Native Linux
-plugins are supported; Windows VST DLLs, Wine bridges, and standalone RNNoise
-executables are outside this integration.
+## Set up an input profile
 
-## Set up a rack
+1. Open MassiveEQ and select **Input**.
+2. If the page shows missing support, select **Install support…**. Open the
+   command in a terminal, or copy it to your terminal:
 
-Install the optional backend and the plugins you want to use:
+   ```sh
+   sudo pacman -S --needed carla pipewire-jack python lsp-plugins-lv2 noise-suppression-for-voice
+   ```
 
-```sh
-sudo pacman -S carla pipewire-jack python
-```
+   Authentication happens in your terminal. Return to MassiveEQ and select the
+   refresh button beside the microphone picker after installation.
+3. Choose your physical microphone. Mono and stereo sources are supported.
+   A disconnected source stays visible in its saved profile.
+4. Select **Add band**, or double-click the graph, to add EQ. Drag a band to
+   change frequency and gain, scroll to change Q, or use its knobs. Double-click
+   a numeric readout to type a value. Peak, low shelf, high shelf, high pass,
+   and low pass filters are available, up to 16 bands per profile.
+5. Expand **Voice processing** to enable RNNoise, the noise gate, or compressor.
+   Set gate threshold above room noise and below speech. Adjust compressor
+   threshold, ratio, attack, release, and makeup gain while checking your
+   calling application's input meter.
+6. Turn on the Input power switch. Wait for **Input on**, then select
+   **MassiveEQ Microphone** in your calling or recording app.
 
-A tested speech rack uses RNNoise VST3 from `noise-suppression-for-voice`,
-followed by **LSP Gate Stereo** and **LSP Compressor Stereo** in LV2 format.
-Install those optional effects with:
+Edits save automatically and apply to a running input chain. The graph shows
+EQ only. Voice processing follows this order: RNNoise, gate, compressor, EQ.
+Microphone EQ does not apply playback loudness matching or automatic gain
+correction. Allow headroom when boosting EQ or compressor makeup gain.
 
-```sh
-sudo pacman -S noise-suppression-for-voice lsp-plugins-lv2
-```
+RNNoise is optional. EQ, gate, and compressor need `lsp-plugins-lv2` and the
+Carla host, but can run without `noise-suppression-for-voice` installed.
+The application configures these effects directly. Normal setup does not
+require the Carla window or a hand-edited configuration file.
 
-Open `pw-jack carla-rack`. Add native Linux VST3 or LV2 effects in processing
-order. For speech, a useful starting order is an RNNoise plugin, noise gate,
-then compressor. Install those plugins separately: MassiveEQ does not bundle
-third-party plugin binaries or RNNoise models. RNNoise can be an LV2 plugin in
-the same rack as your VST3 compressor or gate. Use the plugin browser's format
-and architecture indicators to choose installed native Linux effects.
+## Manage input profiles
 
-Set the gate threshold above your room noise and below speech; adjust compressor
-threshold, ratio, and makeup gain while monitoring the plugin's meters. Save
-an active **Continuous Rack** project as
-`~/.config/massiveeq/microphone.carxp`. All rack plugins must be active; a
-missing, inactive, or mismatched plugin causes startup to fail instead of publishing a
-partially processed chain. Do not save a Patchbay project: its connections do
-not describe the serial rack this helper runs. Close Carla before starting the
-managed chain. Saved external hardware connections are ignored by the helper.
+Use the Input profile picker to switch profiles. The name field renames the
+current profile. The adjacent buttons create, duplicate, or delete a profile.
+Each profile keeps its microphone, EQ, and voice-processing settings.
+Undo and redo operate on input edits while the Input view is visible.
+Playback profiles and their undo history remain separate.
 
-List microphone node names:
+The Input power switch controls `massiveeq-input.service`. Turning it on also
+enables it at login. Turning it off stops the service and disables login
+startup. Closing the editor keeps a running input chain active.
+The Output power switch has no effect on microphone processing.
 
-```sh
-massiveeq-input sources
-```
+Normal parameter edits, profile changes with the same channel map, and
+RNNoise toggles retain the published virtual microphone. Switching between
+mono and stereo recreates that endpoint. Applications may need to select it
+again after a channel-map change.
 
-Copy `/usr/share/massiveeq/input/input.json` to
-`~/.config/massiveeq/input.json`, then replace `source` with the exact physical
-microphone's `node.name` and `project` with the absolute path to your project.
-For example:
+## Use external plugins
 
-```json
-{
-  "source": "alsa_input.usb-My_Microphone-00.mono-fallback",
-  "project": "/home/alex/.config/massiveeq/microphone.carxp",
-  "channels": ["MONO"]
-}
-```
+Expand **Advanced plugins** and select **Use custom Carla rack…** to load an
+existing `.carxp` file. A custom rack replaces that input profile's built-in
+EQ and voice chain. The disabled controls and rack label show which mode is
+active. Select **Use built-in processing** to return to the app's controls.
 
-Use `["FL", "FR"]` for a stereo microphone. `pw-dump` shows each source port's
-`audio.channel`; the helper requires exact channel matches. A mono source feeds
-both sides of Carla's stereo rack; its first output becomes the mono recording
-source, without summing the two sides. Stereo sources retain left/right order.
-This deliberately supports mono and stereo capture, not arbitrary channel maps.
+Create a custom rack with `pw-jack carla-rack`. Add native Linux VST3 or LV2
+effects, enable every effect, and save a **Continuous Rack** project. Close
+Carla before starting the managed service. Patchbay projects are rejected
+because their connections do not describe a serial rack. Saved external
+hardware connections are ignored.
 
-Validate the configuration and start the separate service:
+Some Carla versions cannot select arbitrary classes in a multi-plugin VST3
+bundle. MassiveEQ checks the loaded plugin identity and reports an error if
+the host selects a different effect. Use a compatible single-class VST3 build
+or an LV2 alternative. Windows DLLs and Wine bridges are not supported by this
+integration. Plugins own their latency and real-time behavior.
 
-```sh
-massiveeq-input check
-systemctl --user enable --now massiveeq-input.service
-journalctl --user -u massiveeq-input.service -f
-```
+## Diagnose an input error
 
-Wait for **MassiveEQ Microphone ready** in the journal, then select **MassiveEQ
-Microphone** in your application. The helper never calls `set-default` or
-changes your playback routing. Desktop policy still determines which source a
-new application chooses; explicitly choose the processed source in each app.
-
-For a foreground check instead of the service:
-
-```sh
-pw-jack massiveeq-input run
-```
-
-## Control and troubleshoot
+The Input page reports missing dependencies, disconnected microphones,
+unsupported settings, and plugin load errors. Select the microphone refresh
+button after reconnecting a device or installing support. For detailed logs:
 
 ```sh
 systemctl --user status massiveeq-input.service
-systemctl --user stop massiveeq-input.service
-systemctl --user restart massiveeq-input.service
+journalctl --user -u massiveeq-input.service -b
+massiveeq-input doctor
+massiveeq-input sources
+massiveeq-input check
 ```
 
-Stopping removes the virtual microphone. The helper does not select a replacement;
-your desktop or recording application may fall back to another source. A microphone unplug, stopped
-plugin engine, missing required port, or virtual-source process failure stops
-the chain and reports an error. Systemd retries every three seconds, so a
-reconnected microphone can return without changing playback. A manual
-foreground run exits on those failures; run it again after reconnecting.
+The helper removes its virtual source when stopped or when its microphone is
+removed. Your desktop or recording application may then choose another source.
+The helper never changes the system's default source or connects a microphone
+to speakers. Systemd retries failed input chains independently of playback.
 
-To change settings, stop the microphone service, edit and save the rack in
-Carla, close Carla, then start the service. There is no live crossfade or
-hot-swap of microphone projects in this version. Use your calling application's
-input test to check levels after changing a rack. Plugins own their processing
-latency and real-time behavior; this host cannot enforce third-party RT safety.
+Profiles are stored in `~/.config/massiveeq/input.json`. The earlier
+`source`/`project`/`channels` format remains supported. Opening an older config
+shows its rack in Advanced mode and preserves the original file until you
+edit it. Invalid configs are reported and are not overwritten.
 
-Some Carla versions cannot select arbitrary classes in multi-plugin VST3
-bundles. The helper compares loaded plugin labels with the saved project and
-refuses a different class instead of silently running the wrong effect. Use a
-Carla-compatible single-class VST3 build or LV2 alternative if this occurs.
+## Verify the processing path
 
-If startup fails, check the journal for the exact missing source/port or Carla
-error. Check `massiveeq-input sources`, absolute paths, plugin installation,
-and the `channels` setting. The source is published at low session priority;
-the helper uses no default-source mutation and no microphone-to-speaker link.
-
-## Architecture decision
-
-Two shapes were considered:
-
-1. Add a VST3 COM host, plugin state/parameter model, scanner, editor integration,
-   and input direction to the playback daemon. The GTK editor would own the
-   chain UI; a direction-tagged engine would own capture nodes and state. This
-   permits a unified editor but expands the real-time callback and daemon crash
-   surface, and requires a separate plugin sandbox and migration of the
-   playback-centric device and profile model. Verification would require
-   capture routing plus plugin ABI, state, GUI, and crash tests.
-2. Keep the current playback daemon and profile format intact. A separate
-   `massiveeq-input` process owns a Carla serial rack and a PipeWire virtual
-   source. Carla projects own plugin state; `input.json` owns physical source,
-   project path, and channel map. Systemd owns retries and process-group
-   cleanup. This gives an explicit independent lifetime and isolates plugin
-   failure from playback, with no library migration. The caller configures a
-   rack in Carla and starts/stops one independent service.
-
-The second shape is implemented. The helper uses Carla's standalone C API
-(`carla_standalone_host_init`, engine options, project loading, engine idle and
-close); Python runs only control work. Audio processing runs inside Carla's
-native JACK callback through PipeWire's JACK library. `CARLA_DONT_MANAGE_CONNECTIONS`
-suppresses restoration of the project's external connections; the helper alone
-links the configured source to the rack, then the rack to the virtual source.
-Nodes have automatic connections disabled. Required port resolution is exact
-and checked periodically. Missing devices fail closed, and each restart
-re-resolves IDs instead of persisting transient PipeWire IDs. A runtime lock
-prevents two microphone helpers from competing for the same node names.
-
-The helper validates configuration before starting audio, refuses empty,
-partial, or inactive racks, and removes the published source before closing
-Carla during normal teardown. Systemd's `KillMode=control-group` also removes
-its child process after a native plugin crash. Prefer the service for normal
-use; a native crash in a foreground run cannot execute Python cleanup.
-
-Upstream contracts: [Carla standalone bindings](https://github.com/falkTX/Carla/blob/main/source/frontend/carla_backend.py),
-[Carla project connection restoration](https://github.com/falkTX/Carla/blob/main/source/backend/engine/CarlaEngine.cpp),
-and [PipeWire loopback virtual sources](https://docs.pipewire.org/page_module_loopback.html).
-
-Pure configuration/routing checks run with:
+Run configuration, routing, and parameter mapping checks:
 
 ```sh
-python3 -m unittest discover -s tests -p test_microphone.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p test_microphone.py -v
 ```
 
-An opt-in signal test runs a real installed Linux VST3 plugin through a private
-PipeWire session, measures its saved gain change, and verifies teardown:
+With the optional host and effects installed, an X display available, and
+PipeWire/JACK tools in PATH, run the synthetic signal tests:
 
 ```sh
+python3 tests/native_managed_microphone.py
 python3 tests/native_microphone.py
 ```
 
-It requires Carla, PipeWire/JACK, WirePlumber, `lsp-plugins-vst3`, and an X display
-(Xvfb works). It creates only synthetic audio nodes and uses no hardware or
-existing audio session. The fixture uses the first class in LSP's multi-class
-bundle, an A/B tester with input gain, to accommodate Carla 2.5's class-selection
-limit. It verifies processing and state restoration; microphone hardware,
-compressor/gate tuning, and RNNoise quality still need device testing.
+The tests use a private PipeWire session without audio hardware. They measure
+EQ gain, gate attenuation, compressor makeup gain, saved custom-plugin state,
+live updates, virtual-source identity, and stop/unplug cleanup. RNNoise testing
+checks processing and finite audio, not voice quality on a real microphone.
+See [the input architecture decision](input-workspace.md) for ownership and
+compatibility details.

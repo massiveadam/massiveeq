@@ -242,12 +242,14 @@ installed at `/usr/share/massiveeq/waybar/tray.jsonc`.
 
 ## Microphone DSP and native Linux plugins
 
-An optional, independent `massiveeq-input` companion runs native Linux VST3
-and LV2 effects through Carla and publishes **MassiveEQ Microphone** for calling
-and recording apps. Configure a saved rack with your compressor, noise gate,
-and RNNoise plugin, then control it with its own user service. Playback EQ and
-its Engine switch remain independent. Plugin setup and editing use Carla in
-this version; see the [microphone plugin guide](docs/microphone-plugins.md).
+Use the **Input** view for microphone EQ, RNNoise, gate, and compressor controls.
+It has its own profiles and power switch, independent of **Output** processing.
+Changes apply to a **MassiveEQ Microphone** source that calling and recording
+apps can select. Normal setup stays inside MassiveEQ; **Advanced plugins**
+accepts a custom native Linux VST3 or LV2 rack when needed.
+
+The Input page guides installation of the optional Carla host and effects.
+See the [microphone setup guide](docs/microphone-plugins.md).
 
 ## Noctalia quick controls
 

@@ -4,6 +4,7 @@ pub mod analysis;
 #[cfg(test)]
 mod apo_golden;
 pub mod curve;
+pub mod input;
 pub mod layout;
 pub mod measurement;
 pub mod model;

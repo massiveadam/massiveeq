@@ -3,6 +3,7 @@ mod editing;
 mod editor_tasks;
 mod glyph;
 mod graph;
+mod input_ui;
 mod knob;
 mod live_client;
 mod measurements;
@@ -880,7 +881,29 @@ fn build_ui(app: &adw::Application) {
         .build();
     footer_split.add_css_class("footer-split");
     toolbar.set_content(Some(&footer_split));
-    window.set_content(Some(&toolbar));
+    let input_view = input_ui::build(&window);
+    let workspaces = gtk::Stack::new();
+    workspaces.set_transition_type(gtk::StackTransitionType::Crossfade);
+    workspaces.add_titled(&toolbar, Some("output"), "Output");
+    workspaces.add_titled(&input_view.root, Some("input"), "Input");
+    for bar in [&header, &input_view.header] {
+        let switcher = gtk::StackSwitcher::new();
+        switcher.set_stack(Some(&workspaces));
+        switcher.set_valign(gtk::Align::Center);
+        switcher.update_property(&[gtk::accessible::Property::Label("Audio workspace")]);
+        bar.pack_start(&switcher);
+    }
+    workspaces.connect_visible_child_name_notify({
+        let model = model.clone();
+        move |stack| {
+            if stack.visible_child_name().as_deref() == Some("input")
+                && let Some(tone) = model.graph_tone.borrow().as_ref()
+            {
+                tone.tone.play.set_active(false);
+            }
+        }
+    });
+    window.set_content(Some(&workspaces));
 
     // The status strip gives way first; narrow windows stack the footer.
     let crowded = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
@@ -1019,7 +1042,13 @@ fn build_ui(app: &adw::Application) {
     window.connect_close_request({
         let model = model.clone();
         let status = status.clone();
+        let input_view = input_view.clone();
+        let workspaces = workspaces.clone();
         move |_| {
+            if !input_view.flush() {
+                workspaces.set_visible_child_name("input");
+                return gtk::glib::Propagation::Stop;
+            }
             if model.tasks.is_closed() {
                 return gtk::glib::Propagation::Proceed;
             }
@@ -1062,7 +1091,10 @@ fn build_ui(app: &adw::Application) {
     });
     window.connect_destroy({
         let model = model.clone();
-        move |_| model.stop_editor()
+        move |_| {
+            input_view.close();
+            model.stop_editor();
+        }
     });
 
     *model.live.borrow_mut() = Some(LiveIndicators {
@@ -4065,6 +4097,9 @@ fn build_listening_controls(
         shortcuts.add_shortcut(gtk::Shortcut::new(
             gtk::ShortcutTrigger::parse_string(trigger),
             Some(gtk::CallbackAction::new(move |widget, _| {
+                if !button.is_mapped() {
+                    return gtk::glib::Propagation::Proceed;
+                }
                 // Text entries keep their native text-editing undo behavior.
                 if widget.root().and_then(|r| r.focus()).is_some_and(|f| {
                     f.is::<gtk::TextView>() || f.is::<gtk::Text>() || f.is::<gtk::Entry>()
@@ -5160,6 +5195,9 @@ fn install_comparison_shortcuts(
         let bypass = device_bypass.clone();
         let ui = comparison_ui.clone();
         move |_, key, keycode, modifiers| {
+            if !bypass.is_mapped() {
+                return gtk::glib::Propagation::Proceed;
+            }
             let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
             if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
                 && character == Some('b')
@@ -5425,6 +5463,9 @@ fn install_editor_shortcut(window: &adw::ApplicationWindow, text_toggle: &gtk::T
     controller.connect_key_pressed({
         let text_toggle = text_toggle.clone();
         move |_, key, _, modifiers| {
+            if !text_toggle.is_mapped() {
+                return gtk::glib::Propagation::Proceed;
+            }
             let character = key.to_unicode().map(|value| value.to_ascii_lowercase());
             if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) || character != Some('e') {
                 return gtk::glib::Propagation::Proceed;

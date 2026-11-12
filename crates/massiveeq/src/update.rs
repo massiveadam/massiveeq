@@ -170,6 +170,14 @@ fn terminal() -> Option<String> {
 
 /// The full command line that runs the update script in `terminal`.
 fn terminal_command(terminal: &str, helper: &str) -> Vec<String> {
+    terminal_script(
+        terminal,
+        UPDATE_SCRIPT,
+        &["massiveeq-update", helper, AUR_PACKAGE],
+    )
+}
+
+fn terminal_script(terminal: &str, script: &str, arguments: &[&str]) -> Vec<String> {
     let name = std::path::Path::new(terminal)
         .file_name()
         .map_or(terminal.into(), |name| name.to_string_lossy());
@@ -179,18 +187,19 @@ fn terminal_command(terminal: &str, helper: &str) -> Vec<String> {
         .map_or(&["-e"][..], |(_, prefix)| prefix);
     let mut command = vec![terminal.to_owned()];
     command.extend(prefix.iter().map(|argument| (*argument).to_owned()));
-    command.extend(
-        [
-            "bash",
-            "-c",
-            UPDATE_SCRIPT,
-            "massiveeq-update",
-            helper,
-            AUR_PACKAGE,
-        ]
-        .map(str::to_owned),
-    );
+    command.extend(["bash", "-c", script].map(str::to_owned));
+    command.extend(arguments.iter().map(|argument| (*argument).to_owned()));
     command
+}
+
+pub fn install_input_support() -> bool {
+    let Some(terminal) = terminal() else {
+        return false;
+    };
+    let script = "sudo pacman -S --needed carla pipewire-jack python lsp-plugins-lv2 noise-suppression-for-voice\nprintf '\\n'\nread -rp 'Press Enter to close. ' _";
+    let command = terminal_script(&terminal, script, &["massiveeq-input-install"]);
+    let arguments = command.iter().map(OsStr::new).collect::<Vec<_>>();
+    gio::Subprocess::newv(&arguments, gio::SubprocessFlags::NONE).is_ok()
 }
 
 fn run_update(terminal: &str, helper: &str) -> bool {
