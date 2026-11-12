@@ -4105,6 +4105,8 @@ struct BandUi {
     frequency: knob::Knob,
     gain: knob::Knob,
     q: knob::Knob,
+    value_editors: [gtk::Stack; 3],
+    editing_target: RefCell<(Option<String>, Option<usize>)>,
     enabled: gtk::ToggleButton,
     tiles: Vec<BandTile>,
     /// Add band, kept as the last item among the chips so it wraps with them.
@@ -4378,7 +4380,12 @@ fn build_band_editor(
             }
             let model = model.upgrade()?;
             let index = model.selected_filter.get()?;
-            if (hovered.get() || dragging.get())
+            if (hovered.get()
+                || dragging.get()
+                || panel
+                    .root()
+                    .and_then(|root| root.focus())
+                    .is_some_and(|focus| focus.is::<gtk::Text>() && focus.is_ancestor(&panel)))
                 && let Some((placed_index, rectangle)) = placed.get()
                 && placed_index == index
             {
@@ -4514,6 +4521,8 @@ fn build_band_editor(
         overlay: overlay.clone(),
         kind,
         channels,
+        value_editors: [frequency.value_editor, gain.value_editor, q.value_editor],
+        editing_target: RefCell::new((None, None)),
         frequency: frequency.knob,
         gain: gain.knob,
         q: q.knob,
@@ -4591,6 +4600,13 @@ fn sync_band_ui(model: &Model) {
     };
     ui.syncing.set(true);
     let selected = model.selected_filter.get();
+    let target = (model.current_id.borrow().clone(), selected);
+    if *ui.editing_target.borrow() != target {
+        for editor in &ui.value_editors {
+            editor.set_visible_child_name("value");
+        }
+        *ui.editing_target.borrow_mut() = target;
+    }
     for (index, (tile, filter)) in ui.tiles.iter().zip(&profile.filters).enumerate() {
         tile.select.set_active(selected == Some(index));
         if filter.enabled {
@@ -5920,6 +5936,13 @@ fn install_css() {
         .console-status,
         .level-code,
         .knob-value,
+        entry.knob-value {
+            min-height: 0;
+            padding: 0;
+            border-radius: 3px;
+            background-color: #242427;
+        }
+
         .knob-caption {
             font-family: monospace;
         }
@@ -6209,6 +6232,13 @@ fn install_css() {
         .knob-value {
             font-size: 11.5px;
             font-weight: 600;
+        }
+
+        entry.knob-value {
+            min-height: 0;
+            padding: 0;
+            border-radius: 3px;
+            background-color: #242427;
         }
 
         .knob-caption {

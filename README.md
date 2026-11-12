@@ -50,6 +50,9 @@ support contract.
   to add a band, drag it for frequency and gain, scroll over it for Q
 - Low shelf, peak, and high shelf bands, as on Squiglink, each drawn as its
   curve shape; the selected band's knobs float beside its node
+- Double-click a frequency, gain, or Q readout to type an exact value. Enter
+  applies it; Escape or clicking elsewhere cancels. Frequency is entered in Hz.
+  Double-clicking the knob itself still resets it.
 - Per-ear bands (left, both, right), on/off per band, and undo/redo
 - **Bass** (a 105 Hz shelf), **Tilt** (a whole-range slope in dB per octave
   around 1 kHz), and **Output** knobs

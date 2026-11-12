@@ -398,10 +398,13 @@ fn draw(cr: &cairo::Context, knob: &Knob, width: f64, height: f64) {
     let _ = cr.stroke();
 }
 
-/// A knob with its value and caption below it.
+/// A knob with its value and caption below it. Double-click its value to
+/// enter an exact number; Enter applies it and Escape or focus loss cancels.
 pub struct LabeledKnob {
     pub root: gtk::Box,
     pub knob: Knob,
+    /// Kept by the selected-band UI so a new selection cancels unfinished input.
+    pub value_editor: gtk::Stack,
 }
 
 impl LabeledKnob {
@@ -417,24 +420,256 @@ impl LabeledKnob {
         value.set_width_chars(6);
         let label = gtk::Label::new(Some(&caption.to_uppercase()));
         label.add_css_class("knob-caption");
+        let readout = gtk::Stack::new();
+        readout.set_hhomogeneous(false);
+        readout.set_vhomogeneous(false);
+        readout.add_named(&value, Some("value"));
+        let entry = gtk::Entry::new();
+        entry.add_css_class("knob-value");
+        entry.set_has_frame(false);
+        entry.set_width_chars(8);
+        entry.set_max_width_chars(8);
+        gtk::prelude::EditableExt::set_alignment(&entry, 0.5);
+        entry.update_property(&[gtk::accessible::Property::Label(&format!(
+            "{caption} exact value"
+        ))]);
+        readout.add_named(&entry, Some("entry"));
+        value.set_tooltip_text(Some(
+            "Double-click to enter a value; Enter applies, Escape cancels",
+        ));
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        click.connect_pressed({
+            let knob = knob.downgrade();
+            let readout = readout.downgrade();
+            let entry = entry.downgrade();
+            move |gesture, presses, _, _| {
+                if presses == 2
+                    && let (Some(knob), Some(readout), Some(entry)) =
+                        (knob.upgrade(), readout.upgrade(), entry.upgrade())
+                    && knob.is_sensitive()
+                {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    // Use the full stored number, rather than the rounded display.
+                    entry.set_text(&knob.value().to_string());
+                    entry.remove_css_class("error");
+                    let adjustment = knob.adjustment();
+                    entry.set_tooltip_text(Some(&format!(
+                        "Enter a number from {} to {}",
+                        adjustment.lower(),
+                        adjustment.upper()
+                    )));
+                    readout.set_visible_child_name("entry");
+                    entry.grab_focus();
+                    entry.select_region(0, -1);
+                }
+            }
+        });
+        value.add_controller(click);
+        entry.connect_activate({
+            let knob = knob.downgrade();
+            let readout = readout.downgrade();
+            move |entry| {
+                let (Some(knob), Some(readout)) = (knob.upgrade(), readout.upgrade()) else {
+                    return;
+                };
+                if readout.visible_child_name().as_deref() != Some("entry") || !knob.is_sensitive()
+                {
+                    return;
+                }
+                let adjustment = knob.adjustment();
+                match parse_exact_value(&entry.text(), adjustment.lower(), adjustment.upper()) {
+                    Some(value) => {
+                        readout.set_visible_child_name("value");
+                        // All existing live editing, history and autosave callbacks
+                        // run once, only after a valid value is confirmed.
+                        knob.set_value(value);
+                        knob.grab_focus();
+                    }
+                    None => {
+                        entry.add_css_class("error");
+                    }
+                }
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed({
+            let readout = readout.downgrade();
+            let knob = knob.downgrade();
+            move |_, key, _, _| {
+                if key != gtk::gdk::Key::Escape {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(readout) = readout.upgrade() {
+                    readout.set_visible_child_name("value");
+                }
+                if let Some(knob) = knob.upgrade() {
+                    knob.grab_focus();
+                }
+                glib::Propagation::Stop
+            }
+        });
+        entry.add_controller(keys);
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave({
+            let readout = readout.downgrade();
+            move |_| {
+                if let Some(readout) = readout.upgrade() {
+                    readout.set_visible_child_name("value");
+                }
+            }
+        });
+        entry.add_controller(focus);
+        root.connect_unmap({
+            let readout = readout.downgrade();
+            move |_| {
+                if let Some(readout) = readout.upgrade() {
+                    readout.set_visible_child_name("value");
+                }
+            }
+        });
         root.append(&knob);
-        root.append(&value);
+        root.append(&readout);
         root.append(&label);
         knob.connect_value_changed({
+            let readout = readout.downgrade();
             let value = value.clone();
             move |knob| {
                 let text = format(knob.value());
                 knob.update_property(&[gtk::accessible::Property::ValueText(&text)]);
                 value.set_text(&text);
+                // A selection change or another control changing this parameter
+                // invalidates an unfinished edit of its previous value.
+                if let Some(readout) = readout.upgrade() {
+                    readout.set_visible_child_name("value");
+                }
             }
         });
-        Self { root, knob }
+        Self {
+            root,
+            knob,
+            value_editor: readout,
+        }
     }
+}
+
+/// Parse user input at the UI boundary, before it reaches GtkAdjustment's
+/// clamping or the DSP model. Values outside the displayed range stay editable.
+fn parse_exact_value(text: &str, lower: f64, upper: f64) -> Option<f64> {
+    let value = text.trim().parse::<f64>().ok()?;
+    (value.is_finite() && value >= lower && value <= upper).then_some(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a display; run with xvfb-run cargo test -p massiveeq exact_value_editor -- --ignored"]
+    fn exact_value_editor_commits_only_confirmed_input() {
+        gtk::init().expect("GTK display");
+        let control = LabeledKnob::new(
+            Knob::new(20.0, 20_000.0, 1234.56789, Taper::Log, false),
+            "Frequency",
+            |value| format!("{value:.0} Hz"),
+        );
+        let window = gtk::Window::new();
+        window.set_child(Some(&control.root));
+        window.present();
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+        let readout = &control.value_editor;
+        let label = readout
+            .child_by_name("value")
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        let entry = readout
+            .child_by_name("entry")
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+        let clicks = label.observe_controllers();
+        let click = (0..clicks.n_items())
+            .find_map(|i| clicks.item(i)?.downcast::<gtk::GestureClick>().ok())
+            .unwrap();
+        let begin = || click.emit_by_name::<()>("pressed", &[&2i32, &0.0f64, &0.0f64]);
+        let changes = std::rc::Rc::new(Cell::new(0));
+        control.knob.connect_value_changed({
+            let changes = changes.clone();
+            move |_| changes.set(changes.get() + 1)
+        });
+        begin();
+        assert_eq!(readout.visible_child_name().as_deref(), Some("entry"));
+        assert_eq!(entry.text(), "1234.56789");
+        entry.set_text("2345.67891");
+        assert_eq!(changes.get(), 0);
+        entry.emit_activate();
+        assert_eq!(control.knob.value(), 2345.67891);
+        assert_eq!(changes.get(), 1);
+        assert_eq!(readout.visible_child_name().as_deref(), Some("value"));
+        begin();
+        entry.set_text("NaN");
+        entry.emit_activate();
+        assert_eq!(changes.get(), 1);
+        assert_eq!(readout.visible_child_name().as_deref(), Some("entry"));
+        assert!(entry.has_css_class("error"));
+        entry.set_text("3000");
+        let controllers = entry.observe_controllers();
+        let keys = (0..controllers.n_items())
+            .find_map(|i| {
+                controllers
+                    .item(i)?
+                    .downcast::<gtk::EventControllerKey>()
+                    .ok()
+            })
+            .unwrap();
+        assert!(keys.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk::gdk::Key::Escape,
+                &0u32,
+                &gtk::gdk::ModifierType::empty()
+            ]
+        ));
+        assert_eq!(changes.get(), 1);
+        assert_eq!(readout.visible_child_name().as_deref(), Some("value"));
+        begin();
+        entry.set_text("4000");
+        control.knob.grab_focus();
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(readout.visible_child_name().as_deref(), Some("value"));
+        assert_eq!(changes.get(), 1);
+        begin();
+        entry.set_text("5000");
+        control.root.set_visible(false);
+        assert_eq!(readout.visible_child_name().as_deref(), Some("value"));
+        // A cancelled editor cannot commit to a different band later.
+        entry.emit_activate();
+        assert_eq!(changes.get(), 1);
+        window.close();
+    }
+
+    #[test]
+    fn exact_value_accepts_full_precision_and_rejects_invalid_numbers() {
+        assert_eq!(
+            parse_exact_value(" 1234.56789 ", 20.0, 20_000.0),
+            Some(1234.56789)
+        );
+        assert_eq!(parse_exact_value("-7.25", -24.0, 24.0), Some(-7.25));
+        assert_eq!(parse_exact_value("0.125", 0.1, 20.0), Some(0.125));
+        assert_eq!(parse_exact_value("20", 20.0, 20_000.0), Some(20.0));
+        assert_eq!(parse_exact_value("20000", 20.0, 20_000.0), Some(20_000.0));
+        for text in [
+            "", "abc", "NaN", "inf", "-inf", "1e999", "19.99", "20000.01",
+        ] {
+            assert_eq!(parse_exact_value(text, 20.0, 20_000.0), None, "{text}");
+        }
+    }
 
     #[test]
     fn tapers_round_trip() {
