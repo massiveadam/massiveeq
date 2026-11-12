@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 loader = importlib.machinery.SourceFileLoader("microphone", str(Path(__file__).parents[1] / "packaging/massiveeq-input"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -77,10 +77,47 @@ class MicrophoneTests(unittest.TestCase):
                 path.write_text(json.dumps(config | {field: value}))
                 with self.assertRaises(ValueError):
                     mic.load_config(path)
+            for invalid in [None, [], 12, "input"]:
+                path.write_text(json.dumps(invalid))
+                with self.assertRaises(ValueError):
+                    mic.load_config(path)
+            path.write_text(json.dumps(config | {"project": 12}))
+            with self.assertRaises(ValueError):
+                mic.load_config(path)
             path.write_text(json.dumps(config))
             project.write_text('<CARLA-PROJECT><Plugin/><Patchbay/></CARLA-PROJECT>')
             with self.assertRaises(ValueError):
                 mic.load_config(path)
+
+    def test_runtime_rejects_partial_wrong_identity_and_inactive_plugins(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "mic.carxp"
+            project.write_text('<CARLA-PROJECT><Plugin><Info><Label>Expected</Label></Info></Plugin></CARLA-PROJECT>')
+            host = mic.Carla.__new__(mic.Carla)
+            host.handle = 1
+            host.started = False
+            info = mic.PluginInfo()
+            info.label = b"Expected"
+            host.lib = Mock()
+            host.lib.carla_engine_init.return_value = True
+            host.lib.carla_load_project.return_value = True
+            host.lib.carla_get_current_plugin_count.return_value = 1
+            host.lib.carla_get_plugin_info.return_value = mic.C.pointer(info)
+            host.lib.carla_get_internal_parameter_value.return_value = 1.0
+            host.start(project)
+            host.lib.carla_get_current_plugin_count.return_value = 0
+            with self.assertRaisesRegex(RuntimeError, "partial"):
+                host.start(project)
+            host.lib.carla_get_current_plugin_count.return_value = 1
+            info.label = b"Wrong processor"
+            with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                host.start(project)
+            info.label = b"Expected"
+            host.lib.carla_get_internal_parameter_value.return_value = 0.0
+            with self.assertRaisesRegex(RuntimeError, "inactive"):
+                host.start(project)
+            host.close()
+            host.lib.carla_engine_close.assert_called_once()
 
 
 if __name__ == "__main__":

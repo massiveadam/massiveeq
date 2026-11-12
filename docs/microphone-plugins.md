@@ -30,7 +30,7 @@ Set the gate threshold above your room noise and below speech; adjust compressor
 threshold, ratio, and makeup gain while monitoring the plugin's meters. Save
 an active **Continuous Rack** project as
 `~/.config/massiveeq/microphone.carxp`. All rack plugins must be active; a
-missing or inactive plugin causes startup to fail instead of publishing a
+missing, inactive, or mismatched plugin causes startup to fail instead of publishing a
 partially processed chain. Do not save a Patchbay project: its connections do
 not describe the serial rack this helper runs. Close Carla before starting the
 managed chain. Saved external hardware connections are ignored by the helper.
@@ -100,6 +100,11 @@ hot-swap of microphone projects in this version. Use your calling application's
 input test to check levels after changing a rack. Plugins own their processing
 latency and real-time behavior; this host cannot enforce third-party RT safety.
 
+Some Carla versions cannot select arbitrary classes in multi-plugin VST3
+bundles. The helper compares loaded plugin labels with the saved project and
+refuses a different class instead of silently running the wrong effect. Use a
+Carla-compatible single-class VST3 build or LV2 alternative if this occurs.
+
 If startup fails, check the journal for the exact missing source/port or Carla
 error. Check `massiveeq-input sources`, absolute paths, plugin installation,
 and the `channels` setting. The source is published at low session priority;
@@ -150,3 +155,17 @@ Pure configuration/routing checks run with:
 ```sh
 python3 -m unittest discover -s tests -p test_microphone.py -v
 ```
+
+An opt-in signal test runs a real installed Linux VST3 plugin through a private
+PipeWire session, measures its saved gain change, and verifies teardown:
+
+```sh
+python3 tests/native_microphone.py
+```
+
+It requires Carla, PipeWire/JACK, WirePlumber, `lsp-plugins-vst3`, and an X display
+(Xvfb works). It creates only synthetic audio nodes and uses no hardware or
+existing audio session. The fixture uses the first class in LSP's multi-class
+bundle, an A/B tester with input gain, to accommodate Carla 2.5's class-selection
+limit. It verifies processing and state restoration; microphone hardware,
+compressor/gate tuning, and RNNoise quality still need device testing.

@@ -51,6 +51,13 @@ def load_config(path):
     return {"source": source, "project": str(project), "channels": channels}
 
 
+class PluginInfo(C.Structure):
+    # Stable prefix of CarlaPluginInfo; the C-owned structure has more fields.
+    _fields_ = [("type", C.c_int), ("category", C.c_int), ("hints", C.c_uint),
+                ("options_available", C.c_uint), ("options_enabled", C.c_uint),
+                ("filename", C.c_char_p), ("name", C.c_char_p), ("label", C.c_char_p)]
+
+
 class Carla:
     """Small binding to the stable standalone C API, never called from audio RT."""
     def __init__(self):
@@ -68,6 +75,7 @@ class Carla:
         self.bind("is_engine_running", [C.c_void_p], C.c_bool)
         self.bind("load_project", [C.c_void_p, C.c_char_p], C.c_bool)
         self.bind("get_current_plugin_count", [C.c_void_p], C.c_uint)
+        self.bind("get_plugin_info", [C.c_void_p, C.c_uint], C.POINTER(PluginInfo))
         self.bind("get_internal_parameter_value", [C.c_void_p, C.c_uint, C.c_int32], C.c_float)
         self.bind("get_last_error", [C.c_void_p], C.c_char_p)
         self.handle = self.lib.carla_standalone_host_init()
@@ -94,10 +102,19 @@ class Carla:
         self.check(self.lib.carla_engine_init(self.handle, b"JACK", CLIENT.encode()))
         self.started = True
         self.check(self.lib.carla_load_project(self.handle, os.fsencode(project)))
-        expected = len(ET.parse(project).getroot().findall("Plugin"))
+        plugins = ET.parse(project).getroot().findall("Plugin")
+        expected = len(plugins)
         if self.lib.carla_get_current_plugin_count(self.handle) != expected:
             raise RuntimeError("Carla did not load every plugin; refusing a partial microphone chain")
-        for index in range(expected):
+        for index, plugin in enumerate(plugins):
+            info = self.lib.carla_get_plugin_info(self.handle, index)
+            label = info.contents.label.decode(errors="replace") if info and info.contents.label else ""
+            expected_label = plugin.findtext("Info/Label", "")
+            if not expected_label or label != expected_label:
+                raise RuntimeError(f"plugin {index + 1} identity mismatch: expected {expected_label!r}, "
+                                   f"loaded {label!r}; this Carla version may not support that VST3 bundle")
+            if info.contents.hints & 0x004:
+                raise RuntimeError(f"plugin {index + 1} is an instrument, not a microphone effect")
             if self.lib.carla_get_internal_parameter_value(self.handle, index, -2) < 0.5:
                 raise RuntimeError(f"rack plugin {index + 1} is inactive; refusing an unprocessed microphone")
 
