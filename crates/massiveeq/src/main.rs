@@ -168,6 +168,17 @@ fn main() {
     app.run();
 }
 
+fn workspace_switcher() -> gtk::StackSwitcher {
+    let switcher = gtk::StackSwitcher::new();
+    switcher.add_css_class("workspace-switcher");
+    switcher.set_valign(gtk::Align::Center);
+    switcher.set_hexpand(false);
+    switcher.set_margin_start(4);
+    switcher.set_margin_end(4);
+    switcher.update_property(&[gtk::accessible::Property::Label("Audio workspace")]);
+    switcher
+}
+
 fn build_ui(app: &adw::Application) {
     if let Some(window) = app.active_window() {
         window.present();
@@ -273,6 +284,10 @@ fn build_ui(app: &adw::Application) {
     let brand = gtk::Label::new(Some("MASSIVE/EQ"));
     brand.add_css_class("brand");
     header.pack_start(&brand);
+    // Primary navigation comes before profile/history controls so it cannot
+    // be clipped behind the output selector when the header gets crowded.
+    let output_switcher = workspace_switcher();
+    header.pack_start(&output_switcher);
     // What plays where, and the engine's numbers, as one status strip.
     let header_status = gtk::Label::new(None);
     header_status.add_css_class("header-status");
@@ -321,6 +336,8 @@ fn build_ui(app: &adw::Application) {
     profile_menu_label.set_xalign(0.0);
     profile_menu_label.set_hexpand(true);
     profile_menu_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    profile_menu_label.set_max_width_chars(24);
+    profile_menu_label.connect_label_notify(|label| label.set_tooltip_text(Some(&label.text())));
     profile_menu.set_child(Some(&profile_menu_label));
     profile_menu.set_always_show_arrow(true);
     profile_menu.set_popover(Some(&profile_popover));
@@ -887,13 +904,10 @@ fn build_ui(app: &adw::Application) {
     workspaces.set_transition_type(gtk::StackTransitionType::Crossfade);
     workspaces.add_titled(&toolbar, Some("output"), "Output");
     workspaces.add_titled(&input_view.root, Some("input"), "Input");
-    for bar in [&header, &input_view.header] {
-        let switcher = gtk::StackSwitcher::new();
-        switcher.set_stack(Some(&workspaces));
-        switcher.set_valign(gtk::Align::Center);
-        switcher.update_property(&[gtk::accessible::Property::Label("Audio workspace")]);
-        bar.pack_start(&switcher);
-    }
+    output_switcher.set_stack(Some(&workspaces));
+    let input_switcher = workspace_switcher();
+    input_switcher.set_stack(Some(&workspaces));
+    input_view.header.pack_start(&input_switcher);
     workspaces.connect_visible_child_name_notify({
         let model = model.clone();
         move |stack| {
@@ -929,26 +943,31 @@ fn build_ui(app: &adw::Application) {
     narrow.add_setter(&history_box, "visible", Some(&false.to_value()));
     narrow.add_setter(&previous_profile, "visible", Some(&false.to_value()));
     narrow.add_setter(&next_profile, "visible", Some(&false.to_value()));
-    // The output picker moves from the crowded header to the footer.
-    narrow.connect_apply({
-        let header = header.clone();
-        let footer_start = footer_start.clone();
-        let device_drop = device_drop.clone();
-        move |_| {
-            header.remove(&device_drop);
-            footer_start.append(&device_drop);
-        }
-    });
-    narrow.connect_unapply({
-        let header = header.clone();
-        let footer_start = footer_start.clone();
-        let device_drop = device_drop.clone();
-        move |_| {
-            footer_start.remove(&device_drop);
-            // Packed last at the end, it returns to the left of Unassign.
-            header.pack_end(&device_drop);
-        }
-    });
+    // Move the output picker before either narrow header can crowd navigation.
+    for breakpoint in [&crowded, &narrow] {
+        breakpoint.connect_apply({
+            let header = header.clone();
+            let footer_start = footer_start.clone();
+            let device_drop = device_drop.clone();
+            move |_| {
+                if device_drop.is_ancestor(&header) {
+                    header.remove(&device_drop);
+                    footer_start.append(&device_drop);
+                }
+            }
+        });
+        breakpoint.connect_unapply({
+            let header = header.clone();
+            let footer_start = footer_start.clone();
+            let device_drop = device_drop.clone();
+            move |_| {
+                if device_drop.parent().as_ref() == Some(footer_start.upcast_ref()) {
+                    footer_start.remove(&device_drop);
+                    header.pack_end(&device_drop);
+                }
+            }
+        });
+    }
     window.add_breakpoint(crowded);
     window.add_breakpoint(narrow);
     profile_list.connect_row_activated({
@@ -5929,6 +5948,12 @@ fn install_css() {
             border-bottom: 1px solid #222225;
             box-shadow: none;
             min-height: 50px;
+        }
+
+        .workspace-switcher button {
+            min-width: 0;
+            padding-left: 12px;
+            padding-right: 12px;
         }
 
         .brand {
