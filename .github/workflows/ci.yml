@@ -20,7 +20,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed
           git clang rustup gtk4 libadwaita libsndfile libsamplerate
-          pipewire wireplumber dbus python
+          pipewire wireplumber dbus python xorg-server-xvfb xorg-xauth
 
       - name: Install Rust toolchain
         run: |
@@ -40,3 +40,9 @@ jobs:
 
       - name: Test microphone configuration and routing
         run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_microphone.py -v
+
+      - name: Test input profile switching during autosave
+        run: >-
+          dbus-run-session -- xvfb-run -a env GSK_RENDERER=cairo GDK_DEBUG=no-portals GIO_USE_VFS=local
+          timeout 30s cargo test -p massiveeq --release --locked
+          switching_input_profile_preserves -- --ignored

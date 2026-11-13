@@ -965,6 +965,7 @@ dependencies = [
  "massiveeq-core",
  "serde",
  "serde_json",
+ "tempfile",
  "zbus",
 ]
 

@@ -335,16 +335,30 @@ impl State {
             .iter()
             .map(|p| p.name.as_str())
             .collect::<Vec<_>>();
-        self.ui
-            .profiles
-            .set_model(Some(&gtk::StringList::new(&names)));
-        self.ui.profiles.set_selected(
-            library
+        let unchanged =
+            self.ui
                 .profiles
-                .iter()
-                .position(|p| p.id == library.active_profile)
-                .unwrap_or(0) as u32,
-        );
+                .model()
+                .and_downcast::<gtk::StringList>()
+                .is_some_and(|model| {
+                    model.n_items() as usize == names.len()
+                        && names.iter().enumerate().all(|(index, name)| {
+                            model.string(index as u32).as_deref() == Some(*name)
+                        })
+                });
+        if !unchanged {
+            self.ui
+                .profiles
+                .set_model(Some(&gtk::StringList::new(&names)));
+        }
+        let selected = library
+            .profiles
+            .iter()
+            .position(|p| p.id == library.active_profile)
+            .unwrap_or(0) as u32;
+        if self.ui.profiles.selected() != selected {
+            self.ui.profiles.set_selected(selected);
+        }
         self.ui.name.set_text(&library.active().name);
         self.ui
             .delete_profile
@@ -633,7 +647,10 @@ fn field(grid: &gtk::Grid, label: &str, widget: &impl IsA<gtk::Widget>, column: 
 }
 
 pub fn build(window: &adw::ApplicationWindow) -> InputView {
-    let path = InputLibrary::path();
+    build_at(window, InputLibrary::path())
+}
+
+fn build_at(window: &adw::ApplicationWindow, path: Result<PathBuf, String>) -> InputView {
     let loaded = path
         .as_ref()
         .map_err(Clone::clone)
@@ -1027,16 +1044,24 @@ fn wire(
             let Some(s) = s.upgrade() else {
                 return;
             };
-            if s.syncing.get() || !s.flush() {
+            if s.syncing.get() {
                 return;
             }
-            let id = s
-                .library
-                .borrow()
-                .profiles
-                .get(drop.selected() as usize)
-                .map(|p| p.id.clone());
+            // Capture the user's choice before saving: save() can refresh the
+            // picker. Ignore notifications that only reflect the active profile.
+            let id = {
+                let library = s.library.borrow();
+                library
+                    .profiles
+                    .get(drop.selected() as usize)
+                    .filter(|profile| profile.id != library.active_profile)
+                    .map(|profile| profile.id.clone())
+            };
             if let Some(id) = id {
+                if !s.flush() {
+                    s.profiles();
+                    return;
+                }
                 s.library.borrow_mut().active_profile = id;
                 s.history.borrow_mut().reset(s.snapshot());
                 s.select(None);
@@ -1601,4 +1626,46 @@ fn graph_input(state: &Rc<State>) {
         }
     });
     state.ui.graph.add_controller(keys);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a display; run with xvfb-run and --ignored"]
+    fn switching_input_profile_preserves_the_requested_selection_during_save() {
+        adw::init().expect("GTK display");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("input.json");
+        let app = adw::Application::new(
+            Some("org.massiveeq.InputRegression"),
+            gtk::gio::ApplicationFlags::NON_UNIQUE,
+        );
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let window = adw::ApplicationWindow::new(&app);
+        let view = build_at(&window, Ok(path.clone()));
+        let second = InputProfile {
+            name: "Second microphone".into(),
+            ..Default::default()
+        };
+        let second_id = second.id.clone();
+        view.state.library.borrow_mut().profiles.push(second);
+        view.state.profiles();
+        view.state.edit(|p| p.gate.threshold_db = -32.0);
+        assert!(view.state.dirty.get());
+        view.state.ui.profiles.set_selected(1);
+        let selected = view.state.library.borrow().active_profile.clone();
+        view.flush();
+        view.close();
+        window.close();
+        let saved = InputLibrary::load(&path).unwrap();
+
+        assert_eq!(
+            selected, second_id,
+            "flushing a pending edit must not reset the requested profile"
+        );
+        assert_eq!(saved.active_profile, second_id);
+        assert_eq!(saved.profiles[0].gate.threshold_db, -32.0);
+    }
 }

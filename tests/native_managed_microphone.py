@@ -42,6 +42,10 @@ def main():
         root = Path(temp)
         runtime = root / "runtime"
         runtime.mkdir(mode=0o700)
+        # Native plugins may initialize GIO. Keep their desktop services off
+        # the real user's bus and prevent a GVfs mount in this temporary root.
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + str(runtime / "unused-bus")
+        os.environ["GIO_USE_VFS"] = "local"
         os.environ.update(XDG_RUNTIME_DIR=str(runtime), PIPEWIRE_RUNTIME_DIR=str(runtime),
                           XDG_STATE_HOME=str(root / "state"), XDG_CONFIG_HOME=str(root / "config"),
                           CARLA_DONT_MANAGE_CONNECTIONS="1",
