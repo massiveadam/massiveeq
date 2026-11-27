@@ -350,15 +350,37 @@ impl FilterHost {
                 let average_nanos = if calls == 0 { 0.0 } else { total as f64 / calls as f64 };
                 let deadline_nanos = active.quantum as f64 * 1_000_000_000.0 / active.sample_rate as f64;
                 let cpu_percent = if deadline_nanos == 0.0 { 0.0 } else { average_nanos * 100.0 / deadline_nanos };
+                let block_frames = active
+                    .filter
+                    .stats
+                    .last_block_frames
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let ring_transit_nanos = active
+                    .filter
+                    .stats
+                    .ring_transit_nanos
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let buffer_latency_frames = added_buffer_latency_frames(
+                    block_frames,
+                    active.sample_rate,
+                    ring_transit_nanos,
+                );
+                let added_latency_frames = active.latency_frames.saturating_add(buffer_latency_frames);
+                let rate = active.sample_rate.max(1) as f64;
                 serde_json::json!({
                     "device": device,
                     "node": active.filter.node_name,
                     "sample_rate": active.sample_rate,
                     "quantum_capacity": active.quantum,
+                    "block_frames": (block_frames > 0).then_some(block_frames),
                     "latency_frames": scheduling_latency_frames,
-                    "latency_ms": scheduling_latency_frames as f64 * 1000.0 / active.sample_rate as f64,
+                    "latency_ms": scheduling_latency_frames as f64 * 1000.0 / rate,
                     "dsp_latency_frames": active.latency_frames,
-                    "dsp_latency_ms": active.latency_frames as f64 * 1000.0 / active.sample_rate as f64,
+                    "dsp_latency_ms": active.latency_frames as f64 * 1000.0 / rate,
+                    "buffer_latency_frames": buffer_latency_frames,
+                    "buffer_latency_ms": buffer_latency_frames as f64 * 1000.0 / rate,
+                    "added_latency_frames": added_latency_frames,
+                    "added_latency_ms": added_latency_frames as f64 * 1000.0 / rate,
                     "revision": active.revision,
                     "visible": active.visible,
                     "volume_in_dsp": active.volume_in_dsp,
@@ -380,6 +402,26 @@ impl FilterHost {
             "errors": self.errors,
         })
     }
+}
+
+/// Quantizes measured capture-to-playback ringbuffer transit into whole PipeWire
+/// cycles: same-cycle handoffs report 0, while cross-cycle buffering reports 1-2
+/// cycles and pause/suspend spikes are ignored.
+fn added_buffer_latency_frames(
+    block_frames: u32,
+    sample_rate: u32,
+    ring_transit_nanos: u64,
+) -> u32 {
+    if block_frames == 0 || sample_rate == 0 || ring_transit_nanos == 0 {
+        return 0;
+    }
+    let block_nanos = block_frames as f64 * 1_000_000_000.0 / sample_rate as f64;
+    let transit = ring_transit_nanos as f64;
+    if transit < block_nanos * 0.5 || transit > block_nanos * 2.5 {
+        return 0;
+    }
+    let cycles = (transit / block_nanos).round().clamp(1.0, 2.0) as u32;
+    block_frames.saturating_mul(cycles)
 }
 
 fn compile_reference(
@@ -1375,5 +1417,20 @@ mod tests {
                 .all(|pair| (pair[0] - pair[1]).abs() < 1e-9)
         );
         assert!(levels[0] <= -1.0);
+    }
+
+    #[test]
+    fn ringbuffer_transit_quantizes_same_cycle_and_cross_cycle_delays() {
+        // 1024 frames @ 48 kHz = 21.333 ms per cycle.
+        assert_eq!(added_buffer_latency_frames(1_024, 48_000, 0), 0);
+        // Same-cycle handoff (~0.3 ms) adds 0 frames.
+        assert_eq!(added_buffer_latency_frames(1_024, 48_000, 300_000), 0);
+        // Cross-cycle handoff (~21.3 ms) adds 1 cycle (1024 frames).
+        assert_eq!(
+            added_buffer_latency_frames(1_024, 48_000, 21_333_000),
+            1_024
+        );
+        // Pause/suspend spike (>2.5 cycles) is ignored.
+        assert_eq!(added_buffer_latency_frames(1_024, 48_000, 250_000_000), 0);
     }
 }

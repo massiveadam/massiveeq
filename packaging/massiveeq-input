@@ -102,6 +102,7 @@ def validate_managed_profile(profile):
 
 FILTER_TYPES = {"Peaking": 1, "HighPass": 2, "HighShelf": 3, "LowPass": 4, "LowShelf": 5}
 LSP_URI = "http://lsp-plug.in/plugins/lv2/"
+RNNOISE_LATENCY_MS = 10.0
 
 
 class NoMicrophone(ValueError):
@@ -151,7 +152,7 @@ def validate_sample_rate(profile, sample_rate):
         raise RuntimeError(f"an active microphone EQ band exceeds the {sample_rate / 2:g} Hz Nyquist limit; lower its frequency")
 
 
-def write_status(state, config=None, error=None):
+def write_status(state, config=None, error=None, latency=None):
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime:
         return
@@ -159,6 +160,8 @@ def write_status(state, config=None, error=None):
     value = {"state": state, "profile_id": config.get("profile_id", ""), "source": config.get("source", ""),
              "backend": "managed" if "managed" in config else "custom", "error": error,
              "pid": os.getpid(), "updated_at": time.time()}
+    if latency is not None:
+        value["latency"] = latency
     path = Path(runtime) / "massiveeq-input-status.json"
     temporary = path.with_suffix(f".{os.getpid()}.tmp")
     try:
@@ -221,6 +224,9 @@ class Carla:
         self.bind("get_parameter_ranges", [C.c_void_p, C.c_uint, C.c_uint], C.POINTER(ParameterRanges))
         self.bind("get_parameter_data", [C.c_void_p, C.c_uint, C.c_uint], C.POINTER(ParameterData))
         self.bind("set_parameter_value", [C.c_void_p, C.c_uint, C.c_uint, C.c_float], None)
+        self.bind_optional("get_buffer_size", [C.c_void_p], C.c_uint)
+        self.bind_optional("get_parameter_value", [C.c_void_p, C.c_uint, C.c_uint], C.c_float)
+        self.bind_optional("get_plugin_latency", [C.c_void_p, C.c_uint], C.c_uint)
         self.handle = self.lib.carla_standalone_host_init()
         if not self.handle:
             raise RuntimeError("could not create Carla host")
@@ -229,6 +235,11 @@ class Carla:
     def bind(self, name, args, result):
         func = getattr(self.lib, "carla_" + name)
         func.argtypes, func.restype = args, result
+
+    def bind_optional(self, name, args, result):
+        func = getattr(self.lib, "carla_" + name, None)
+        if func is not None:
+            func.argtypes, func.restype = args, result
 
     def check(self, success):
         if not success:
@@ -340,6 +351,73 @@ class Carla:
                 validate_sample_rate(self.managed_profile, rate)
                 self.managed_rate = rate
 
+    def plugin_latency_frames(self, plugin_id):
+        get_latency = getattr(self.lib, "carla_get_plugin_latency", None)
+        if get_latency is not None:
+            return max(0, int(get_latency(self.handle, plugin_id))), True
+        get_param_value = getattr(self.lib, "carla_get_parameter_value", None)
+        if get_param_value is None:
+            return 0, False
+        count = int(self.lib.carla_get_parameter_count(self.handle, plugin_id))
+        for index in range(count):
+            data = self.lib.carla_get_parameter_data(self.handle, plugin_id, index)
+            info = self.lib.carla_get_parameter_info(self.handle, plugin_id, index)
+            if not data or not info or data.contents.type != 2 or not info.contents.symbol:
+                continue
+            symbol = info.contents.symbol.decode(errors="replace")
+            if symbol in ("out_latency", "latency"):
+                value = float(get_param_value(self.handle, plugin_id, index))
+                return (max(0, int(round(value))) if math.isfinite(value) else 0), True
+        return 0, False
+
+    def latency_info(self, config, objects=None):
+        clock_rate, clock_quantum = graph_clock(objects) if objects else (None, None)
+        sample_rate = float(self.lib.carla_get_sample_rate(self.handle))
+        if not math.isfinite(sample_rate) or sample_rate <= 0:
+            sample_rate = float(clock_rate) if clock_rate else 0.0
+        get_buffer_size = getattr(self.lib, "carla_get_buffer_size", None)
+        buffer_frames = int(get_buffer_size(self.handle)) if get_buffer_size is not None else 0
+        if buffer_frames <= 0 and clock_quantum:
+            buffer_frames = int(clock_quantum)
+        plugin_count = int(self.lib.carla_get_current_plugin_count(self.handle))
+        rnnoise_id = getattr(self, "effects", {}).get("rnnoise", (None,))[0]
+        managed = "managed" in config
+        plugin_frames = 0
+        unreported_custom = False
+        for plugin_id in range(plugin_count):
+            frames, reported = self.plugin_latency_frames(plugin_id)
+            if managed and plugin_id == rnnoise_id and sample_rate > 0:
+                frames = max(frames, int(round(sample_rate * RNNOISE_LATENCY_MS / 1000.0)))
+                reported = True
+            if not managed and not reported:
+                unreported_custom = True
+            plugin_frames += frames
+        if (plugin_count == 0 and managed
+                and config["managed"].get("rnnoise", {}).get("enabled") and sample_rate > 0):
+            plugin_frames = int(round(sample_rate * RNNOISE_LATENCY_MS / 1000.0))
+        if sample_rate <= 0:
+            return {
+                "sample_rate": None,
+                "buffer_frames": buffer_frames or None,
+                "plugin_latency_frames": plugin_frames,
+                "plugin_latency_ms": None,
+                "routing_latency_ms": None,
+                "added_latency_ms": None,
+                "custom_plugins_unreported": unreported_custom,
+            }
+        plugin_ms = plugin_frames * 1000.0 / sample_rate
+        routing_ms = (buffer_frames * 1000.0 / sample_rate) if buffer_frames > 0 else None
+        added_ms = plugin_ms + (routing_ms or 0.0)
+        return {
+            "sample_rate": int(round(sample_rate)),
+            "buffer_frames": buffer_frames or None,
+            "plugin_latency_frames": plugin_frames,
+            "plugin_latency_ms": round(plugin_ms, 2),
+            "routing_latency_ms": round(routing_ms, 2) if routing_ms is not None else None,
+            "added_latency_ms": round(added_ms, 2),
+            "custom_plugins_unreported": unreported_custom,
+        }
+
     def close(self):
         if self.started:
             self.lib.carla_engine_close(self.handle)
@@ -348,6 +426,52 @@ class Carla:
 
 def graph():
     return json.loads(subprocess.check_output(["pw-dump"], timeout=5))
+
+
+def _positive_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+            return parsed if parsed > 0 else None
+        except ValueError:
+            return None
+    return None
+
+
+def graph_clock(objects):
+    settings = {}
+    for obj in objects or ():
+        if (obj.get("type") == "PipeWire:Interface:Metadata"
+                and obj.get("props", {}).get("metadata.name") == "settings"):
+            for entry in obj.get("metadata", []):
+                key = entry.get("key")
+                if isinstance(key, str):
+                    settings[key] = entry.get("value")
+    rate = _positive_int(settings.get("clock.force-rate")) or _positive_int(settings.get("clock.rate"))
+    quantum = _positive_int(settings.get("clock.force-quantum")) or _positive_int(settings.get("clock.quantum"))
+    return rate, quantum
+
+
+def metadata_clock():
+    try:
+        text = subprocess.check_output(["pw-metadata", "-n", "settings", "0"], timeout=2, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    values = {}
+    for line in text.splitlines():
+        for key in ("clock.force-rate", "clock.rate", "clock.force-quantum", "clock.quantum"):
+            marker = f"key:'{key}' value:'"
+            if marker in line:
+                raw = line.split(marker, 1)[1].split("'", 1)[0]
+                parsed = _positive_int(raw)
+                if parsed is not None:
+                    values[key] = parsed
+    return (values.get("clock.force-rate") or values.get("clock.rate"),
+            values.get("clock.force-quantum") or values.get("clock.quantum"))
 
 
 def node_ports(objects, name, direction):
@@ -457,6 +581,7 @@ def run(config, config_file=None):
         deadline = time.monotonic() + 10
         ready = False
         last_check = last_reload = 0.0
+        last_objects = None
         observed_config = config
         config_error = None
         while not stopping:
@@ -498,14 +623,16 @@ def run(config, config_file=None):
                         config = next_config
                         observed_config = next_config
                         if ready:
-                            write_status("running", config)
+                            write_status("running", config, latency=rack.latency_info(config, last_objects))
                     if config_error is not None:
                         config_error = None
-                        write_status("running" if ready else "starting", config)
+                        write_status("running" if ready else "starting", config,
+                                     latency=rack.latency_info(config, last_objects) if ready else None)
             if now - last_check >= 1:
                 last_check = now
                 try:
-                    reconcile(graph(), config)
+                    last_objects = graph()
+                    reconcile(last_objects, config)
                 except RuntimeError:
                     if ready or now >= deadline:
                         raise
@@ -514,7 +641,7 @@ def run(config, config_file=None):
                         print("MassiveEQ Microphone ready", flush=True)
                         ready = True
                     if config_error is None:
-                        write_status("running", config)
+                        write_status("running", config, latency=rack.latency_info(config, last_objects))
             time.sleep(0.02)
     except BaseException as error:
         failed = True
@@ -558,8 +685,10 @@ def doctor():
     for command, package in [("pw-jack", "pipewire-jack"), ("pw-loopback", "pipewire"), ("pw-link", "pipewire")]:
         if shutil.which(command) is None and package not in missing:
             missing.append(package)
+    clock_rate, clock_quantum = metadata_clock()
     return {"available": not missing, "missing": missing,
-            "rnnoise_available": Path("/usr/lib/vst3/rnnoise.vst3").exists()}
+            "rnnoise_available": Path("/usr/lib/vst3/rnnoise.vst3").exists(),
+            "clock_rate": clock_rate, "clock_quantum": clock_quantum}
 
 
 def main():

@@ -290,7 +290,8 @@ pub fn compile_profile(
             convolutions.push(ConvolutionKernel {
                 sample_rate: options.sample_rate,
                 impulse: design.impulse,
-                latency_frames: options.quantum + design.latency_frames,
+                // TwoStageFFTConvolver uses zero-latency partitioned overlap-add.
+                latency_frames: design.latency_frames,
             });
         }
         for (convolution, ir, _) in impulses.iter().filter(|(convolution, _, layout)| {
@@ -411,7 +412,9 @@ fn kernel(impulse: Vec<f32>, options: &CompileOptions) -> ConvolutionKernel {
     ConvolutionKernel {
         sample_rate: options.sample_rate,
         impulse,
-        latency_frames: options.quantum + inherent_latency,
+        // Partitioned FFT convolution adds zero block latency; only the IR's
+        // own peak delay shifts the signal.
+        latency_frames: inherent_latency,
     }
 }
 
@@ -897,5 +900,28 @@ mod tests {
         assert!(compiled.channels[0].convolutions[0].impulse[0] > 0.8);
         assert!(compiled.channels[1].convolutions[0].impulse[0] > 0.4);
         assert_eq!(compiled.channels[0].convolutions[0].sample_rate, 48_000);
+    }
+
+    #[test]
+    fn convolution_latency_matches_measured_impulse_peak() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("assets")).unwrap();
+        // Minimum-phase GraphicEQ uses zero-latency partitioned convolution.
+        let graphic = parse_text("graphic", "GraphicEQ: 20 0; 1000 3; 20000 0");
+        let compiled_graphic =
+            compile_profile(&graphic, &CompileOptions::stereo(48_000, 128, temp.path())).unwrap();
+        assert_eq!(compiled_graphic.latency_frames, 0);
+
+        // An IR whose peak is delayed by 37 samples shifts the impulse by 37 samples,
+        // without adding an extra quantum of latency.
+        let mut ir = vec![0.0_f32; 64];
+        ir[37] = 1.0;
+        write_float_wav(&temp.path().join("assets/delayed.wav"), 48_000, 1, &ir);
+        let delayed = parse_text("delayed", "Convolution: assets/delayed.wav");
+        let compiled_delayed =
+            compile_profile(&delayed, &CompileOptions::stereo(48_000, 128, temp.path())).unwrap();
+        assert_eq!(compiled_delayed.latency_frames, 37);
+        let (measured_peak, _) = tap(&impulse_response(&compiled_delayed, 0)[0]).unwrap();
+        assert_eq!(measured_peak, 37);
     }
 }

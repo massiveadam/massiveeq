@@ -249,6 +249,70 @@ class MicrophoneTests(unittest.TestCase):
         host.apply_managed(profile)
         self.assertEqual(host.set_controls.call_args_list[-1].args[1]["ft_0"], 0)
 
+    def test_graph_clock_reads_forced_or_default_rate_and_quantum(self):
+        objects = [
+            {"type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "settings"},
+             "metadata": [
+                 {"key": "clock.rate", "value": 48000},
+                 {"key": "clock.quantum", "value": 1024},
+                 {"key": "clock.force-quantum", "value": 0},
+             ]}
+        ]
+        self.assertEqual(mic.graph_clock(objects), (48000, 1024))
+        objects[0]["metadata"][2]["value"] = 256
+        self.assertEqual(mic.graph_clock(objects), (48000, 256))
+
+    def test_latency_info_accounts_for_rnnoise_lv2_latency_and_custom_racks(self):
+        host = mic.Carla.__new__(mic.Carla)
+        host.handle = 1
+        host.lib = Mock(spec=[
+            "carla_get_sample_rate", "carla_get_buffer_size",
+            "carla_get_current_plugin_count", "carla_get_parameter_count",
+            "carla_get_parameter_data", "carla_get_parameter_info",
+            "carla_get_parameter_value",
+        ])
+        host.lib.carla_get_sample_rate.return_value = 48000.0
+        host.lib.carla_get_buffer_size.return_value = 1024
+        host.lib.carla_get_current_plugin_count.return_value = 4
+        host.lib.carla_get_parameter_count.return_value = 0
+        host.effects = {"rnnoise": (0, {}), "gate": (1, {}), "compressor": (2, {}), "eq": (3, {})}
+        profile = mic.validate_managed_profile(self.managed_profile() | {"rnnoise": {"enabled": True}})
+        info = host.latency_info({"managed": profile})
+        self.assertEqual(info["sample_rate"], 48000)
+        self.assertEqual(info["buffer_frames"], 1024)
+        self.assertEqual(info["plugin_latency_frames"], 480)
+        self.assertEqual(info["plugin_latency_ms"], 10.0)
+        self.assertAlmostEqual(info["routing_latency_ms"], 21.33, places=2)
+        self.assertAlmostEqual(info["added_latency_ms"], 31.33, places=2)
+        self.assertFalse(info["custom_plugins_unreported"])
+
+        # Without RNNoise, only routing buffer latency applies unless LV2 reports latency.
+        host.effects = {"gate": (0, {}), "compressor": (1, {}), "eq": (2, {})}
+        host.lib.carla_get_current_plugin_count.return_value = 3
+        plain = mic.validate_managed_profile(self.managed_profile())
+        info_plain = host.latency_info({"managed": plain})
+        self.assertEqual(info_plain["plugin_latency_frames"], 0)
+        self.assertAlmostEqual(info_plain["added_latency_ms"], 21.33, places=2)
+
+        # LV2 out_latency output parameter is read when present.
+        out_data = mic.ParameterData(type=2, hints=0, index=0, rindex=0)
+        out_info = mic.ParameterInfo(name=b"Latency", symbol=b"out_latency", unit=b"")
+        host.lib.carla_get_current_plugin_count.return_value = 1
+        host.lib.carla_get_parameter_count.return_value = 1
+        host.lib.carla_get_parameter_data.return_value = mic.C.pointer(out_data)
+        host.lib.carla_get_parameter_info.return_value = mic.C.pointer(out_info)
+        host.lib.carla_get_parameter_value.return_value = 96.0
+        info_lv2 = host.latency_info({"project": "/tmp/custom.carxp"})
+        self.assertEqual(info_lv2["plugin_latency_frames"], 96)
+        self.assertAlmostEqual(info_lv2["plugin_latency_ms"], 2.0, places=2)
+        self.assertFalse(info_lv2["custom_plugins_unreported"])
+
+        # Custom rack plugin without out_latency flags custom_plugins_unreported.
+        host.lib.carla_get_parameter_count.return_value = 0
+        info_custom = host.latency_info({"project": "/tmp/custom.carxp"})
+        self.assertTrue(info_custom["custom_plugins_unreported"])
+        self.assertAlmostEqual(info_custom["added_latency_ms"], 21.33, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

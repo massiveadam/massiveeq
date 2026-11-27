@@ -626,11 +626,23 @@ fn build_ui(app: &adw::Application) {
     analysis_label.add_css_class("readouts");
     analysis_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     analysis_label.set_halign(gtk::Align::End);
-    analysis_label.set_valign(gtk::Align::Start);
-    analysis_label.set_margin_end(30);
-    analysis_label.set_margin_top(34);
-    analysis_label.set_can_target(false);
-    graph_overlay.add_overlay(&analysis_label);
+    let compact_latency = gtk::Label::new(None);
+    compact_latency.add_css_class("readouts");
+    compact_latency.set_halign(gtk::Align::End);
+    compact_latency.set_visible(false);
+    let compact_latency_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    compact_latency_slot.set_halign(gtk::Align::End);
+    compact_latency_slot.set_visible(false);
+    compact_latency_slot.append(&compact_latency);
+    let readouts_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    readouts_box.set_halign(gtk::Align::End);
+    readouts_box.set_valign(gtk::Align::Start);
+    readouts_box.set_margin_end(30);
+    readouts_box.set_margin_top(34);
+    readouts_box.set_can_target(false);
+    readouts_box.append(&analysis_label);
+    readouts_box.append(&compact_latency_slot);
+    graph_overlay.add_overlay(&readouts_box);
     let status = gtk::Label::new(Some("Ready"));
     status.set_xalign(0.0);
     status.set_wrap(true);
@@ -659,7 +671,8 @@ fn build_ui(app: &adw::Application) {
     notes.append(&curve_context);
     graph_overlay.add_overlay(&notes);
     header_status.set_markup(&header_markup(&engine_status, &model));
-    header_status.set_tooltip_text(Some(&engine_tooltip(&engine_status)));
+    header_status.set_tooltip_text(Some(&engine_tooltip_for(&engine_status, &model)));
+    update_compact_output_latency(&compact_latency, &engine_status, &model);
 
     let output = knob::LabeledKnob::new(
         knob::Knob::new(-24.0, 24.0, 0.0, knob::Taper::Linear, true),
@@ -933,6 +946,7 @@ fn build_ui(app: &adw::Application) {
     ));
     for breakpoint in [&crowded, &narrow] {
         breakpoint.add_setter(&header_status, "visible", Some(&false.to_value()));
+        breakpoint.add_setter(&compact_latency_slot, "visible", Some(&true.to_value()));
     }
     narrow.add_setter(
         &footer,
@@ -1210,6 +1224,7 @@ fn build_ui(app: &adw::Application) {
         let bypass = device_bypass.clone();
         let engine = global_bypass.clone();
         let engine_readout = header_status.clone();
+        let compact_latency = compact_latency.clone();
         let comparison_ui = comparison_ui.clone();
         let profile_list = profile_list.clone();
         let volume_ui = volume_ui.clone();
@@ -1222,6 +1237,7 @@ fn build_ui(app: &adw::Application) {
                 Err(error) => {
                     engine_readout.set_text("Audio service unavailable");
                     engine_readout.set_tooltip_text(Some(&error));
+                    compact_latency.set_visible(false);
                     engine.set_sensitive(false);
                     return gtk::glib::ControlFlow::Continue;
                 }
@@ -1284,18 +1300,21 @@ fn build_ui(app: &adw::Application) {
                 .get("global_bypass")
                 .and_then(serde_json::Value::as_bool)
             {
+                let engine_changed = model.engine_off.replace(engine_off) != engine_off;
                 engine_readout.set_markup(&header_markup(&service_status, &model));
-                engine_readout.set_tooltip_text(Some(&engine_tooltip(&service_status)));
+                engine_readout.set_tooltip_text(Some(&engine_tooltip_for(&service_status, &model)));
+                update_compact_output_latency(&compact_latency, &service_status, &model);
                 engine.set_sensitive(true);
                 model.syncing_engine.set(true);
                 engine.set_active(!engine_off);
                 model.syncing_engine.set(false);
-                if model.engine_off.replace(engine_off) != engine_off {
+                if engine_changed {
                     update_live_indicators(&model);
                 }
             } else {
                 engine_readout
                     .set_markup("<span foreground='#ff7a1a'>AUDIO SERVICE UNAVAILABLE</span>");
+                compact_latency.set_visible(false);
                 engine.set_sensitive(false);
             }
             gtk::glib::ControlFlow::Continue
@@ -5867,8 +5886,162 @@ fn source_rate(status: &serde_json::Value) -> Option<SourceRate> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct OutputLatency {
+    added_ms: f64,
+    dsp_frames: u64,
+    dsp_ms: f64,
+    buffer_frames: u64,
+    buffer_ms: f64,
+    sample_rate: f64,
+    cycle_frames: Option<u64>,
+    process_average_us: Option<f64>,
+}
+
+pub(crate) fn format_rough_latency_ms(ms: f64, plus_unknown: bool) -> String {
+    let suffix = if plus_unknown { "+" } else { "" };
+    if !ms.is_finite() || ms < 0.05 {
+        format!("~0 ms{suffix}")
+    } else if ms < 1.0 {
+        format!("<1 ms{suffix}")
+    } else if ms < 10.0 {
+        format!("~{ms:.1} ms{suffix}")
+    } else {
+        format!("~{ms:.0} ms{suffix}")
+    }
+}
+
+fn default_device_key(model: &Model) -> Option<String> {
+    model
+        .devices
+        .borrow()
+        .iter()
+        .find(|device| device.connected && device.is_default)
+        .map(|device| device.key.as_storage_key())
+}
+
+fn active_output_engine<'a>(
+    status: &'a serde_json::Value,
+    default_key: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    let active = status.pointer("/engine/active")?.as_array()?;
+    match default_key {
+        Some(key) => active
+            .iter()
+            .find(|entry| entry.get("device").and_then(serde_json::Value::as_str) == Some(key)),
+        None => active.first(),
+    }
+}
+
+fn output_dsp_latency(
+    status: &serde_json::Value,
+    default_key: Option<&str>,
+) -> Option<OutputLatency> {
+    let active = active_output_engine(status, default_key)?;
+    let number = |key: &str| active.get(key).and_then(serde_json::Value::as_f64);
+    let sample_rate = number("sample_rate").filter(|rate| rate.is_finite() && *rate > 0.0)?;
+    let dsp_frames = active
+        .get("dsp_latency_frames")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let dsp_ms = number("dsp_latency_ms")
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(dsp_frames as f64 * 1000.0 / sample_rate);
+    let buffer_frames = active
+        .get("buffer_latency_frames")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let buffer_ms = number("buffer_latency_ms")
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(buffer_frames as f64 * 1000.0 / sample_rate);
+    let added_ms = number("added_latency_ms")
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(dsp_ms + buffer_ms);
+    let cycle_frames = active
+        .get("block_frames")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|frames| *frames > 0)
+        .or_else(|| {
+            status
+                .pointer("/graph/quantum")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|frames| *frames > 0)
+        });
+    let process_average_us =
+        number("process_average_us").filter(|value| value.is_finite() && *value > 0.0);
+    Some(OutputLatency {
+        added_ms,
+        dsp_frames,
+        dsp_ms,
+        buffer_frames,
+        buffer_ms,
+        sample_rate,
+        cycle_frames,
+        process_average_us,
+    })
+}
+
+fn output_latency_tooltip(latency: &OutputLatency) -> String {
+    let rough = format_rough_latency_ms(latency.added_ms, false);
+    let mut details = Vec::new();
+    if latency.dsp_frames == 0 {
+        details.push("zero-latency EQ/limiter".to_owned());
+    } else {
+        details.push(format!(
+            "{:.1} ms ({} frames) convolution delay",
+            latency.dsp_ms, latency.dsp_frames
+        ));
+    }
+    if latency.buffer_frames > 0 {
+        details.push(format!(
+            "+{:.1} ms ({} frames) filter buffer",
+            latency.buffer_ms, latency.buffer_frames
+        ));
+    }
+    if let Some(cycle_frames) = latency.cycle_frames {
+        let cycle_ms = cycle_frames as f64 * 1000.0 / latency.sample_rate;
+        details.push(format!(
+            "PipeWire cycle {:.1} ms ({} frames at {:.1} kHz)",
+            cycle_ms,
+            cycle_frames,
+            latency.sample_rate / 1000.0
+        ));
+    }
+    if let Some(us) = latency.process_average_us {
+        details.push(format!("DSP CPU {:.2} ms avg", us / 1000.0));
+    }
+    format!(
+        "Output DSP adds roughly {rough} ({}).\n\n",
+        details.join("; ")
+    )
+}
+
+fn engine_tooltip_for(status: &serde_json::Value, model: &Model) -> String {
+    let default_key = default_device_key(model);
+    let latency = (!model.engine_off.get())
+        .then(|| output_dsp_latency(status, default_key.as_deref()))
+        .flatten();
+    engine_tooltip_with_latency(status, latency.as_ref())
+}
+
+#[cfg(test)]
 fn engine_tooltip(status: &serde_json::Value) -> String {
+    let engine_off = status
+        .get("global_bypass")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let latency = (!engine_off)
+        .then(|| output_dsp_latency(status, None))
+        .flatten();
+    engine_tooltip_with_latency(status, latency.as_ref())
+}
+
+fn engine_tooltip_with_latency(
+    status: &serde_json::Value,
+    latency: Option<&OutputLatency>,
+) -> String {
     let khz = |rate: u32| format!("{} kHz", rate as f64 / 1000.0);
+    let latency_note = latency.map(output_latency_tooltip).unwrap_or_default();
     let rate = match source_rate(status) {
         Some(SourceRate::Native) => {
             "Playing audio reaches MassiveEQ at its own sample rate, with no resampling.\n\n"
@@ -5911,7 +6084,7 @@ fn engine_tooltip(status: &serde_json::Value) -> String {
         None => String::new(),
     };
     format!(
-        "{rate}Double-click the graph to add a band, drag points to edit, or use arrows on the selected point"
+        "{latency_note}{rate}Double-click the graph to add a band, drag points to edit, or use arrows on the selected point"
     )
 }
 
@@ -6759,15 +6932,17 @@ fn set_analysis_label(label: &gtk::Label, analysis: &ProfileAnalysis) {
 }
 
 /// The header's status strip: what plays on the system output, then the
-/// engine's rate, latency, and load.
+/// engine's rate and rough added DSP latency.
 fn header_markup(status: &serde_json::Value, model: &Model) -> String {
     let escape = |text: &str| gtk::glib::markup_escape_text(text).to_string();
     let accent = |text: &str| format!("<span foreground='{ACCENT}'>{}</span>", escape(text));
     let devices = model.devices.borrow();
     let comparisons = model.comparisons.borrow();
-    let route = devices
+    let default_device = devices
         .iter()
-        .find(|device| device.connected && device.is_default)
+        .find(|device| device.connected && device.is_default);
+    let default_key = default_device.map(|device| device.key.as_storage_key());
+    let route = default_device
         .map(|device| {
             let profile = (!model.engine_off.get())
                 .then(|| device.playing_profile_id(&comparisons))
@@ -6791,13 +6966,19 @@ fn header_markup(status: &serde_json::Value, model: &Model) -> String {
         })
         .unwrap_or_else(|| "NO OUTPUT".to_owned());
     let mut parts = vec![route];
-    if let Some(active) = status.pointer("/engine/active/0") {
+    if model.engine_off.get() {
+        parts.push("ENGINE OFF".to_owned());
+    } else if let Some(active) = active_output_engine(status, default_key.as_deref()) {
         let number = |key: &str| active.get(key).and_then(serde_json::Value::as_f64);
         if let Some(rate) = number("sample_rate") {
             parts.push(format!("{} kHz", accent(&format!("{:.1}", rate / 1000.0))));
         }
-    } else if model.engine_off.get() {
-        parts.push("ENGINE OFF".to_owned());
+        if let Some(latency) = output_dsp_latency(status, default_key.as_deref()) {
+            parts.push(format!(
+                "DSP {}",
+                accent(&format_rough_latency_ms(latency.added_ms, false))
+            ));
+        }
     }
     if let Some(SourceRate::Resampled { source, .. }) = source_rate(status) {
         parts.push(format!(
@@ -6806,6 +6987,23 @@ fn header_markup(status: &serde_json::Value, model: &Model) -> String {
         ));
     }
     parts.join("  <span foreground='#3a3a3e'>│</span>  ")
+}
+
+fn update_compact_output_latency(label: &gtk::Label, status: &serde_json::Value, model: &Model) {
+    if model.engine_off.get() {
+        label.set_visible(false);
+        return;
+    }
+    let default_key = default_device_key(model);
+    let Some(latency) = output_dsp_latency(status, default_key.as_deref()) else {
+        label.set_visible(false);
+        return;
+    };
+    let rough = gtk::glib::markup_escape_text(&format_rough_latency_ms(latency.added_ms, false));
+    label.set_markup(&format!(
+        "OUT DSP <span foreground='{ACCENT}'>{rough}</span>"
+    ));
+    label.set_visible(true);
 }
 
 fn refresh_profiles(model: &Rc<Model>, list: &gtk::ListBox) {
@@ -7162,5 +7360,63 @@ mod tests {
         assert!(!can_add_filter(&document, ChannelSelection::All));
         assert!(!can_add_filter(&document, ChannelSelection::Left));
         assert!(can_add_filter(&document, ChannelSelection::Right));
+    }
+
+    #[test]
+    fn rough_latency_formatting_covers_zero_sub_ms_and_large_delays() {
+        assert_eq!(super::format_rough_latency_ms(0.0, false), "~0 ms");
+        assert_eq!(super::format_rough_latency_ms(0.4, false), "<1 ms");
+        assert_eq!(super::format_rough_latency_ms(4.24, false), "~4.2 ms");
+        assert_eq!(super::format_rough_latency_ms(21.33, false), "~21 ms");
+        assert_eq!(super::format_rough_latency_ms(21.33, true), "~21 ms+");
+    }
+
+    #[test]
+    fn output_latency_matches_default_device_and_explains_convolution_delay() {
+        let status = serde_json::json!({
+            "global_bypass": false,
+            "graph": { "rate": 48_000, "quantum": 1_024 },
+            "engine": {
+                "active": [
+                    {
+                        "device": "alsa|speakers|playback",
+                        "sample_rate": 48_000,
+                        "dsp_latency_frames": 0,
+                        "dsp_latency_ms": 0.0,
+                        "buffer_latency_frames": 0,
+                        "buffer_latency_ms": 0.0,
+                        "added_latency_ms": 0.0,
+                        "process_average_us": 120.0
+                    },
+                    {
+                        "device": "alsa|headphones|playback",
+                        "sample_rate": 48_000,
+                        "block_frames": 512,
+                        "dsp_latency_frames": 1_024,
+                        "dsp_latency_ms": 21.333,
+                        "buffer_latency_frames": 0,
+                        "buffer_latency_ms": 0.0,
+                        "added_latency_ms": 21.333,
+                        "process_average_us": 450.0
+                    }
+                ]
+            }
+        });
+        let speakers = super::output_dsp_latency(&status, Some("alsa|speakers|playback")).unwrap();
+        assert_eq!(speakers.added_ms, 0.0);
+        assert_eq!(speakers.cycle_frames, Some(1_024));
+        assert!(super::output_latency_tooltip(&speakers).contains("roughly ~0 ms"));
+        assert!(super::output_latency_tooltip(&speakers).contains("zero-latency EQ/limiter"));
+
+        let headphones =
+            super::output_dsp_latency(&status, Some("alsa|headphones|playback")).unwrap();
+        assert!((headphones.added_ms - 21.333).abs() < 1e-6);
+        assert_eq!(headphones.cycle_frames, Some(512));
+        assert!(super::output_latency_tooltip(&headphones).contains("roughly ~21 ms"));
+        assert!(super::output_latency_tooltip(&headphones).contains("1024 frames"));
+
+        // Direct/unassigned default output does not inherit another device's latency.
+        assert!(super::output_dsp_latency(&status, Some("alsa|hdmi|playback")).is_none());
+        assert!(engine_tooltip(&status).contains("Output DSP adds roughly ~0 ms"));
     }
 }

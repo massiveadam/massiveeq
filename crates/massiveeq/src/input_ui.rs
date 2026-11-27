@@ -17,6 +17,7 @@ use std::{
 };
 
 const INSTALL_COMMAND: &str = "sudo pacman -S --needed carla pipewire-jack python lsp-plugins-lv2 noise-suppression-for-voice";
+const RNNOISE_LATENCY_MS: f64 = 10.0;
 const KINDS: [FilterKind; 5] = [
     FilterKind::Peaking,
     FilterKind::LowShelf,
@@ -43,7 +44,28 @@ enum Reply {
     Action(Result<(), String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceStatus {
+    Off,
+    Running,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct InputLatency {
+    live: bool,
+    sample_rate: Option<u32>,
+    buffer_frames: Option<u32>,
+    plugin_ms: f64,
+    routing_ms: Option<f64>,
+    added_ms: Option<f64>,
+    plus_unknown: bool,
+    rnnoise_enabled: bool,
+    custom_rack: bool,
+}
+
 struct Widgets {
+    header_status: gtk::Label,
     profiles: gtk::DropDown,
     name: gtk::Entry,
     sources: gtk::DropDown,
@@ -103,6 +125,10 @@ struct State {
     poll_busy: Cell<bool>,
     action_busy: Cell<bool>,
     last_poll: Cell<Instant>,
+    clock_rate: Cell<Option<u32>>,
+    clock_quantum: Cell<Option<u32>>,
+    service_status: Cell<ServiceStatus>,
+    runtime_latency: RefCell<Option<InputLatency>>,
     ui: Widgets,
 }
 
@@ -309,6 +335,59 @@ impl State {
         self.ui.undo.set_sensitive(self.history.borrow().can_undo());
         self.ui.redo.set_sensitive(self.history.borrow().can_redo());
         self.syncing.set(false);
+        self.update_latency();
+    }
+
+    fn current_latency(&self) -> InputLatency {
+        let library = self.library.borrow();
+        let profile = library.active();
+        if self.service_status.get() == ServiceStatus::Running
+            && let Some(runtime) = self.runtime_latency.borrow().clone()
+        {
+            if runtime.rnnoise_enabled == profile.rnnoise.enabled
+                && runtime.custom_rack == profile.advanced_project.is_some()
+            {
+                return runtime;
+            }
+            let mut estimated = estimate_input_latency(
+                profile,
+                runtime.sample_rate.or_else(|| self.clock_rate.get()),
+                runtime.buffer_frames.or_else(|| self.clock_quantum.get()),
+            );
+            estimated.live = true;
+            return estimated;
+        }
+        estimate_input_latency(profile, self.clock_rate.get(), self.clock_quantum.get())
+    }
+
+    fn update_latency(&self) {
+        let latency = self.current_latency();
+        let tooltip = input_latency_tooltip(&latency);
+        self.ui
+            .header_status
+            .set_markup(&input_header_markup(&latency));
+        self.ui.header_status.set_tooltip_text(Some(&tooltip));
+        if self.load_error.is_some() || self.action_busy.get() {
+            return;
+        }
+        let summary = input_latency_summary(&latency);
+        match self.service_status.get() {
+            ServiceStatus::Running => {
+                self.ui.status.set_text(&format!(
+                    "Input on · DSP {summary} · select MassiveEQ Microphone in your calling or recording app"
+                ));
+                self.ui.status.set_tooltip_text(Some(&tooltip));
+            }
+            ServiceStatus::Off => {
+                self.ui.status.set_text(&format!(
+                    "Input off · est. DSP {summary} · playback processing is independent"
+                ));
+                self.ui.status.set_tooltip_text(Some(&tooltip));
+            }
+            ServiceStatus::Other => {
+                self.ui.status.set_tooltip_text(None);
+            }
+        }
     }
 
     fn select(self: &Rc<Self>, index: Option<usize>) {
@@ -553,15 +632,34 @@ impl State {
                         format!("Install microphone support: {packages}")
                     };
                     self.ui.dependency_label.set_text(&text);
+                    if let Some(rate) = doctor
+                        .get("clock_rate")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|v| u32::try_from(v).ok())
+                        .filter(|v| *v > 0)
+                    {
+                        self.clock_rate.set(Some(rate));
+                    }
+                    if let Some(quantum) = doctor
+                        .get("clock_quantum")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|v| u32::try_from(v).ok())
+                        .filter(|v| *v > 0)
+                    {
+                        self.clock_quantum.set(Some(quantum));
+                    }
+                    self.update_latency();
                 }
                 Reply::Sources(Ok(sources)) => {
                     *self.sources.borrow_mut() = sources;
                     self.source_list();
                 }
-                Reply::Sources(Err(error)) => self
-                    .ui
-                    .status
-                    .set_text(&format!("Could not list microphones: {error}")),
+                Reply::Sources(Err(error)) => {
+                    self.service_status.set(ServiceStatus::Other);
+                    self.ui
+                        .status
+                        .set_text(&format!("Could not list microphones: {error}"));
+                }
                 Reply::Action(result) => {
                     self.action_busy.set(false);
                     self.ui.engine.set_sensitive(true);
@@ -595,17 +693,34 @@ impl State {
                     let current =
                         runtime.get("pid").and_then(|v| v.as_u64()) == Some(pid as u64) && pid != 0;
                     if active && current && state == Some("running") {
-                        self.ui.status.set_text("Input on · select MassiveEQ Microphone in your calling or recording app");
+                        self.service_status.set(ServiceStatus::Running);
+                        let parsed = {
+                            let library = self.library.borrow();
+                            parse_runtime_latency(
+                                &runtime,
+                                library.active(),
+                                self.clock_rate.get(),
+                                self.clock_quantum.get(),
+                            )
+                        };
+                        *self.runtime_latency.borrow_mut() = parsed;
+                        self.update_latency();
                     } else if let Some(error) = error {
+                        self.service_status.set(ServiceStatus::Other);
+                        *self.runtime_latency.borrow_mut() = None;
                         self.ui
                             .status
                             .set_text(&format!("Input needs attention: {error}"));
+                        self.update_latency();
                     } else if active {
+                        self.service_status.set(ServiceStatus::Other);
+                        *self.runtime_latency.borrow_mut() = None;
                         self.ui.status.set_text("Starting microphone processing…");
+                        self.update_latency();
                     } else {
-                        self.ui
-                            .status
-                            .set_text("Input off · playback processing is independent");
+                        self.service_status.set(ServiceStatus::Off);
+                        *self.runtime_latency.borrow_mut() = None;
+                        self.update_latency();
                     }
                 }
             }
@@ -613,6 +728,166 @@ impl State {
         if self.last_poll.get().elapsed() >= Duration::from_secs(2) {
             self.poll();
         }
+    }
+}
+
+fn parse_runtime_latency(
+    runtime: &serde_json::Value,
+    profile: &InputProfile,
+    fallback_rate: Option<u32>,
+    fallback_quantum: Option<u32>,
+) -> Option<InputLatency> {
+    let custom_rack = runtime.get("backend").and_then(|v| v.as_str()) == Some("custom");
+    let Some(latency) = runtime.get("latency").and_then(|v| v.as_object()) else {
+        let mut estimated = estimate_input_latency(profile, fallback_rate, fallback_quantum);
+        estimated.live = true;
+        estimated.custom_rack = custom_rack;
+        estimated.plus_unknown |= custom_rack;
+        return Some(estimated);
+    };
+    let u32_field = |key: &str| {
+        latency
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v > 0)
+    };
+    let f64_field = |key: &str| {
+        latency
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+    let sample_rate = u32_field("sample_rate").or(fallback_rate);
+    let buffer_frames = u32_field("buffer_frames").or(fallback_quantum);
+    let plugin_ms = f64_field("plugin_latency_ms").unwrap_or(0.0);
+    let routing_ms = f64_field("routing_latency_ms")
+        .or_else(|| Some(buffer_frames? as f64 * 1000.0 / sample_rate? as f64));
+    let added_ms = f64_field("added_latency_ms").or_else(|| routing_ms.map(|r| plugin_ms + r));
+    let plus_unknown = latency
+        .get("custom_plugins_unreported")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(custom_rack);
+    let rnnoise_enabled = !custom_rack && profile.rnnoise.enabled;
+    Some(InputLatency {
+        live: true,
+        sample_rate,
+        buffer_frames,
+        plugin_ms,
+        routing_ms,
+        added_ms,
+        plus_unknown,
+        rnnoise_enabled,
+        custom_rack,
+    })
+}
+
+fn estimate_input_latency(
+    profile: &InputProfile,
+    clock_rate: Option<u32>,
+    clock_quantum: Option<u32>,
+) -> InputLatency {
+    let custom_rack = profile.advanced_project.is_some();
+    let rnnoise_enabled = !custom_rack && profile.rnnoise.enabled;
+    let plugin_ms = if rnnoise_enabled {
+        RNNOISE_LATENCY_MS
+    } else {
+        0.0
+    };
+    let routing_ms = match (clock_rate, clock_quantum) {
+        (Some(rate), Some(quantum)) if rate > 0 && quantum > 0 => {
+            Some(quantum as f64 * 1000.0 / rate as f64)
+        }
+        _ => None,
+    };
+    let added_ms = routing_ms.map(|routing| plugin_ms + routing);
+    InputLatency {
+        live: false,
+        sample_rate: clock_rate,
+        buffer_frames: clock_quantum,
+        plugin_ms,
+        routing_ms,
+        added_ms,
+        plus_unknown: custom_rack,
+        rnnoise_enabled,
+        custom_rack,
+    }
+}
+
+fn input_latency_summary(latency: &InputLatency) -> String {
+    if let Some(added_ms) = latency.added_ms {
+        crate::format_rough_latency_ms(added_ms, latency.plus_unknown)
+    } else if latency.custom_rack {
+        "custom".to_owned()
+    } else if latency.plugin_ms >= 0.5 {
+        format!(
+            "{} + buffer",
+            crate::format_rough_latency_ms(latency.plugin_ms, false)
+        )
+    } else {
+        "~1 buffer".to_owned()
+    }
+}
+
+fn input_header_markup(latency: &InputLatency) -> String {
+    let escape = |text: &str| gtk::glib::markup_escape_text(text).to_string();
+    let accent = |text: &str| format!("<span foreground='#ff7a1a'>{}</span>", escape(text));
+    let mut parts = vec!["MICROPHONE".to_owned()];
+    if latency.live
+        && let Some(rate) = latency.sample_rate
+    {
+        parts.push(format!(
+            "{} kHz",
+            accent(&format!("{:.1}", rate as f64 / 1000.0))
+        ));
+    }
+    let summary = input_latency_summary(latency);
+    if latency.live {
+        parts.push(format!("DSP {}", accent(&summary)));
+    } else {
+        parts.push(format!("EST. DSP {}", accent(&summary)));
+    }
+    parts.join("  <span foreground='#3a3a3e'>│</span>  ")
+}
+
+fn input_latency_tooltip(latency: &InputLatency) -> String {
+    let summary = input_latency_summary(latency);
+    let mut details = Vec::new();
+    if latency.custom_rack {
+        if latency.plugin_ms >= 0.05 {
+            details.push(format!("{:.1} ms reported plugin delay", latency.plugin_ms));
+        }
+    } else if latency.rnnoise_enabled {
+        details.push(format!("{:.1} ms RNNoise", latency.plugin_ms));
+    } else if latency.plugin_ms >= 0.05 {
+        details.push(format!("{:.1} ms plugins", latency.plugin_ms));
+    } else {
+        details.push("0 ms EQ/gate/compressor".to_owned());
+    }
+    if let (Some(routing_ms), Some(frames), Some(rate)) = (
+        latency.routing_ms,
+        latency.buffer_frames,
+        latency.sample_rate,
+    ) {
+        details.push(format!(
+            "~{routing_ms:.1} ms PipeWire rack/loopback buffer ({frames} frames at {:.1} kHz)",
+            rate as f64 / 1000.0
+        ));
+    } else {
+        details.push("PipeWire rack/loopback buffer".to_owned());
+    }
+    if latency.plus_unknown {
+        details.push("custom plugins may add more".to_owned());
+    }
+    let detail_text = details.join("; ");
+    if latency.live {
+        if latency.plus_unknown {
+            format!("Input DSP adds at least {summary} ({detail_text}).")
+        } else {
+            format!("Input DSP adds roughly {summary} ({detail_text}).")
+        }
+    } else {
+        format!("Estimated Input DSP latency when enabled: {summary} ({detail_text}).")
     }
 }
 
@@ -677,7 +952,10 @@ fn build_at(window: &adw::ApplicationWindow, path: Result<PathBuf, String>) -> I
     let brand = gtk::Label::new(Some("MASSIVE/EQ"));
     brand.add_css_class("brand");
     header.pack_start(&brand);
-    header.set_title_widget(Some(&gtk::Label::new(Some("MICROPHONE"))));
+    let header_status = gtk::Label::new(Some("MICROPHONE"));
+    header_status.add_css_class("header-status");
+    header_status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    header.set_title_widget(Some(&header_status));
     let engine = gtk::ToggleButton::new();
     engine.set_icon_name("system-shutdown-symbolic");
     engine.add_css_class("power");
@@ -911,7 +1189,12 @@ fn build_at(window: &adw::ApplicationWindow, path: Result<PathBuf, String>) -> I
         poll_busy: Cell::new(false),
         action_busy: Cell::new(false),
         last_poll: Cell::new(Instant::now()),
+        clock_rate: Cell::new(None),
+        clock_quantum: Cell::new(None),
+        service_status: Cell::new(ServiceStatus::Off),
+        runtime_latency: RefCell::new(None),
         ui: Widgets {
+            header_status,
             profiles,
             name,
             sources,
@@ -1667,5 +1950,54 @@ mod tests {
         );
         assert_eq!(saved.active_profile, second_id);
         assert_eq!(saved.profiles[0].gate.threshold_db, -32.0);
+    }
+
+    #[test]
+    fn estimated_input_latency_reflects_rnnoise_quantum_and_custom_racks() {
+        let mut profile = InputProfile::default();
+        let plain = estimate_input_latency(&profile, Some(48_000), Some(1_024));
+        assert_eq!(input_latency_summary(&plain), "~21 ms");
+        assert!(input_header_markup(&plain).contains("EST. DSP"));
+        assert!(input_latency_tooltip(&plain).contains("0 ms EQ/gate/compressor"));
+
+        profile.rnnoise.enabled = true;
+        let rnnoise = estimate_input_latency(&profile, Some(48_000), Some(1_024));
+        assert_eq!(input_latency_summary(&rnnoise), "~31 ms");
+        assert!(input_latency_tooltip(&rnnoise).contains("10.0 ms RNNoise"));
+
+        // Without PipeWire clock info yet, still shows RNNoise + buffer cleanly.
+        let no_clock = estimate_input_latency(&profile, None, None);
+        assert_eq!(input_latency_summary(&no_clock), "~10 ms + buffer");
+
+        // Custom Carla racks mark unknown plugin latency with a trailing '+'.
+        profile.advanced_project = Some(PathBuf::from("/tmp/rack.carxp"));
+        let custom = estimate_input_latency(&profile, Some(48_000), Some(1_024));
+        assert_eq!(input_latency_summary(&custom), "~21 ms+");
+        assert!(input_latency_tooltip(&custom).contains("custom plugins may add more"));
+    }
+
+    #[test]
+    fn runtime_input_latency_parses_live_service_metrics() {
+        let mut profile = InputProfile::default();
+        profile.rnnoise.enabled = true;
+        let runtime = serde_json::json!({
+            "state": "running",
+            "backend": "managed",
+            "latency": {
+                "sample_rate": 48_000,
+                "buffer_frames": 256,
+                "plugin_latency_frames": 480,
+                "plugin_latency_ms": 10.0,
+                "routing_latency_ms": 5.33,
+                "added_latency_ms": 15.33,
+                "custom_plugins_unreported": false
+            }
+        });
+        let live = parse_runtime_latency(&runtime, &profile, None, None).unwrap();
+        assert!(live.live);
+        assert_eq!(input_latency_summary(&live), "~15 ms");
+        assert!(input_header_markup(&live).contains("48.0</span> kHz"));
+        assert!(input_header_markup(&live).contains("DSP <span"));
+        assert!(input_latency_tooltip(&live).contains("Input DSP adds roughly ~15 ms"));
     }
 }

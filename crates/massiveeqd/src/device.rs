@@ -47,6 +47,7 @@ pub fn settings_at_rate(graph: GraphSettings, rate: u32) -> GraphSettings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct GraphInfo {
     pub rate: Option<u32>,
+    pub quantum: Option<u32>,
     pub allowed_rates: Vec<u32>,
     pub streams: Vec<StreamRate>,
 }
@@ -136,10 +137,19 @@ pub fn graph_info(objects: &[Value]) -> GraphInfo {
         })
         .find_map(|object| object.pointer("/info/params/Format/0/rate")?.as_u64())
         .map(|rate| rate as u32);
+    let forced_quantum = setting("clock.force-quantum")
+        .and_then(number)
+        .filter(|quantum| *quantum > 0);
+    let quantum = forced_quantum.or_else(|| {
+        setting("clock.quantum")
+            .and_then(number)
+            .filter(|quantum| *quantum > 0)
+    });
     GraphInfo {
         rate: forced
             .or(running)
             .or_else(|| setting("clock.rate").and_then(number)),
+        quantum,
         allowed_rates,
         streams,
     }
@@ -368,6 +378,8 @@ mod tests {
               {"type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "settings"},
                "metadata": [
                  {"key": "clock.rate", "value": 48000},
+                 {"key": "clock.quantum", "value": 1024},
+                 {"key": "clock.force-quantum", "value": 0},
                  {"key": "clock.allowed-rates", "value": "[ 44100 48000 ]"},
                  {"key": "clock.force-rate", "value": 0}
                ]},
@@ -387,6 +399,7 @@ mod tests {
             graph_info(&objects),
             GraphInfo {
                 rate: Some(48_000),
+                quantum: Some(1_024),
                 allowed_rates: vec![44_100, 48_000],
                 streams: vec![StreamRate {
                     name: "mpv".into(),

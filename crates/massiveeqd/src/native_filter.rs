@@ -25,6 +25,9 @@ pub struct NativeStats {
     pub process_calls: AtomicU64,
     pub process_nanos_total: AtomicU64,
     pub process_nanos_peak: AtomicU64,
+    pub last_block_frames: AtomicU32,
+    pub last_capture_nanos: AtomicU64,
+    pub ring_transit_nanos: AtomicU64,
 }
 
 pub struct NativeFilter {
@@ -261,9 +264,11 @@ fn run_filter_pair(
         if let Some(volume) = &volume {
             engine = engine.with_volume(volume.clone());
         }
+        let epoch = std::time::Instant::now();
         let control_volume = volume.clone();
         let capture_stats = stats.clone();
         let capture_rate = stream_rate.clone();
+        let capture_epoch = epoch;
         let _capture_listener = capture
             .add_local_listener_with_user_data(engine)
             // Volume keys and mixers set the sink's volume; with the volume in
@@ -333,7 +338,16 @@ fn run_filter_pair(
                 let started = std::time::Instant::now();
                 let processed = engine.process(samples);
                 let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                capture_stats.process_calls.fetch_add(1, Ordering::Relaxed);
+                if let Some(block_frames) = samples
+                    .len()
+                    .checked_div(input_channels)
+                    .map(|frames| frames.min(u32::MAX as usize) as u32)
+                    .filter(|frames| *frames > 0)
+                {
+                    capture_stats
+                        .last_block_frames
+                        .store(block_frames, Ordering::Relaxed);
+                }
                 capture_stats
                     .process_nanos_total
                     .fetch_add(elapsed, Ordering::Relaxed);
@@ -348,10 +362,18 @@ fn run_filter_pair(
                         break;
                     }
                 }
+                if !processed.is_empty() {
+                    let finished = capture_epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    capture_stats
+                        .last_capture_nanos
+                        .store(finished, Ordering::Release);
+                }
+                capture_stats.process_calls.fetch_add(1, Ordering::Release);
             })
             .register()?;
 
         let playback_stats = stats.clone();
+        let playback_epoch = epoch;
         let _playback_listener = playback
             .add_local_listener_with_user_data(0_u64)
             .process(move |stream, last_capture_call| {
@@ -392,10 +414,12 @@ fn run_filter_pair(
                     // Count missing samples only when fresh captured audio was
                     // expected in this playback cycle.
                     let fresh_input = capture_call != *last_capture_call;
+                    let mut underflowed = false;
                     for sample in samples.iter_mut() {
                         *sample = match audio_consumer.pop() {
                             Ok(value) => value,
                             Err(_) => {
+                                underflowed = true;
                                 if fresh_input {
                                     playback_stats
                                         .output_underflows
@@ -404,6 +428,17 @@ fn run_filter_pair(
                                 0.0
                             }
                         };
+                    }
+                    if fresh_input && !underflowed && !samples.is_empty() {
+                        let capture_nanos =
+                            playback_stats.last_capture_nanos.load(Ordering::Acquire);
+                        if capture_nanos > 0 {
+                            let now_nanos =
+                                playback_epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                            playback_stats
+                                .ring_transit_nanos
+                                .store(now_nanos.saturating_sub(capture_nanos), Ordering::Relaxed);
+                        }
                     }
                     *last_capture_call = capture_call;
                     byte_len
